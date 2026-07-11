@@ -7,7 +7,8 @@ use eframe::egui;
 use eframe::egui_wgpu::{Callback, CallbackResources, CallbackTrait, ScreenDescriptor};
 use eframe::wgpu::{self, util::DeviceExt};
 use sms_formats::{
-    J3dAlphaCompare, J3dBlendMode, J3dMaterial, J3dTevStage, J3dTexMatrix, J3dZMode,
+    J3dAlphaCompare, J3dBlendMode, J3dMaterial, J3dTevStage, J3dTexMatrix, J3dTextureSrtAnimation,
+    J3dZMode,
 };
 
 use super::{
@@ -822,6 +823,7 @@ pub struct GpuViewportFrame {
     pub viewport_pan: [f32; 2],
     pub near: f32,
     pub far: f32,
+    pub animation_seconds: f32,
 }
 
 impl Default for GpuViewportFrame {
@@ -836,6 +838,7 @@ impl Default for GpuViewportFrame {
             viewport_pan: [0.0; 2],
             near: 8.0,
             far: 100_000.0,
+            animation_seconds: 0.0,
         }
     }
 }
@@ -867,7 +870,7 @@ impl CallbackTrait for GpuViewportCallback {
             .entry::<GpuViewportResources>()
             .or_insert_with(|| GpuViewportResources::new(device, shared.target_format));
         resources.ensure_scene(device, queue, &shared.scene, shared.generation);
-        resources.write_frame(queue, shared.frame);
+        resources.write_frame(queue, shared.frame, &shared.scene);
         Vec::new()
     }
 
@@ -1152,6 +1155,14 @@ struct GpuMaterialData {
     uniform: GpuMaterialUniform,
     texture_indices: [usize; TEXTURE_SLOT_COUNT],
     state: GpuMaterialState,
+    tex_matrices: [Option<J3dTexMatrix>; TEXTURE_SLOT_COUNT],
+    animations: Vec<GpuMaterialAnimation>,
+}
+
+#[derive(Clone)]
+struct GpuMaterialAnimation {
+    animation: J3dTextureSrtAnimation,
+    binding_index: usize,
 }
 
 impl GpuMaterialData {
@@ -1162,10 +1173,28 @@ impl GpuMaterialData {
                 .map(|index| index + 1)
                 .unwrap_or(0)
         });
+        let animations = preview
+            .material_animation_bindings
+            .get(material.material_index)
+            .into_iter()
+            .flatten()
+            .filter_map(|binding| {
+                preview
+                    .texture_srt_animations
+                    .get(binding.animation_index)
+                    .cloned()
+                    .map(|animation| GpuMaterialAnimation {
+                        animation,
+                        binding_index: binding.binding_index,
+                    })
+            })
+            .collect();
         Self {
             uniform: GpuMaterialUniform::from_j3d(material),
             texture_indices,
             state: GpuMaterialState::from_j3d(material),
+            tex_matrices: material.tex_matrices,
+            animations,
         }
     }
 
@@ -1199,7 +1228,31 @@ impl GpuMaterialData {
                 }),
                 depth: triangle.z_mode.unwrap_or(default_z_mode()),
             },
+            tex_matrices: [None; TEXTURE_SLOT_COUNT],
+            animations: Vec::new(),
         }
+    }
+
+    fn uniform_at_time(&self, elapsed_seconds: f32) -> GpuMaterialUniform {
+        let mut uniform = self.uniform;
+        for animated in &self.animations {
+            let Some(binding) = animated.animation.bindings.get(animated.binding_index) else {
+                continue;
+            };
+            let slot = binding.texture_matrix_index as usize;
+            let Some(mut matrix) = self.tex_matrices.get(slot).copied().flatten() else {
+                continue;
+            };
+            let frame = animated.animation.playback_frame(elapsed_seconds);
+            let srt = binding.sample(frame);
+            matrix.center = binding.center;
+            matrix.scale = srt.scale;
+            matrix.rotation = srt.rotation;
+            matrix.translation = srt.translation;
+            let rows = texture_srt_rows(matrix);
+            uniform.tex_matrix_rows[slot * 3..slot * 3 + 3].copy_from_slice(&rows);
+        }
+        uniform
     }
 }
 
@@ -1828,7 +1881,7 @@ impl GpuViewportResources {
             let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("sms viewport J3D material uniform"),
                 contents: bytemuck::bytes_of(&material.uniform),
-                usage: wgpu::BufferUsages::UNIFORM,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             });
             let mut entries = vec![wgpu::BindGroupEntry {
                 binding: 0,
@@ -1871,12 +1924,19 @@ impl GpuViewportResources {
         }
     }
 
-    fn write_frame(&mut self, queue: &wgpu::Queue, frame: GpuViewportFrame) {
+    fn write_frame(&mut self, queue: &wgpu::Queue, frame: GpuViewportFrame, scene: &GpuSceneData) {
         queue.write_buffer(
             &self.camera_buffer,
             0,
             bytemuck::bytes_of(&GpuCameraUniform::from(frame)),
         );
+        for (material, buffer) in scene.materials.iter().zip(&self.material_buffers) {
+            if material.animations.is_empty() {
+                continue;
+            }
+            let uniform = material.uniform_at_time(frame.animation_seconds);
+            queue.write_buffer(buffer, 0, bytemuck::bytes_of(&uniform));
+        }
     }
 
     fn paint(&self, render_pass: &mut wgpu::RenderPass<'static>) {
@@ -2414,6 +2474,7 @@ mod tests {
             ),
         };
         J3dMaterial {
+            name: String::new(),
             material_index: 0,
             material_id: 0,
             loader_flags: SMS_MAP_MODEL_LOAD_FLAGS,

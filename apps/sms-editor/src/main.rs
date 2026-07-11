@@ -1,13 +1,14 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::Instant;
 
 use eframe::egui;
 use sms_formats::{
     discover_scene_archives, read_stage_asset_bytes, J3dAlphaCompare, J3dBlendMode, J3dFile,
-    J3dGeometryPreview, J3dMaterial, J3dPreviewCombineMode, J3dZMode, SceneArchiveInfo,
-    StageAssetKind, SMS_DEFAULT_OBJECT_MODEL_LOAD_FLAGS, SMS_MAP_MODEL_LOAD_FLAGS,
-    SMS_POLLUTION_MODEL_LOAD_FLAGS,
+    J3dGeometryPreview, J3dMaterial, J3dPreviewCombineMode, J3dTextureSrtAnimation, J3dZMode,
+    SceneArchiveInfo, StageAssetKind, SMS_DEFAULT_OBJECT_MODEL_LOAD_FLAGS,
+    SMS_MAP_MODEL_LOAD_FLAGS, SMS_POLLUTION_MODEL_LOAD_FLAGS,
 };
 use sms_render::{RenderScene, RendererConfig, ViewportRenderer};
 use sms_scene::{
@@ -98,6 +99,8 @@ struct ModelPreview {
     triangles: Vec<PreviewTriangle>,
     textures: Vec<PreviewTexture>,
     materials: Vec<J3dMaterial>,
+    texture_srt_animations: Vec<J3dTextureSrtAnimation>,
+    material_animation_bindings: Vec<Vec<PreviewMaterialAnimationBinding>>,
     bounds_min: [f32; 3],
     bounds_max: [f32; 3],
     camera_bounds_min: [f32; 3],
@@ -109,6 +112,12 @@ struct ModelPreview {
     source_triangles: usize,
     source_textures: usize,
     object_model_indices: BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PreviewMaterialAnimationBinding {
+    animation_index: usize,
+    binding_index: usize,
 }
 
 impl ModelPreview {
@@ -276,6 +285,7 @@ struct SmsEditorApp {
     next_object_serial: u32,
     undo_stack: Vec<Vec<SceneObject>>,
     redo_stack: Vec<Vec<SceneObject>>,
+    animation_started_at: Instant,
 }
 
 impl Default for SmsEditorApp {
@@ -328,6 +338,7 @@ impl Default for SmsEditorApp {
             next_object_serial: 1,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            animation_started_at: Instant::now(),
         }
     }
 }
@@ -1302,6 +1313,13 @@ impl SmsEditorApp {
             .is_some_and(|preview| !preview.triangles.is_empty());
 
         if has_triangles {
+            if self
+                .model_preview
+                .as_ref()
+                .is_some_and(|preview| !preview.texture_srt_animations.is_empty())
+            {
+                ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            }
             if let (Some(gpu_viewport), Some(frame)) =
                 (self.gpu_viewport.as_ref(), self.gpu_viewport_frame(rect))
             {
@@ -1361,6 +1379,7 @@ impl SmsEditorApp {
             viewport_pan: [self.viewport_pan.x, self.viewport_pan.y],
             near: VIEWPORT_NEAR_CLIP,
             far,
+            animation_seconds: self.animation_started_at.elapsed().as_secs_f32(),
         })
     }
 
@@ -1786,11 +1805,12 @@ impl SmsEditorApp {
                 ));
                 if let Some(preview) = &model_preview {
                     self.log.push(format!(
-                        "Viewport preview loaded {} model(s), {} sampled point(s), {} triangle(s), {} texture(s), {} source vertex/vertices.",
+                        "Viewport preview loaded {} model(s), {} sampled point(s), {} triangle(s), {} texture(s), {} BTK material animation(s), {} source vertex/vertices.",
                         preview.loaded_models,
                         preview.points.len(),
                         preview.triangles.len(),
                         preview.textures.len(),
+                        preview.texture_srt_animations.len(),
                         preview.source_vertices
                     ));
                 } else if !scene.model_paths.is_empty() {
@@ -1845,6 +1865,8 @@ impl SmsEditorApp {
         let mut triangles = Vec::new();
         let mut textures = Vec::new();
         let mut materials = Vec::new();
+        let mut texture_srt_animations = Vec::new();
+        let mut material_animation_bindings = Vec::new();
         let mut next_packet_index = 0usize;
         let mut bounds_min = [f32::INFINITY; 3];
         let mut bounds_max = [f32::NEG_INFINITY; 3];
@@ -1882,6 +1904,17 @@ impl SmsEditorApp {
                     let texture_base = push_preview_textures(&mut textures, &preview);
                     let material_base =
                         push_preview_materials(&mut materials, &preview, texture_base);
+                    material_animation_bindings.resize_with(materials.len(), Vec::new);
+                    if model_render_layer == PreviewRenderLayer::Water {
+                        attach_model_texture_srt_animation(
+                            document,
+                            &asset_path,
+                            material_base,
+                            &preview.materials,
+                            &mut texture_srt_animations,
+                            &mut material_animation_bindings,
+                        );
+                    }
                     let packet_base = next_packet_index;
                     next_packet_index += preview
                         .triangles
@@ -2140,6 +2173,8 @@ impl SmsEditorApp {
                 .collect();
         }
 
+        material_animation_bindings.resize_with(materials.len(), Vec::new);
+
         if loaded_models == 0 || (points.is_empty() && triangles.is_empty()) {
             return None;
         }
@@ -2165,6 +2200,8 @@ impl SmsEditorApp {
             triangles,
             textures,
             materials,
+            texture_srt_animations,
+            material_animation_bindings,
             bounds_min,
             bounds_max,
             camera_bounds_min,
@@ -2793,6 +2830,59 @@ fn push_preview_materials(
         materials.push(material);
     }
     material_base
+}
+
+fn attach_model_texture_srt_animation(
+    document: &StageDocument,
+    model_path: &str,
+    material_base: usize,
+    model_materials: &[J3dMaterial],
+    animations: &mut Vec<J3dTextureSrtAnimation>,
+    material_bindings: &mut [Vec<PreviewMaterialAnimationBinding>],
+) {
+    let Some(extension_offset) = model_path.rfind('.') else {
+        return;
+    };
+    let animation_path = format!("{}.btk", &model_path[..extension_offset]);
+    let Some(asset) = document.assets.iter().find(|asset| {
+        asset.kind == StageAssetKind::Animation
+            && asset
+                .path
+                .to_string_lossy()
+                .replace('\\', "/")
+                .eq_ignore_ascii_case(&animation_path)
+    }) else {
+        return;
+    };
+    let Ok(bytes) = read_stage_asset_bytes(&asset.path) else {
+        return;
+    };
+    let Ok(animation) = J3dTextureSrtAnimation::parse(&bytes) else {
+        return;
+    };
+
+    let animation_index = animations.len();
+    let mut matched = false;
+    for (binding_index, binding) in animation.bindings.iter().enumerate() {
+        let Some(material_index) = model_materials
+            .iter()
+            .position(|material| material.name == binding.material_name)
+        else {
+            continue;
+        };
+        let global_material_index = material_base + material_index;
+        let Some(bindings) = material_bindings.get_mut(global_material_index) else {
+            continue;
+        };
+        bindings.push(PreviewMaterialAnimationBinding {
+            animation_index,
+            binding_index,
+        });
+        matched = true;
+    }
+    if matched {
+        animations.push(animation);
+    }
 }
 
 fn apply_model_material_table(
@@ -4099,7 +4189,13 @@ fn path_is_water_model_path(path: &str) -> bool {
     if path_is_indirect_water_model_path(&path) {
         return false;
     }
-    path.contains("/map/map/sea")
+    let model_name = path
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(".bmd")
+        .trim_end_matches(".bdl");
+    matches!(model_name, "sea" | "biancoriver" | "monteriver")
         || path.contains("/map/map/water")
         || path.contains("/map/water/")
         || path.contains("/map/mirror/puddle")
@@ -4442,6 +4538,8 @@ mod tests {
                 has_translucent_alpha,
             }],
             materials: Vec::new(),
+            texture_srt_animations: Vec::new(),
+            material_animation_bindings: Vec::new(),
             bounds_min: [0.0, 0.0, 0.0],
             bounds_max: [1.0, 1.0, 1.0],
             camera_bounds_min: [0.0, 0.0, 0.0],
@@ -4684,6 +4782,19 @@ mod tests {
             PreviewRenderLayer::Water
         );
         assert!(!is_camera_bounds_model_path(path));
+    }
+
+    #[test]
+    fn source_named_river_models_are_level_water_layers() {
+        for path in [
+            "stage.szs!/map/map/BiancoRiver.bmd",
+            "stage.szs!/map/map/MonteRiver.bmd",
+        ] {
+            assert_eq!(
+                preview_render_layer_for_model_path(path),
+                PreviewRenderLayer::Water
+            );
+        }
     }
 
     #[test]
@@ -4931,6 +5042,8 @@ mod tests {
                 }],
                 textures: Vec::new(),
                 materials: Vec::new(),
+                texture_srt_animations: Vec::new(),
+                material_animation_bindings: Vec::new(),
                 bounds_min: [0.0, 0.0, 0.0],
                 bounds_max: [1.0, 2.0, 3.0],
                 camera_bounds_min: [0.0, 0.0, 0.0],

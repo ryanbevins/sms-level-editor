@@ -8,6 +8,7 @@
 mod binary;
 mod col;
 mod j3d;
+mod j3d_anim;
 mod jdrama;
 mod rarc;
 mod raw;
@@ -23,6 +24,7 @@ pub use j3d::{
     J3dTriangle, J3dZMode, SMS_DEFAULT_OBJECT_MODEL_LOAD_FLAGS, SMS_MAP_MODEL_LOAD_FLAGS,
     SMS_POLLUTION_MODEL_LOAD_FLAGS,
 };
+pub use j3d_anim::{J3dTextureSrt, J3dTextureSrtAnimation, J3dTextureSrtBinding};
 pub use jdrama::{parse_jdrama_object_records, JDramaObjectRecord, JDramaTransform};
 pub use rarc::{RarcArchive, RarcFileEntry, RarcHeader};
 pub use raw::{RawFile, RawFormat};

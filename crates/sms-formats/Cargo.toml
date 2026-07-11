@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+encoding_rs.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 walkdir.workspace = true

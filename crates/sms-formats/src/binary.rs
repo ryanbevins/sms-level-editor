@@ -1,3 +1,5 @@
+use encoding_rs::SHIFT_JIS;
+
 use crate::{FormatError, Result};
 
 pub fn require_len(format: &'static str, bytes: &[u8], expected: usize) -> Result<()> {
@@ -72,4 +74,64 @@ pub fn checked_slice<'a>(
     }
 
     Ok(&bytes[offset..end])
+}
+
+pub fn read_jut_name_table(bytes: &[u8], offset: usize, limit: usize) -> Result<Vec<String>> {
+    const FORMAT: &str = "JUT name table";
+    if limit > bytes.len() || offset > limit {
+        return Err(FormatError::InvalidOffset {
+            format: FORMAT,
+            offset,
+            len: bytes.len(),
+        });
+    }
+    checked_slice(FORMAT, &bytes[..limit], offset, 4)?;
+
+    let count = be_u16(bytes, offset, FORMAT)? as usize;
+    let entries_offset = offset.checked_add(4).ok_or(FormatError::InvalidOffset {
+        format: FORMAT,
+        offset,
+        len: limit,
+    })?;
+    checked_slice(
+        FORMAT,
+        &bytes[..limit],
+        entries_offset,
+        count.checked_mul(4).ok_or(FormatError::InvalidOffset {
+            format: FORMAT,
+            offset: entries_offset,
+            len: limit,
+        })?,
+    )?;
+
+    let mut names = Vec::with_capacity(count);
+    for index in 0..count {
+        let relative = be_u16(bytes, entries_offset + index * 4 + 2, FORMAT)? as usize;
+        let start = offset
+            .checked_add(relative)
+            .ok_or(FormatError::InvalidOffset {
+                format: FORMAT,
+                offset: relative,
+                len: limit,
+            })?;
+        if start >= limit {
+            return Err(FormatError::InvalidOffset {
+                format: FORMAT,
+                offset: start,
+                len: limit,
+            });
+        }
+        let end = bytes[start..limit]
+            .iter()
+            .position(|byte| *byte == 0)
+            .map(|length| start + length)
+            .ok_or(FormatError::InvalidOffset {
+                format: FORMAT,
+                offset: start,
+                len: limit,
+            })?;
+        let (name, _) = SHIFT_JIS.decode_without_bom_handling(&bytes[start..end]);
+        names.push(name.into_owned());
+    }
+    Ok(names)
 }

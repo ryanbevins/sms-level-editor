@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-use crate::binary::{be_f32, be_i16, be_u16, be_u32, checked_slice, require_magic};
+use crate::binary::{
+    be_f32, be_i16, be_u16, be_u32, checked_slice, read_jut_name_table, require_magic,
+};
 use crate::{FormatError, PreserveBytes, Result};
 
 const FORMAT: &str = "J3D";
@@ -312,6 +314,7 @@ pub struct J3dFog {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct J3dMaterial {
+    pub name: String,
     pub material_index: usize,
     pub material_id: usize,
     pub loader_flags: u32,
@@ -1515,6 +1518,17 @@ impl J3dFile {
         let material_count = be_u16(&self.bytes, base + 0x08, FORMAT)? as usize;
         let init_offset = relative_offset(&self.bytes, base, 0x0C)?;
         let material_id_offset = relative_offset(&self.bytes, base, 0x10)?;
+        let material_names = optional_relative_offset(&self.bytes, base, 0x14)
+            .map(|offset| {
+                read_jut_name_table(
+                    &self.bytes,
+                    offset,
+                    base.saturating_add(mat3.size as usize)
+                        .min(self.bytes.len()),
+                )
+            })
+            .transpose()?
+            .unwrap_or_default();
         let ind_init_offset = optional_relative_offset(&self.bytes, base, 0x18);
         let cull_mode_offset = optional_relative_offset(&self.bytes, base, 0x1C);
         let mat_color_offset = optional_relative_offset(&self.bytes, base, 0x20);
@@ -1641,6 +1655,10 @@ impl J3dFile {
             let dither = read_indexed_u8(&self.bytes, dither_offset, init_data[7]).unwrap_or(0);
 
             materials.push(J3dMaterial {
+                name: material_names
+                    .get(material_index)
+                    .cloned()
+                    .unwrap_or_default(),
                 material_index,
                 material_id,
                 loader_flags,
