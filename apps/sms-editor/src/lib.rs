@@ -602,10 +602,17 @@ impl SmsEditorApp {
         const POINTS_PER_MODEL: usize = 1_200;
         const POINTS_PER_OBJECT_INSTANCE: usize = 500;
 
+        let active_pollution_layers = active_pollution_layer_count(document);
         let models: Vec<_> = document
             .assets
             .iter()
             .filter(|asset| asset.kind == StageAssetKind::Model)
+            .filter(|asset| {
+                pollution_layer_model_is_active(
+                    &asset.path.to_string_lossy(),
+                    active_pollution_layers,
+                )
+            })
             .collect();
         let preferred: Vec<_> = models
             .iter()
@@ -669,6 +676,7 @@ impl SmsEditorApp {
             match file.geometry_preview_with_loader_flags(loader_flags) {
                 Ok(mut preview) => {
                     apply_model_material_table(document, &asset_path, loader_flags, &mut preview);
+                    apply_pollution_bitmap_mask(document, &asset_path, &mut preview);
                     loaded_models += 1;
                     let model_index = loaded_models;
                     let texture_base = push_preview_textures(&mut textures, &preview);
@@ -1789,6 +1797,53 @@ fn path_is_indirect_water_model_path(path: &str) -> bool {
 
 fn path_is_goop_model_path(path: &str) -> bool {
     path.contains("/map/pollution/") || path.contains("pollution")
+}
+
+fn active_pollution_layer_count(document: &StageDocument) -> usize {
+    document
+        .assets
+        .iter()
+        .find(|asset| {
+            asset
+                .path
+                .to_string_lossy()
+                .replace('\\', "/")
+                .to_ascii_lowercase()
+                .ends_with("/map/ymap.ymp")
+        })
+        .and_then(|asset| read_stage_asset_bytes(&asset.path).ok())
+        .and_then(|bytes| pollution_layer_count_from_bytes(&bytes))
+        .unwrap_or(0) as usize
+}
+
+fn pollution_layer_count_from_bytes(bytes: &[u8]) -> Option<u32> {
+    Some(u32::from_be_bytes(bytes.get(..4)?.try_into().ok()?))
+}
+
+fn pollution_layer_model_is_active(path: &str, active_layer_count: usize) -> bool {
+    pollution_layer_model_index(path).is_none_or(|index| index < active_layer_count)
+}
+
+fn pollution_layer_model_index(path: &str) -> Option<usize> {
+    let path = path.replace('\\', "/").to_ascii_lowercase();
+    if !path.contains("/map/pollution/") {
+        return None;
+    }
+
+    let stem = path
+        .rsplit('/')
+        .next()?
+        .strip_suffix(".bmd")
+        .or_else(|| path.rsplit('/').next()?.strip_suffix(".bdl"))?;
+    let suffix = stem.strip_prefix("pollution")?;
+    match suffix {
+        "a" => Some(7),
+        "b" => Some(8),
+        digits if !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()) => {
+            digits.parse().ok()
+        }
+        _ => None,
+    }
 }
 
 fn model_loader_flags_for_path(path: &str) -> u32 {

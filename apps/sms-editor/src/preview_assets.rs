@@ -1,5 +1,84 @@
 use super::*;
 
+pub(super) fn apply_pollution_bitmap_mask(
+    document: &StageDocument,
+    model_path: &str,
+    preview: &mut J3dGeometryPreview,
+) {
+    if pollution_layer_model_index(model_path).is_none() {
+        return;
+    }
+    let Some(bitmap_path) = model_path
+        .rsplit_once('.')
+        .map(|(base, _)| format!("{base}.bmp"))
+    else {
+        return;
+    };
+    let Some(asset) = document.assets.iter().find(|asset| {
+        asset.kind == StageAssetKind::Texture
+            && asset
+                .path
+                .to_string_lossy()
+                .replace('\\', "/")
+                .eq_ignore_ascii_case(&bitmap_path)
+    }) else {
+        return;
+    };
+    let Some(texture) = preview.textures.first_mut() else {
+        return;
+    };
+    let Ok(bytes) = read_stage_asset_bytes(&asset.path) else {
+        return;
+    };
+    let Some((width, height, rgba)) = decode_pollution_bitmap_mask(&bytes) else {
+        return;
+    };
+    if texture.width != width || texture.height != height {
+        return;
+    }
+
+    texture.rgba = rgba;
+    texture.mips.clear();
+    texture.mipmap_count = 1;
+}
+
+pub(super) fn decode_pollution_bitmap_mask(bytes: &[u8]) -> Option<(u16, u16, Vec<u8>)> {
+    if bytes.get(..2)? != b"BM" {
+        return None;
+    }
+    let pixel_offset = u32::from_le_bytes(bytes.get(10..14)?.try_into().ok()?) as usize;
+    let width = i32::from_le_bytes(bytes.get(18..22)?.try_into().ok()?);
+    let height = i32::from_le_bytes(bytes.get(22..26)?.try_into().ok()?);
+    let planes = u16::from_le_bytes(bytes.get(26..28)?.try_into().ok()?);
+    let bits_per_pixel = u16::from_le_bytes(bytes.get(28..30)?.try_into().ok()?);
+    let compression = u32::from_le_bytes(bytes.get(30..34)?.try_into().ok()?);
+    if width <= 0 || height == 0 || planes != 1 || bits_per_pixel != 8 || compression != 0 {
+        return None;
+    }
+
+    let width = usize::try_from(width).ok()?;
+    let height_abs = height.unsigned_abs() as usize;
+    let row_stride = width.checked_add(3)? & !3;
+    let pixel_len = row_stride.checked_mul(height_abs)?;
+    let pixels = bytes.get(pixel_offset..pixel_offset.checked_add(pixel_len)?)?;
+    let mut rgba = Vec::with_capacity(width.checked_mul(height_abs)?.checked_mul(4)?);
+    for y in 0..height_abs {
+        let source_y = if height > 0 { height_abs - 1 - y } else { y };
+        let row = pixels
+            .get(source_y.checked_mul(row_stride)?..)?
+            .get(..width)?;
+        for &value in row {
+            rgba.extend_from_slice(&[value, value, value, value]);
+        }
+    }
+
+    Some((
+        u16::try_from(width).ok()?,
+        u16::try_from(height_abs).ok()?,
+        rgba,
+    ))
+}
+
 pub(super) fn push_preview_textures(
     textures: &mut Vec<PreviewTexture>,
     preview: &J3dGeometryPreview,

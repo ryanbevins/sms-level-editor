@@ -439,6 +439,83 @@ fn pollution_meshes_are_goop_not_generic_effects() {
 }
 
 #[test]
+fn archived_pollution_models_require_an_active_ymap_layer() {
+    let first = "stage.szs!/map/pollution/pollution00.bmd";
+    let second = "stage.szs!/map/pollution/pollution01.bdl";
+
+    assert!(!pollution_layer_model_is_active(first, 0));
+    assert!(pollution_layer_model_is_active(first, 1));
+    assert!(!pollution_layer_model_is_active(second, 1));
+    assert!(pollution_layer_model_is_active(second, 2));
+}
+
+#[test]
+fn ymap_layer_count_is_read_as_big_endian() {
+    assert_eq!(
+        pollution_layer_count_from_bytes(&[0, 0, 0, 0, 0, 0, 0, 8]),
+        Some(0)
+    );
+    assert_eq!(pollution_layer_count_from_bytes(&[0, 0, 0, 3]), Some(3));
+    assert_eq!(pollution_layer_count_from_bytes(&[0, 0, 0]), None);
+}
+
+#[test]
+fn mare_lettered_pollution_layers_follow_the_runtime_name_table() {
+    assert_eq!(
+        pollution_layer_model_index("stage.szs!/map/pollution/pollutionA.bmd"),
+        Some(7)
+    );
+    assert_eq!(
+        pollution_layer_model_index("stage.szs!/map/pollution/pollutionB.bmd"),
+        Some(8)
+    );
+}
+
+#[test]
+fn named_static_pollution_models_are_not_ymap_layers() {
+    let path = "stage.szs!/map/map/mareSeaPollutionS0.bmd";
+
+    assert_eq!(pollution_layer_model_index(path), None);
+    assert!(pollution_layer_model_is_active(path, 0));
+}
+
+#[test]
+fn pollution_bitmap_replaces_the_embedded_authoring_mask_top_down() {
+    let mut bmp = vec![0u8; 70];
+    bmp[0..2].copy_from_slice(b"BM");
+    bmp[10..14].copy_from_slice(&54u32.to_le_bytes());
+    bmp[14..18].copy_from_slice(&40u32.to_le_bytes());
+    bmp[18..22].copy_from_slice(&2i32.to_le_bytes());
+    bmp[22..26].copy_from_slice(&2i32.to_le_bytes());
+    bmp[26..28].copy_from_slice(&1u16.to_le_bytes());
+    bmp[28..30].copy_from_slice(&8u16.to_le_bytes());
+    // BMP rows are bottom-up and padded to four bytes.
+    bmp[54..62].copy_from_slice(&[30, 40, 0, 0, 10, 20, 0, 0]);
+
+    let (width, height, rgba) = decode_pollution_bitmap_mask(&bmp).unwrap();
+
+    assert_eq!((width, height), (2, 2));
+    assert_eq!(
+        rgba,
+        vec![10, 10, 10, 10, 20, 20, 20, 20, 30, 30, 30, 30, 40, 40, 40, 40]
+    );
+}
+
+#[test]
+fn pollution_bitmap_rejects_non_i8_or_truncated_inputs() {
+    assert_eq!(decode_pollution_bitmap_mask(b"not a bitmap"), None);
+
+    let mut bmp = vec![0u8; 54];
+    bmp[0..2].copy_from_slice(b"BM");
+    bmp[10..14].copy_from_slice(&54u32.to_le_bytes());
+    bmp[18..22].copy_from_slice(&1i32.to_le_bytes());
+    bmp[22..26].copy_from_slice(&1i32.to_le_bytes());
+    bmp[26..28].copy_from_slice(&1u16.to_le_bytes());
+    bmp[28..30].copy_from_slice(&24u16.to_le_bytes());
+    assert_eq!(decode_pollution_bitmap_mask(&bmp), None);
+}
+
+#[test]
 fn every_model_layer_uses_its_same_basename_btk() {
     for (model, animation) in [
         (
