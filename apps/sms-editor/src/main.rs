@@ -17,6 +17,8 @@ use sms_schema::{ObjectDefinition, ObjectRegistry, SchemaGenerator};
 
 mod gpu_viewport;
 
+const VIEWPORT_NEAR_CLIP: f32 = 8.0;
+
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -1165,12 +1167,7 @@ impl SmsEditorApp {
     }
 
     fn paint_viewport(&mut self, ui: &egui::Ui, painter: &egui::Painter, rect: egui::Rect) {
-        painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(21, 23, 25));
-
-        let sky = egui::Rect::from_min_max(rect.min, egui::pos2(rect.right(), rect.center().y));
-        painter.rect_filled(sky, 0.0, egui::Color32::from_rgb(30, 42, 48));
-        let lower = egui::Rect::from_min_max(egui::pos2(rect.left(), rect.center().y), rect.max);
-        painter.rect_filled(lower, 0.0, egui::Color32::from_rgb(18, 24, 26));
+        painter.add(egui::Shape::mesh(viewport_background_mesh(rect)));
 
         if self.renderer.config().show_grid {
             self.paint_grid(painter, rect);
@@ -1232,36 +1229,37 @@ impl SmsEditorApp {
         for i in -10..=10 {
             let v = i as f32 * 500.0;
             let stroke = if i % 5 == 0 { major } else { minor };
-            painter.line_segment(
-                [
-                    self.world_to_screen(rect, [v, 0.0, -5000.0]),
-                    self.world_to_screen(rect, [v, 0.0, 5000.0]),
-                ],
-                stroke,
-            );
-            painter.line_segment(
-                [
-                    self.world_to_screen(rect, [-5000.0, 0.0, v]),
-                    self.world_to_screen(rect, [5000.0, 0.0, v]),
-                ],
-                stroke,
-            );
+            self.paint_world_segment(painter, rect, [v, 0.0, -5000.0], [v, 0.0, 5000.0], stroke);
+            self.paint_world_segment(painter, rect, [-5000.0, 0.0, v], [5000.0, 0.0, v], stroke);
         }
 
-        painter.line_segment(
-            [
-                self.world_to_screen(rect, [-5200.0, 0.0, 0.0]),
-                self.world_to_screen(rect, [5200.0, 0.0, 0.0]),
-            ],
+        self.paint_world_segment(
+            painter,
+            rect,
+            [-5200.0, 0.0, 0.0],
+            [5200.0, 0.0, 0.0],
             egui::Stroke::new(2.0, egui::Color32::from_rgb(206, 82, 82)),
         );
-        painter.line_segment(
-            [
-                self.world_to_screen(rect, [0.0, 0.0, -5200.0]),
-                self.world_to_screen(rect, [0.0, 0.0, 5200.0]),
-            ],
+        self.paint_world_segment(
+            painter,
+            rect,
+            [0.0, 0.0, -5200.0],
+            [0.0, 0.0, 5200.0],
             egui::Stroke::new(2.0, egui::Color32::from_rgb(82, 168, 110)),
         );
+    }
+
+    fn paint_world_segment(
+        &self,
+        painter: &egui::Painter,
+        rect: egui::Rect,
+        start: [f32; 3],
+        end: [f32; 3],
+        stroke: egui::Stroke,
+    ) {
+        if let Some(segment) = self.project_world_segment_to_screen(rect, start, end) {
+            painter.line_segment(segment, stroke);
+        }
     }
 
     fn paint_stage_silhouette(&self, painter: &egui::Painter, rect: egui::Rect) {
@@ -1361,7 +1359,7 @@ impl SmsEditorApp {
             focal,
             viewport_size: [rect.width().max(1.0), rect.height().max(1.0)],
             viewport_pan: [self.viewport_pan.x, self.viewport_pan.y],
-            near: 8.0,
+            near: VIEWPORT_NEAR_CLIP,
             far,
         })
     }
@@ -1379,24 +1377,27 @@ impl SmsEditorApp {
                 continue;
             }
 
-            let a = self.world_to_screen(rect, pair[0].position);
-            let b = self.world_to_screen(rect, pair[1].position);
-            if rect.expand(80.0).contains(a)
-                && rect.expand(80.0).contains(b)
-                && a.distance(b) < 90.0
+            if let Some([a, b]) =
+                self.project_world_segment_to_screen(rect, pair[0].position, pair[1].position)
             {
-                painter.line_segment([a, b], stroke);
+                if rect.expand(80.0).contains(a)
+                    && rect.expand(80.0).contains(b)
+                    && a.distance(b) < 90.0
+                {
+                    painter.line_segment([a, b], stroke);
+                }
             }
         }
 
         for point in &preview.points {
-            let screen = self.world_to_screen(rect, point.position);
-            if rect.expand(4.0).contains(screen) {
-                painter.circle_filled(
-                    screen,
-                    1.4,
-                    egui::Color32::from_rgba_unmultiplied(224, 243, 229, 155),
-                );
+            if let Some((screen, _)) = self.project_world_to_screen(rect, point.position) {
+                if rect.expand(4.0).contains(screen) {
+                    painter.circle_filled(
+                        screen,
+                        1.4,
+                        egui::Color32::from_rgba_unmultiplied(224, 243, 229, 155),
+                    );
+                }
             }
         }
     }
@@ -1548,13 +1549,7 @@ impl SmsEditorApp {
             egui::Color32::from_rgba_unmultiplied(255, 214, 102, 115),
         );
         for (a, b) in edges {
-            painter.line_segment(
-                [
-                    self.world_to_screen(rect, corners[a]),
-                    self.world_to_screen(rect, corners[b]),
-                ],
-                stroke,
-            );
+            self.paint_world_segment(painter, rect, corners[a], corners[b], stroke);
         }
     }
 
@@ -2598,12 +2593,11 @@ impl SmsEditorApp {
                 document
                     .objects
                     .iter()
-                    .map(|object| {
-                        (
-                            object.id.clone(),
-                            self.world_to_screen(rect, object.transform.translation),
-                            object.factory_name.clone(),
-                        )
+                    .filter_map(|object| {
+                        self.project_world_to_screen(rect, object.transform.translation)
+                            .map(|(screen, _)| {
+                                (object.id.clone(), screen, object.factory_name.clone())
+                            })
                     })
                     .collect()
             })
@@ -2624,7 +2618,7 @@ impl SmsEditorApp {
         let frame = self.camera_frame();
         let rel = vec3_sub(point, frame.position);
         let depth = vec3_dot(rel, frame.forward);
-        if depth <= 8.0 || !depth.is_finite() {
+        if depth < VIEWPORT_NEAR_CLIP || !depth.is_finite() {
             return None;
         }
 
@@ -2636,6 +2630,20 @@ impl SmsEditorApp {
         }
 
         Some((rect.center() + self.viewport_pan + egui::vec2(x, -y), depth))
+    }
+
+    fn project_world_segment_to_screen(
+        &self,
+        rect: egui::Rect,
+        start: [f32; 3],
+        end: [f32; 3],
+    ) -> Option<[egui::Pos2; 2]> {
+        let [start, end] =
+            clip_world_segment_to_near_plane(self.camera_frame(), start, end, VIEWPORT_NEAR_CLIP)?;
+        Some([
+            self.project_world_to_screen(rect, start)?.0,
+            self.project_world_to_screen(rect, end)?.0,
+        ])
     }
 
     fn camera_frame(&self) -> CameraFrame {
@@ -3246,6 +3254,44 @@ fn preview_triangle_world_vertices(
     }
 }
 
+fn clip_world_segment_to_near_plane(
+    camera: CameraFrame,
+    start: [f32; 3],
+    end: [f32; 3],
+    near: f32,
+) -> Option<[[f32; 3]; 2]> {
+    let mut clipped = [start, end];
+    let mut depths = [
+        vec3_dot(vec3_sub(start, camera.position), camera.forward),
+        vec3_dot(vec3_sub(end, camera.position), camera.forward),
+    ];
+    if !near.is_finite() || depths.iter().any(|depth| !depth.is_finite()) {
+        return None;
+    }
+    if depths[0] < near && depths[1] < near {
+        return None;
+    }
+
+    for endpoint in 0..2 {
+        if depths[endpoint] >= near {
+            continue;
+        }
+        let other = 1 - endpoint;
+        let depth_span = depths[other] - depths[endpoint];
+        if depth_span.abs() <= f32::EPSILON {
+            return None;
+        }
+        let t = ((near - depths[endpoint]) / depth_span).clamp(0.0, 1.0);
+        clipped[endpoint] = vec3_add(
+            clipped[endpoint],
+            vec3_scale(vec3_sub(clipped[other], clipped[endpoint]), t),
+        );
+        depths[endpoint] = near;
+    }
+
+    Some(clipped)
+}
+
 fn recompute_model_preview_bounds(preview: &mut ModelPreview) {
     if let Some((bounds_min, bounds_max)) =
         robust_preview_bounds(&preview.triangles, &preview.points)
@@ -3396,6 +3442,19 @@ fn framebuffer_size_for_rect(rect: egui::Rect) -> [usize; 2] {
         (width * scale).round().clamp(1.0, max_side) as usize,
         (height * scale).round().clamp(1.0, max_side) as usize,
     ]
+}
+
+fn viewport_background_mesh(rect: egui::Rect) -> egui::Mesh {
+    let mut mesh = egui::Mesh::default();
+    let top = egui::Color32::from_rgb(30, 42, 48);
+    let bottom = egui::Color32::from_rgb(18, 24, 26);
+    mesh.colored_vertex(rect.left_top(), top);
+    mesh.colored_vertex(rect.right_top(), top);
+    mesh.colored_vertex(rect.right_bottom(), bottom);
+    mesh.colored_vertex(rect.left_bottom(), bottom);
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    mesh
 }
 
 fn viewport_framebuffer_background(size: [usize; 2]) -> egui::ColorImage {
@@ -4539,6 +4598,53 @@ mod tests {
 
         let far = preview.far_clip(1_000.0);
         assert!((157_000.0..158_000.0).contains(&far));
+    }
+
+    #[test]
+    fn viewport_background_is_one_continuous_gradient() {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let mesh = viewport_background_mesh(rect);
+
+        assert_eq!(mesh.vertices.len(), 4);
+        assert_eq!(mesh.indices, [0, 1, 2, 0, 2, 3]);
+        assert_eq!(mesh.vertices[0].color, mesh.vertices[1].color);
+        assert_eq!(mesh.vertices[2].color, mesh.vertices[3].color);
+        assert_ne!(mesh.vertices[0].color, mesh.vertices[2].color);
+    }
+
+    #[test]
+    fn viewport_lines_clip_at_the_near_plane_instead_of_the_crosshair() {
+        let camera = CameraFrame {
+            position: [0.0, 0.0, 0.0],
+            right: [1.0, 0.0, 0.0],
+            up: [0.0, 1.0, 0.0],
+            forward: [0.0, 0.0, 1.0],
+        };
+
+        let clipped =
+            clip_world_segment_to_near_plane(camera, [0.0, 0.0, -10.0], [10.0, 0.0, 10.0], 1.0)
+                .unwrap();
+
+        assert_vec3_close(clipped[0], [5.5, 0.0, 1.0]);
+        assert_vec3_close(clipped[1], [10.0, 0.0, 10.0]);
+    }
+
+    #[test]
+    fn viewport_lines_fully_behind_the_camera_are_hidden() {
+        let camera = CameraFrame {
+            position: [0.0, 0.0, 0.0],
+            right: [1.0, 0.0, 0.0],
+            up: [0.0, 1.0, 0.0],
+            forward: [0.0, 0.0, 1.0],
+        };
+
+        assert!(clip_world_segment_to_near_plane(
+            camera,
+            [0.0, 0.0, -10.0],
+            [10.0, 0.0, -1.0],
+            1.0,
+        )
+        .is_none());
     }
 
     #[test]
