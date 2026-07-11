@@ -776,5 +776,10 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     if (!alpha_compare_passes(previous.a)) {
         discard;
     }
-    return apply_fog(previous, input.view_depth);
+    // GX TEV registers retain signed 10-bit values between stages when their
+    // clamp bit is clear, but the pixel engine consumes 8-bit RGBA for alpha
+    // compare and framebuffer blending. Do not let an unclamped final TEV
+    // value become a floating-point blend input: BiancoRiver deliberately
+    // scales its last water stage by 4x and relies on this EFB quantization.
+    return clamp(apply_fog(previous, input.view_depth), vec4<f32>(0.0), vec4<f32>(1.0));
 }
