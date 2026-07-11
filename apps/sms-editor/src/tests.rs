@@ -560,6 +560,8 @@ fn shimmer_models_use_the_heatwave_layer_and_indirect_loader_flags() {
     for path in [
         "stage.szs!/mapobj/shimmerlow.bmd",
         "stage.szs!/mapobj/shimmerlowfar.bmd",
+        "stage.szs!/mapobj/shimmerhi.bmd",
+        "stage.szs!/mapobj/shimmerhifar.bmd",
     ] {
         assert!(path_is_shimmer_model_path(path));
         assert_eq!(
@@ -568,6 +570,10 @@ fn shimmer_models_use_the_heatwave_layer_and_indirect_loader_flags() {
         );
         assert_eq!(model_loader_flags_for_path(path), 0x1101_0000);
     }
+
+    assert!(!path_is_shimmer_model_path(
+        "stage.szs!/mapobj/shimmerunrelated.bmd"
+    ));
 }
 
 #[test]

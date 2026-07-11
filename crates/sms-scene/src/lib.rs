@@ -977,6 +977,10 @@ mod tests {
     fn shimmer_uses_the_model_basename_stored_in_its_placement_stream() {
         let models = vec![
             (
+                "stage.szs!/mapobj/shimmerhi.bmd".to_string(),
+                "shimmerhi".to_string(),
+            ),
+            (
                 "stage.szs!/mapobj/shimmerlow.bmd".to_string(),
                 "shimmerlow".to_string(),
             ),
@@ -993,6 +997,14 @@ mod tests {
         assert_eq!(
             infer_preview_model_path(&object, &models).as_deref(),
             Some("stage.szs!/mapobj/shimmerlowfar.bmd")
+        );
+
+        object
+            .raw_params
+            .insert("stream_string_0".to_string(), "ShimmerHi".to_string());
+        assert_eq!(
+            infer_preview_model_path(&object, &models).as_deref(),
+            Some("stage.szs!/mapobj/shimmerhi.bmd")
         );
     }
 

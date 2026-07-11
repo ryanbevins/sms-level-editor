@@ -1910,10 +1910,17 @@ fn preview_render_layer_for_model_path(path: &str) -> PreviewRenderLayer {
 fn path_is_shimmer_model_path(path: &str) -> bool {
     let path = path.replace('\\', "/").to_ascii_lowercase();
     path.rsplit('/').next().is_some_and(|name| {
-        name == "shimmerlow.bmd"
-            || name == "shimmerlow.bdl"
-            || name == "shimmerlowfar.bmd"
-            || name == "shimmerlowfar.bdl"
+        matches!(
+            name,
+            "shimmerlow.bmd"
+                | "shimmerlow.bdl"
+                | "shimmerlowfar.bmd"
+                | "shimmerlowfar.bdl"
+                | "shimmerhi.bmd"
+                | "shimmerhi.bdl"
+                | "shimmerhifar.bmd"
+                | "shimmerhifar.bdl"
+        )
     })
 }
 
@@ -2021,7 +2028,7 @@ fn model_loader_flags_for_path(path: &str) -> u32 {
     match model_name {
         // TShimmer::load passes 0x11010000 so the authored indirect block is
         // retained and can displace the screen-copy texture.
-        "shimmerlow" | "shimmerlowfar" => 0x1101_0000,
+        "shimmerlow" | "shimmerlowfar" | "shimmerhi" | "shimmerhifar" => 0x1101_0000,
         // TSky::load uses SMS_MakeMActorWithAnmData(..., 0x10220000).
         "sky" if path_is_sky_model_path(&path) => SMS_DEFAULT_OBJECT_MODEL_LOAD_FLAGS,
         // TMapStaticObj::actor_data_table in MapStaticObject.cpp.
