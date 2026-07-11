@@ -595,6 +595,52 @@ fn shimmer_draw_transform_keeps_scale_but_cancels_placement_pose() {
 }
 
 #[test]
+fn reset_fruit_draw_transform_matches_runtime_body_radius_offsets() {
+    let transform = Transform {
+        translation: [10.0, 300.0, 30.0],
+        rotation_degrees: [0.0; 3],
+        scale: [1.0; 3],
+    };
+
+    for (resource_name, expected_y) in [
+        ("FruitCoconut", 340.0),
+        ("FruitPapaya", 340.0),
+        ("FruitDurian", 345.0),
+        ("FruitPine", 350.0),
+        ("RedPepper", 300.0),
+        ("FruitBanana", 300.0),
+    ] {
+        let mut object = SceneObject::new(resource_name, "ResetFruit");
+        object
+            .raw_params
+            .insert("stream_string_0".to_string(), resource_name.to_string());
+
+        assert_eq!(
+            reset_fruit_preview_transform(&object, transform).translation[1],
+            expected_y
+        );
+    }
+}
+
+#[test]
+fn reset_fruit_draw_transform_scales_the_runtime_body_radius() {
+    let mut object = SceneObject::new("pine", "ResetFruit");
+    object
+        .raw_params
+        .insert("stream_string_0".to_string(), "FruitPine".to_string());
+    let transform = Transform {
+        translation: [0.0, 100.0, 0.0],
+        rotation_degrees: [0.0; 3],
+        scale: [2.0; 3],
+    };
+
+    assert_eq!(
+        reset_fruit_preview_transform(&object, transform).translation[1],
+        210.0
+    );
+}
+
+#[test]
 fn skybox_vertices_track_camera_translation() {
     let vertices = [[1.0, 2.0, 3.0], [-4.0, 5.0, 6.0], [7.0, 8.0, -9.0]];
     let camera = [100.0, 200.0, 300.0];

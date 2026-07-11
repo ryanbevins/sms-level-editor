@@ -640,9 +640,10 @@ fn infer_preview_model_path(
 
     // TMapObjBase::load and TShimmer::load read their resource identity from
     // the first placement stream string. Prefer that authored basename over
-    // generic factories such as `Palm` and `Shimmer`.
+    // generic factories such as `Palm`, `Shimmer`, and `ResetFruit`.
     if object.factory_name.eq_ignore_ascii_case("Palm")
         || object.factory_name.eq_ignore_ascii_case("Shimmer")
+        || object.factory_name.eq_ignore_ascii_case("ResetFruit")
     {
         if let Some(model_name) = object.raw_params.get("stream_string_0") {
             let key = normalize_model_key(model_name);
@@ -1032,5 +1033,49 @@ mod tests {
             infer_preview_model_path(&object, &models).as_deref(),
             Some("stage.szs!/mapobj/palmleaf.bmd")
         );
+    }
+
+    #[test]
+    fn reset_fruits_use_the_model_basename_stored_in_their_placement_stream() {
+        let models = vec![
+            (
+                "stage.szs!/mapobj/fruitbanana.bmd".to_string(),
+                "fruitbanana".to_string(),
+            ),
+            (
+                "stage.szs!/mapobj/fruitcoconut.bmd".to_string(),
+                "fruitcoconut".to_string(),
+            ),
+            (
+                "stage.szs!/mapobj/fruitdurian.bmd".to_string(),
+                "fruitdurian".to_string(),
+            ),
+            (
+                "stage.szs!/mapobj/fruitpapaya.bmd".to_string(),
+                "fruitpapaya".to_string(),
+            ),
+            (
+                "stage.szs!/mapobj/fruitpine.bmd".to_string(),
+                "fruitpine".to_string(),
+            ),
+        ];
+
+        for fruit in [
+            "FruitBanana",
+            "FruitCoconut",
+            "FruitDurian",
+            "FruitPapaya",
+            "FruitPine",
+        ] {
+            let mut object = SceneObject::new(fruit, "ResetFruit");
+            object
+                .raw_params
+                .insert("stream_string_0".to_string(), fruit.to_string());
+
+            assert_eq!(
+                infer_preview_model_path(&object, &models).as_deref(),
+                Some(format!("stage.szs!/mapobj/{}.bmd", fruit.to_ascii_lowercase()).as_str())
+            );
+        }
     }
 }

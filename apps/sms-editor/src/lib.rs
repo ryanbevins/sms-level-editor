@@ -821,7 +821,7 @@ impl SmsEditorApp {
             let object_preview_transform = if object_render_layer == PreviewRenderLayer::Heatwave {
                 shimmer_preview_transform(object.transform)
             } else {
-                object.transform
+                reset_fruit_preview_transform(object, object.transform)
             };
             let model_cache_key = (model_path.clone(), loader_flags);
 
@@ -1933,6 +1933,41 @@ fn shimmer_preview_transform(transform: Transform) -> Transform {
         rotation_degrees: [0.0; 3],
         scale: transform.scale,
     }
+}
+
+fn reset_fruit_preview_transform(object: &SceneObject, mut transform: Transform) -> Transform {
+    if !object.factory_name.eq_ignore_ascii_case("ResetFruit") {
+        return transform;
+    }
+
+    let Some(resource_name) = object.raw_params.get("stream_string_0") else {
+        return transform;
+    };
+    let resource_name = resource_name.to_ascii_lowercase();
+    let base_radius = match resource_name.as_str() {
+        "fruitcoconut" | "fruitpapaya" => 40.0,
+        "fruitdurian" => 45.0,
+        "fruitbanana" | "fruitpine" => 50.0,
+        // redpepper.bmd is already authored bottom-origin in the geometry
+        // preview (like fruitbanana.bmd), so an additional lift makes it float.
+        "redpepper" => 0.0,
+        _ => return transform,
+    };
+
+    // TMapObjBall::initMapObj sets the fruit-specific body radius, then
+    // TResetFruit::makeObjAppeared places the model at position.y + radius.
+    // Banana and pineapple apply the additional matrix corrections below.
+    let matrix_y_axis_y = transform.scale[1]
+        * transform.rotation_degrees[0].to_radians().cos()
+        * transform.rotation_degrees[2].to_radians().cos();
+    let mut y_offset = base_radius * transform.scale[1];
+    if resource_name == "fruitbanana" && matrix_y_axis_y > 0.0 {
+        y_offset -= 50.0 * matrix_y_axis_y;
+    } else if resource_name == "fruitpine" {
+        y_offset -= 10.0 * (1.0 - matrix_y_axis_y);
+    }
+    transform.translation[1] += y_offset;
+    transform
 }
 
 fn path_is_sky_model_path(path: &str) -> bool {

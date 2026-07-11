@@ -379,32 +379,56 @@ impl SmsEditorApp {
             return false;
         };
 
+        let (old_preview_transform, new_preview_transform) = self
+            .document
+            .as_ref()
+            .and_then(|document| {
+                document
+                    .objects
+                    .iter()
+                    .find(|object| object.id == object_id)
+            })
+            .map(|object| {
+                (
+                    reset_fruit_preview_transform(object, old_transform),
+                    reset_fruit_preview_transform(object, new_transform),
+                )
+            })
+            .unwrap_or((old_transform, new_transform));
+
         for model in &mut preview.animated_models {
             if let Some(instance) = model
                 .instances
                 .iter_mut()
                 .find(|instance| instance.model_index == model_index)
             {
-                instance.transform = new_transform;
+                instance.transform = new_preview_transform;
             }
         }
 
         let mut changed = false;
         for point in &mut preview.points {
             if point.model_index == model_index {
-                point.position =
-                    retransform_preview_point(point.position, old_transform, new_transform);
+                point.position = retransform_preview_point(
+                    point.position,
+                    old_preview_transform,
+                    new_preview_transform,
+                );
                 changed = true;
             }
         }
         for triangle in &mut preview.triangles {
             if triangle.model_index == model_index {
-                triangle.vertices = triangle
-                    .vertices
-                    .map(|vertex| retransform_preview_point(vertex, old_transform, new_transform));
+                triangle.vertices = triangle.vertices.map(|vertex| {
+                    retransform_preview_point(vertex, old_preview_transform, new_preview_transform)
+                });
                 triangle.normals = triangle.normals.map(|normals| {
                     normals.map(|normal| {
-                        retransform_preview_normal(normal, old_transform, new_transform)
+                        retransform_preview_normal(
+                            normal,
+                            old_preview_transform,
+                            new_preview_transform,
+                        )
                     })
                 });
                 changed = true;
