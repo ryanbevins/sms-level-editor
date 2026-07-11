@@ -484,22 +484,60 @@ fn alpha_arg(
     }
 }
 
-fn tev_scale(value: vec3<f32>, scale: u32) -> vec3<f32> {
-    switch scale {
-        case 1u: { return value * 2.0; }
-        case 2u: { return value * 4.0; }
-        case 3u: { return value * 0.5; }
-        default: { return value; }
-    }
+fn tev_s10(value: f32) -> i32 {
+    return clamp(i32(round(value * 255.0)), -1024, 1023);
 }
 
-fn tev_alpha_scale(value: f32, scale: u32) -> f32 {
-    switch scale {
-        case 1u: { return value * 2.0; }
-        case 2u: { return value * 4.0; }
-        case 3u: { return value * 0.5; }
-        default: { return value; }
+fn tev_input_u8(value: f32) -> i32 {
+    // A, B, and C read only the low eight bits of a TEV register. This is
+    // observable when an earlier unclamped stage writes a signed 10-bit value.
+    return tev_s10(value) & 255;
+}
+
+fn tev_regular_channel(
+    a: f32,
+    b: f32,
+    c: f32,
+    d: f32,
+    operation: vec4<u32>,
+) -> f32 {
+    let input_a = tev_input_u8(a);
+    let input_b = tev_input_u8(b);
+    let input_c = tev_input_u8(c);
+    let input_d = tev_s10(d);
+    var bias = 0;
+    if (operation.y == 1u) {
+        bias = 128;
+    } else if (operation.y == 2u) {
+        bias = -128;
     }
+
+    // GX expands C from 0..255 to 0..256, shifts scale into both terms, and
+    // applies a one-unit rounding difference between add and subtract.
+    let lerp_numerator = (input_a * 256)
+        + (input_b - input_a) * (input_c + (input_c >> 7));
+    var result = 0;
+    if (operation.z == 3u) {
+        let lerp = lerp_numerator >> 8;
+        result = select(input_d + bias + lerp, input_d + bias - lerp, operation.x == 1u) >> 1;
+    } else {
+        var scale = 1;
+        if (operation.z == 1u) {
+            scale = 2;
+        } else if (operation.z == 2u) {
+            scale = 4;
+        }
+        let rounding = select(128, 127, operation.x == 1u);
+        let lerp = (lerp_numerator * scale + rounding) >> 8;
+        result = select((input_d + bias) * scale + lerp, (input_d + bias) * scale - lerp, operation.x == 1u);
+    }
+
+    let clamped = select(
+        clamp(result, -1024, 1023),
+        clamp(result, 0, 255),
+        (operation.w & 0xffu) != 0u,
+    );
+    return f32(clamped) / 255.0;
 }
 
 fn tev_u8(value: f32) -> u32 {
@@ -522,74 +560,63 @@ fn tev_color_result(
     operation: vec4<u32>,
 ) -> vec3<f32> {
     let op = operation.x;
-    var result = vec3<f32>(0.0);
     if (op == 0u || op == 1u) {
-        let mixed = mix(a, b, c);
-        result = select(d + mixed, d - mixed, op == 1u);
-        if (operation.y == 1u) {
-            result = result + vec3<f32>(0.5);
-        } else if (operation.y == 2u) {
-            result = result - vec3<f32>(0.5);
-        }
-        result = tev_scale(result, operation.z);
+        return vec3<f32>(
+            tev_regular_channel(a.r, b.r, c.r, d.r, operation),
+            tev_regular_channel(a.g, b.g, c.g, d.g, operation),
+            tev_regular_channel(a.b, b.b, c.b, d.b, operation),
+        );
+    }
+
+    var comparison = vec3<f32>(0.0);
+    if (op == 8u) {
+        comparison = vec3<f32>(select(0.0, 1.0, tev_u8(a.r) > tev_u8(b.r)));
+    } else if (op == 9u) {
+        comparison = vec3<f32>(select(0.0, 1.0, tev_u8(a.r) == tev_u8(b.r)));
+    } else if (op == 10u) {
+        comparison = vec3<f32>(select(0.0, 1.0, tev_pack_gr(a) > tev_pack_gr(b)));
+    } else if (op == 11u) {
+        comparison = vec3<f32>(select(0.0, 1.0, tev_pack_gr(a) == tev_pack_gr(b)));
+    } else if (op == 12u) {
+        comparison = vec3<f32>(select(0.0, 1.0, tev_pack_bgr(a) > tev_pack_bgr(b)));
+    } else if (op == 13u) {
+        comparison = vec3<f32>(select(0.0, 1.0, tev_pack_bgr(a) == tev_pack_bgr(b)));
+    } else if (op == 14u) {
+        comparison = vec3<f32>(
+            select(0.0, 1.0, tev_u8(a.r) > tev_u8(b.r)),
+            select(0.0, 1.0, tev_u8(a.g) > tev_u8(b.g)),
+            select(0.0, 1.0, tev_u8(a.b) > tev_u8(b.b)),
+        );
     } else {
-        var comparison = vec3<f32>(0.0);
-        if (op == 8u) {
-            comparison = vec3<f32>(select(0.0, 1.0, tev_u8(a.r) > tev_u8(b.r)));
-        } else if (op == 9u) {
-            comparison = vec3<f32>(select(0.0, 1.0, tev_u8(a.r) == tev_u8(b.r)));
-        } else if (op == 10u) {
-            comparison = vec3<f32>(select(0.0, 1.0, tev_pack_gr(a) > tev_pack_gr(b)));
-        } else if (op == 11u) {
-            comparison = vec3<f32>(select(0.0, 1.0, tev_pack_gr(a) == tev_pack_gr(b)));
-        } else if (op == 12u) {
-            comparison = vec3<f32>(select(0.0, 1.0, tev_pack_bgr(a) > tev_pack_bgr(b)));
-        } else if (op == 13u) {
-            comparison = vec3<f32>(select(0.0, 1.0, tev_pack_bgr(a) == tev_pack_bgr(b)));
-        } else if (op == 14u) {
-            comparison = vec3<f32>(
-                select(0.0, 1.0, tev_u8(a.r) > tev_u8(b.r)),
-                select(0.0, 1.0, tev_u8(a.g) > tev_u8(b.g)),
-                select(0.0, 1.0, tev_u8(a.b) > tev_u8(b.b)),
-            );
-        } else {
-            comparison = vec3<f32>(
-                select(0.0, 1.0, tev_u8(a.r) == tev_u8(b.r)),
-                select(0.0, 1.0, tev_u8(a.g) == tev_u8(b.g)),
-                select(0.0, 1.0, tev_u8(a.b) == tev_u8(b.b)),
-            );
-        }
-        result = d + comparison * c;
+        comparison = vec3<f32>(
+            select(0.0, 1.0, tev_u8(a.r) == tev_u8(b.r)),
+            select(0.0, 1.0, tev_u8(a.g) == tev_u8(b.g)),
+            select(0.0, 1.0, tev_u8(a.b) == tev_u8(b.b)),
+        );
     }
-    let packed = operation.w;
-    if ((packed & 0xffu) != 0u) {
-        return clamp(result, vec3<f32>(0.0), vec3<f32>(1.0));
-    }
-    return clamp(result, vec3<f32>(-4.0), vec3<f32>(4.0));
+    let result = d + comparison * c;
+    return select(
+        clamp(result, vec3<f32>(-1024.0 / 255.0), vec3<f32>(1023.0 / 255.0)),
+        clamp(result, vec3<f32>(0.0), vec3<f32>(1.0)),
+        (operation.w & 0xffu) != 0u,
+    );
 }
 
 fn tev_alpha_result(a: f32, b: f32, c: f32, d: f32, operation: vec4<u32>) -> f32 {
     let op = operation.x;
-    var result = 0.0;
     if (op == 0u || op == 1u) {
-        let mixed = mix(a, b, c);
-        result = select(d + mixed, d - mixed, op == 1u);
-        if (operation.y == 1u) {
-            result = result + 0.5;
-        } else if (operation.y == 2u) {
-            result = result - 0.5;
-        }
-        result = tev_alpha_scale(result, operation.z);
-    } else if (op == 14u) {
-        result = d + select(0.0, c, tev_u8(a) > tev_u8(b));
-    } else {
-        result = d + select(0.0, c, tev_u8(a) == tev_u8(b));
+        return tev_regular_channel(a, b, c, d, operation);
     }
-    let packed = operation.w;
-    if ((packed & 0xffu) != 0u) {
-        return clamp(result, 0.0, 1.0);
-    }
-    return clamp(result, -4.0, 4.0);
+    let result = select(
+        d + select(0.0, c, tev_u8(a) == tev_u8(b)),
+        d + select(0.0, c, tev_u8(a) > tev_u8(b)),
+        op == 14u,
+    );
+    return select(
+        clamp(result, -1024.0 / 255.0, 1023.0 / 255.0),
+        clamp(result, 0.0, 1.0),
+        (operation.w & 0xffu) != 0u,
+    );
 }
 
 fn gx_compare(value: f32, compare: u32, reference: f32) -> bool {

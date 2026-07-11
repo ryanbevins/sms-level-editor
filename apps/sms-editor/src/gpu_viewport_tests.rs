@@ -23,6 +23,27 @@ fn j3d_shader_parses_and_validates() {
 }
 
 #[test]
+fn unclamped_tev_outputs_wrap_to_u8_when_reused_by_coin_material() {
+    fn regular(a: i32, b: i32, c: i32, d: i32, bias: i32, scale: i32) -> i32 {
+        let a = a & 255;
+        let b = b & 255;
+        let c = c & 255;
+        let lerp = (((a * 256 + (b - a) * (c + (c >> 7))) * scale) + 128) >> 8;
+        ((d + bias) * scale + lerp).clamp(-1024, 1023)
+    }
+
+    // The first coin stage writes 0.5 * 4 to an unclamped signed register.
+    // GX feeds only its low byte into C on the next stage, selecting the dark
+    // base register. Treating 512 as a floating-point 2.0 instead saturates the
+    // final coin color and is the visible brightness bug this guards against.
+    let stage0 = regular(0, 0, 255, 0, 128, 4);
+    assert_eq!(stage0, 512);
+    assert_eq!(stage0 & 255, 0);
+    assert_eq!(regular(173, 255, stage0, 0, 0, 1), 173);
+    assert!(J3D_SHADER.contains("return tev_s10(value) & 255;"));
+}
+
+#[test]
 fn geometry_updates_touch_only_requested_triangle_batches() {
     let mut preview = geometry_update_preview();
     let mut scene = GpuSceneData::from_preview(&preview);
