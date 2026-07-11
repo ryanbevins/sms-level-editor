@@ -28,7 +28,7 @@ serde_json = "1.0"
 thiserror = "2.0"
 toml = "0.9"
 walkdir = "2.5"
-wgpu = "29.0.3"
+wgpu = "30.0.0"
 
 sms-formats = { path = "crates/sms-formats" }
 sms-render = { path = "crates/sms-render" }
