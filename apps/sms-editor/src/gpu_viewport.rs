@@ -74,6 +74,7 @@ struct VertexIn {
     @location(9) uv5: vec2<f32>,
     @location(10) uv6: vec2<f32>,
     @location(11) uv7: vec2<f32>,
+    @location(12) camera_relative: u32,
 };
 
 struct VertexOut {
@@ -218,7 +219,14 @@ fn compute_color_channel(
 
 @vertex
 fn vs_main(input: VertexIn) -> VertexOut {
-    let rel = input.position - camera.camera_position.xyz;
+    // TSky::perform translates sky.bmd to the camera every frame. Keeping the
+    // model in camera-local space here reproduces that behavior without
+    // rebuilding its vertex buffer while the editor camera moves.
+    let rel = select(
+        input.position - camera.camera_position.xyz,
+        input.position,
+        input.camera_relative != 0u,
+    );
     let depth = dot(rel, camera.forward.xyz);
     let clip_x = dot(rel, camera.right.xyz) * camera.projection.x + camera.projection.z * depth;
     let clip_y = dot(rel, camera.up.xyz) * camera.projection.y + camera.projection.w * depth;
@@ -978,6 +986,7 @@ impl GpuSceneData {
                     uv5: tex_coords[5],
                     uv6: tex_coords[6],
                     uv7: tex_coords[7],
+                    camera_relative: camera_relative_for_render_layer(triangle.render_layer),
                 });
             }
             batch.indices.extend_from_slice(&[base, base + 1, base + 2]);
@@ -1022,9 +1031,14 @@ fn render_layer_id(layer: PreviewRenderLayer) -> u8 {
     }
 }
 
+fn camera_relative_for_render_layer(layer: PreviewRenderLayer) -> u32 {
+    u32::from(layer == PreviewRenderLayer::Sky)
+}
+
 #[derive(Clone)]
 struct GpuTextureData {
     mips: Vec<GpuTextureMip>,
+    format: wgpu::TextureFormat,
     address_mode_u: wgpu::AddressMode,
     address_mode_v: wgpu::AddressMode,
     mag_filter: wgpu::FilterMode,
@@ -1045,6 +1059,7 @@ impl GpuTextureData {
                 size: [1, 1],
                 rgba: vec![255; 4],
             }],
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Nearest,
@@ -1066,12 +1081,25 @@ impl GpuTextureData {
         }
         Self {
             mips,
+            format: gpu_texture_format_for_j3d(texture.format),
             address_mode_u: sampler_address_mode(texture.wrap_s),
             address_mode_v: sampler_address_mode(texture.wrap_t),
             mag_filter: sampler_mag_filter(texture.mag_filter),
             min_filter: sampler_min_filter(texture.min_filter),
             mipmap_filter: sampler_mipmap_filter(texture.min_filter, texture.mipmap_count),
         }
+    }
+}
+
+fn gpu_texture_format_for_j3d(format: u8) -> wgpu::TextureFormat {
+    // GX intensity formats carry numeric intensity/mask values, not sRGB
+    // colors. Sampling them through an sRGB texture view darkens their RGB
+    // before TEV math while leaving alpha untouched, which breaks effects
+    // such as sky cloud masks that use the same intensity in both paths.
+    if matches!(format, 0..=3) {
+        wgpu::TextureFormat::Rgba8Unorm
+    } else {
+        wgpu::TextureFormat::Rgba8UnormSrgb
     }
 }
 
@@ -1617,10 +1645,11 @@ struct GpuVertex {
     uv5: [f32; 2],
     uv6: [f32; 2],
     uv7: [f32; 2],
+    camera_relative: u32,
 }
 
 impl GpuVertex {
-    const ATTRIBUTES: [wgpu::VertexAttribute; 12] = wgpu::vertex_attr_array![
+    const ATTRIBUTES: [wgpu::VertexAttribute; 13] = wgpu::vertex_attr_array![
         0 => Float32x3,
         1 => Float32x3,
         2 => Float32x4,
@@ -1632,7 +1661,8 @@ impl GpuVertex {
         8 => Float32x2,
         9 => Float32x2,
         10 => Float32x2,
-        11 => Float32x2
+        11 => Float32x2,
+        12 => Uint32
     ];
 
     fn layout() -> wgpu::VertexBufferLayout<'static> {
@@ -1891,7 +1921,7 @@ impl GpuTextureResource {
             mip_level_count: data.mips.len() as u32,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            format: data.format,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -2118,13 +2148,13 @@ fn gpu_blend_state(key: GpuBlendKey) -> Option<wgpu::BlendState> {
     match key.mode {
         1 => Some(wgpu::BlendState {
             color: wgpu::BlendComponent {
-                src_factor: gx_blend_factor(key.src_factor, true),
-                dst_factor: gx_blend_factor(key.dst_factor, false),
+                src_factor: gx_blend_factor(key.src_factor),
+                dst_factor: gx_blend_factor(key.dst_factor),
                 operation: wgpu::BlendOperation::Add,
             },
             alpha: wgpu::BlendComponent {
-                src_factor: gx_blend_factor(key.src_factor, true),
-                dst_factor: gx_blend_factor(key.dst_factor, false),
+                src_factor: gx_blend_factor(key.src_factor),
+                dst_factor: gx_blend_factor(key.dst_factor),
                 operation: wgpu::BlendOperation::Add,
             },
         }),
@@ -2144,14 +2174,12 @@ fn gpu_blend_state(key: GpuBlendKey) -> Option<wgpu::BlendState> {
     }
 }
 
-fn gx_blend_factor(factor: u8, source: bool) -> wgpu::BlendFactor {
+fn gx_blend_factor(factor: u8) -> wgpu::BlendFactor {
     match factor {
         0 => wgpu::BlendFactor::Zero,
         1 => wgpu::BlendFactor::One,
-        2 if source => wgpu::BlendFactor::Src,
-        2 => wgpu::BlendFactor::Dst,
-        3 if source => wgpu::BlendFactor::OneMinusSrc,
-        3 => wgpu::BlendFactor::OneMinusDst,
+        2 => wgpu::BlendFactor::Src,
+        3 => wgpu::BlendFactor::OneMinusSrc,
         4 => wgpu::BlendFactor::SrcAlpha,
         5 => wgpu::BlendFactor::OneMinusSrcAlpha,
         6 => wgpu::BlendFactor::DstAlpha,
@@ -2257,6 +2285,39 @@ mod tests {
                 .pass,
             GpuBatchPass::Translucent
         );
+    }
+
+    #[test]
+    fn only_sky_vertices_are_camera_relative() {
+        assert_eq!(camera_relative_for_render_layer(PreviewRenderLayer::Sky), 1);
+        assert_eq!(
+            camera_relative_for_render_layer(PreviewRenderLayer::Main),
+            0
+        );
+        assert_eq!(
+            camera_relative_for_render_layer(PreviewRenderLayer::Water),
+            0
+        );
+    }
+
+    #[test]
+    fn gx_intensity_textures_are_sampled_in_linear_space() {
+        for format in 0..=3 {
+            assert_eq!(
+                gpu_texture_format_for_j3d(format),
+                wgpu::TextureFormat::Rgba8Unorm
+            );
+        }
+        assert_eq!(
+            gpu_texture_format_for_j3d(6),
+            wgpu::TextureFormat::Rgba8UnormSrgb
+        );
+    }
+
+    #[test]
+    fn gx_source_color_blend_factors_do_not_change_with_blend_slot() {
+        assert_eq!(gx_blend_factor(2), wgpu::BlendFactor::Src);
+        assert_eq!(gx_blend_factor(3), wgpu::BlendFactor::OneMinusSrc);
     }
 
     #[test]

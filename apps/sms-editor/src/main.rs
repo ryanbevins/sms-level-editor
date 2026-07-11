@@ -100,6 +100,7 @@ struct ModelPreview {
     bounds_max: [f32; 3],
     camera_bounds_min: [f32; 3],
     camera_bounds_max: [f32; 3],
+    sky_radius: f32,
     loaded_models: usize,
     failed_models: usize,
     source_vertices: usize,
@@ -122,6 +123,12 @@ impl ModelPreview {
         let dy = self.camera_bounds_max[1] - self.camera_bounds_min[1];
         let dz = self.camera_bounds_max[2] - self.camera_bounds_min[2];
         ((dx * dx + dy * dy + dz * dz).sqrt() * 0.5).max(1000.0)
+    }
+
+    fn far_clip(&self, camera_distance: f32) -> f32 {
+        (camera_distance + self.radius() * 5.0)
+            .max(self.sky_radius * 1.05)
+            .max(20_000.0)
     }
 }
 
@@ -1345,7 +1352,7 @@ impl SmsEditorApp {
         let preview = self.model_preview.as_ref()?;
         let frame = self.camera_frame();
         let focal = perspective_focal_length(rect, self.viewport_zoom);
-        let far = (self.renderer.camera().distance + preview.radius() * 5.0).max(20_000.0);
+        let far = preview.far_clip(self.renderer.camera().distance);
         Some(gpu_viewport::GpuViewportFrame {
             camera_position: frame.position,
             right: frame.right,
@@ -1468,7 +1475,12 @@ impl SmsEditorApp {
         size: [usize; 2],
         triangle: &'a PreviewTriangle,
     ) -> Option<ProjectedPreviewTriangle<'a>> {
-        let screen = project_triangle_to_framebuffer(self, rect, size, triangle.vertices)?;
+        let vertices = preview_triangle_world_vertices(
+            triangle.vertices,
+            triangle.render_layer,
+            self.camera_frame().position,
+        );
+        let screen = project_triangle_to_framebuffer(self, rect, size, vertices)?;
         if !projected_triangle_overlaps_frame(screen, size) {
             return None;
         }
@@ -1843,6 +1855,7 @@ impl SmsEditorApp {
         let mut bounds_max = [f32::NEG_INFINITY; 3];
         let mut camera_bounds_min = [f32::INFINITY; 3];
         let mut camera_bounds_max = [f32::NEG_INFINITY; 3];
+        let mut sky_radius = 0.0f32;
         let mut camera_bound_points = Vec::new();
         let mut loaded_models = 0;
         let mut failed_models = 0;
@@ -1855,6 +1868,7 @@ impl SmsEditorApp {
             let asset_path = asset.path.to_string_lossy().replace('\\', "/");
             let include_in_camera_bounds = is_camera_bounds_model_path(&asset_path);
             let model_render_layer = preview_render_layer_for_model_path(&asset_path);
+            let is_sky = model_render_layer == PreviewRenderLayer::Sky;
             let Ok(bytes) = read_stage_asset_bytes(&asset.path) else {
                 failed_models += 1;
                 continue;
@@ -1884,12 +1898,16 @@ impl SmsEditorApp {
                     source_vertices += preview.positions.len();
                     source_triangles += preview.triangles.len();
                     source_textures += preview.textures.len();
-                    merge_bounds(
-                        &mut bounds_min,
-                        &mut bounds_max,
-                        preview.bounds_min,
-                        preview.bounds_max,
-                    );
+                    if is_sky {
+                        sky_radius = sky_radius.max(max_distance_from_origin(&preview.positions));
+                    } else {
+                        merge_bounds(
+                            &mut bounds_min,
+                            &mut bounds_max,
+                            preview.bounds_min,
+                            preview.bounds_max,
+                        );
+                    }
                     if include_in_camera_bounds {
                         merge_bounds(
                             &mut camera_bounds_min,
@@ -1900,12 +1918,14 @@ impl SmsEditorApp {
                         camera_bound_points.extend(preview.positions.iter().copied());
                     }
 
-                    let point_stride = (preview.positions.len() / POINTS_PER_MODEL).max(1);
-                    for position in preview.positions.iter().step_by(point_stride) {
-                        points.push(PreviewPoint {
-                            position: *position,
-                            model_index,
-                        });
+                    if !is_sky {
+                        let point_stride = (preview.positions.len() / POINTS_PER_MODEL).max(1);
+                        for position in preview.positions.iter().step_by(point_stride) {
+                            points.push(PreviewPoint {
+                                position: *position,
+                                model_index,
+                            });
+                        }
                     }
 
                     for triangle in &preview.triangles {
@@ -1952,12 +1972,16 @@ impl SmsEditorApp {
                     loaded_models += 1;
                     let model_index = loaded_models;
                     source_vertices += preview.positions.len();
-                    merge_bounds(
-                        &mut bounds_min,
-                        &mut bounds_max,
-                        preview.bounds_min,
-                        preview.bounds_max,
-                    );
+                    if is_sky {
+                        sky_radius = sky_radius.max(max_distance_from_origin(&preview.positions));
+                    } else {
+                        merge_bounds(
+                            &mut bounds_min,
+                            &mut bounds_max,
+                            preview.bounds_min,
+                            preview.bounds_max,
+                        );
+                    }
                     if include_in_camera_bounds {
                         merge_bounds(
                             &mut camera_bounds_min,
@@ -1968,12 +1992,14 @@ impl SmsEditorApp {
                         camera_bound_points.extend(preview.positions.iter().copied());
                     }
 
-                    let stride = (preview.positions.len() / POINTS_PER_MODEL).max(1);
-                    for position in preview.positions.iter().step_by(stride) {
-                        points.push(PreviewPoint {
-                            position: *position,
-                            model_index,
-                        });
+                    if !is_sky {
+                        let stride = (preview.positions.len() / POINTS_PER_MODEL).max(1);
+                        for position in preview.positions.iter().step_by(stride) {
+                            points.push(PreviewPoint {
+                                position: *position,
+                                model_index,
+                            });
+                        }
                     }
                 }
             }
@@ -2148,6 +2174,7 @@ impl SmsEditorApp {
             bounds_max,
             camera_bounds_min,
             camera_bounds_max,
+            sky_radius,
             loaded_models,
             failed_models,
             source_vertices,
@@ -3199,6 +3226,26 @@ fn merge_bounds(
     }
 }
 
+fn max_distance_from_origin(points: &[[f32; 3]]) -> f32 {
+    points
+        .iter()
+        .filter(|point| point.iter().all(|value| value.is_finite()))
+        .map(|point| vec3_dot(*point, *point).sqrt())
+        .fold(0.0, f32::max)
+}
+
+fn preview_triangle_world_vertices(
+    vertices: [[f32; 3]; 3],
+    render_layer: PreviewRenderLayer,
+    camera_position: [f32; 3],
+) -> [[f32; 3]; 3] {
+    if render_layer == PreviewRenderLayer::Sky {
+        vertices.map(|vertex| vec3_add(vertex, camera_position))
+    } else {
+        vertices
+    }
+}
+
 fn recompute_model_preview_bounds(preview: &mut ModelPreview) {
     if let Some((bounds_min, bounds_max)) =
         robust_preview_bounds(&preview.triangles, &preview.points)
@@ -3232,7 +3279,10 @@ fn robust_preview_bounds(
     points: &[PreviewPoint],
 ) -> Option<([f32; 3], [f32; 3])> {
     let mut axes = [Vec::new(), Vec::new(), Vec::new()];
-    if triangles.is_empty() {
+    let has_world_triangles = triangles
+        .iter()
+        .any(|triangle| triangle.render_layer != PreviewRenderLayer::Sky);
+    if !has_world_triangles {
         for point in points {
             for (axis, value) in axes.iter_mut().zip(point.position) {
                 if value.is_finite() {
@@ -3241,7 +3291,10 @@ fn robust_preview_bounds(
             }
         }
     } else {
-        for triangle in triangles {
+        for triangle in triangles
+            .iter()
+            .filter(|triangle| triangle.render_layer != PreviewRenderLayer::Sky)
+        {
             for vertex in triangle.vertices {
                 for (axis, value) in axes.iter_mut().zip(vertex) {
                     if value.is_finite() {
@@ -3929,8 +3982,8 @@ fn is_default_preview_model_path(
     if !(path.contains("!/map/") || path.contains("/scene/map/")) {
         return false;
     }
-    if path.contains("/map/map/sky") {
-        return false;
+    if path_is_sky_model_path(&path) {
+        return true;
     }
     if path_is_indirect_water_model_path(&path) {
         return false;
@@ -3955,7 +4008,7 @@ fn is_camera_bounds_model_path(path: &str) -> bool {
     if !(path.contains("!/map/") || path.contains("/scene/map/")) {
         return false;
     }
-    !(path.contains("/map/map/sky")
+    !(path_is_sky_model_path(&path)
         || path_is_water_model_path(&path)
         || path_is_indirect_water_model_path(&path)
         || path_is_goop_model_path(&path)
@@ -3966,7 +4019,7 @@ fn is_camera_bounds_model_path(path: &str) -> bool {
 
 fn preview_render_layer_for_model_path(path: &str) -> PreviewRenderLayer {
     let path = path.to_ascii_lowercase();
-    if path.contains("/map/map/sky") {
+    if path_is_sky_model_path(&path) {
         PreviewRenderLayer::Sky
     } else if path_is_goop_model_path(&path) {
         PreviewRenderLayer::Goop
@@ -3975,6 +4028,11 @@ fn preview_render_layer_for_model_path(path: &str) -> PreviewRenderLayer {
     } else {
         PreviewRenderLayer::Main
     }
+}
+
+fn path_is_sky_model_path(path: &str) -> bool {
+    let path = path.replace('\\', "/").to_ascii_lowercase();
+    path.ends_with("/map/map/sky.bmd") || path.ends_with("/map/map/sky.bdl")
 }
 
 fn path_is_water_model_path(path: &str) -> bool {
@@ -4010,6 +4068,8 @@ fn model_loader_flags_for_path(path: &str) -> u32 {
         .trim_end_matches(".bdl");
 
     match model_name {
+        // TSky::load uses SMS_MakeMActorWithAnmData(..., 0x10220000).
+        "sky" if path_is_sky_model_path(&path) => SMS_DEFAULT_OBJECT_MODEL_LOAD_FLAGS,
         // TMapStaticObj::actor_data_table in MapStaticObject.cpp.
         "seaindirect" => 0x1121_0000,
         "sea" => 0x1022_0000,
@@ -4327,6 +4387,7 @@ mod tests {
             bounds_max: [1.0, 1.0, 1.0],
             camera_bounds_min: [0.0, 0.0, 0.0],
             camera_bounds_max: [1.0, 1.0, 1.0],
+            sky_radius: 0.0,
             loaded_models: 1,
             failed_models: 0,
             source_vertices: 0,
@@ -4433,6 +4494,51 @@ mod tests {
         assert!(!is_default_preview_model_path(path, true, true, false));
         assert!(is_default_preview_model_path(path, true, true, true));
         assert!(!is_camera_bounds_model_path(path));
+    }
+
+    #[test]
+    fn skybox_model_is_loaded_as_camera_relative_environment() {
+        let path = "stage.szs!/map/map/sky.bmd";
+
+        assert!(is_default_preview_model_path(path, false, false, false));
+        assert!(!is_camera_bounds_model_path(path));
+        assert_eq!(
+            preview_render_layer_for_model_path(path),
+            PreviewRenderLayer::Sky
+        );
+        assert_eq!(
+            model_loader_flags_for_path(path),
+            SMS_DEFAULT_OBJECT_MODEL_LOAD_FLAGS
+        );
+        assert!(!path_is_sky_model_path("stage.szs!/map/map/reflectsky.bmd"));
+    }
+
+    #[test]
+    fn skybox_vertices_track_camera_translation() {
+        let vertices = [[1.0, 2.0, 3.0], [-4.0, 5.0, 6.0], [7.0, 8.0, -9.0]];
+        let camera = [100.0, 200.0, 300.0];
+
+        assert_eq!(
+            preview_triangle_world_vertices(vertices, PreviewRenderLayer::Sky, camera),
+            [
+                [101.0, 202.0, 303.0],
+                [96.0, 205.0, 306.0],
+                [107.0, 208.0, 291.0],
+            ]
+        );
+        assert_eq!(
+            preview_triangle_world_vertices(vertices, PreviewRenderLayer::Main, camera),
+            vertices
+        );
+    }
+
+    #[test]
+    fn skybox_radius_expands_the_far_clip() {
+        let mut preview = preview_for_texture_alpha(false, false);
+        preview.sky_radius = 150_000.0;
+
+        let far = preview.far_clip(1_000.0);
+        assert!((157_000.0..158_000.0).contains(&far));
     }
 
     #[test]
@@ -4723,6 +4829,7 @@ mod tests {
                 bounds_max: [1.0, 2.0, 3.0],
                 camera_bounds_min: [0.0, 0.0, 0.0],
                 camera_bounds_max: [1.0, 2.0, 3.0],
+                sky_radius: 0.0,
                 loaded_models: 1,
                 failed_models: 0,
                 source_vertices: 3,
