@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 
+use encoding_rs::SHIFT_JIS;
 use serde::{Deserialize, Serialize};
 
 use crate::binary::{be_f32, be_u16, be_u32};
@@ -159,7 +160,10 @@ fn read_len_string(bytes: &[u8], offset: usize, limit: usize) -> Result<(String,
     if end > limit || end > bytes.len() {
         return Err(invalid_offset(end, limit));
     }
-    let value = String::from_utf8_lossy(&bytes[start..end]).to_string();
+    // Retail JDrama names use the GameCube-era Japanese code page. ASCII is a
+    // subset of Shift-JIS, so this also preserves the common English names.
+    let (value, _) = SHIFT_JIS.decode_without_bom_handling(&bytes[start..end]);
+    let value = value.into_owned();
     Ok((value, end))
 }
 
@@ -237,5 +241,18 @@ mod tests {
             scan_ascii_stream_strings(&bytes, 0, bytes.len()),
             ["NozzleBox", "rocket_nozzle_item"]
         );
+    }
+
+    #[test]
+    fn decodes_shift_jis_length_prefixed_string() {
+        let bytes = [
+            0x00, 0x10, 0x83, 0x6f, 0x83, 0x8b, 0x81, 0x5b, 0x83, 0x93, 0x83, 0x77, 0x83, 0x8b,
+            0x83, 0x76, b'v', b'1',
+        ];
+
+        let (value, next) = read_len_string(&bytes, 0, bytes.len()).unwrap();
+
+        assert_eq!(value, "バルーンヘルプv1");
+        assert_eq!(next, bytes.len());
     }
 }

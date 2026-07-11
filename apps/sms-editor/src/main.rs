@@ -1905,16 +1905,14 @@ impl SmsEditorApp {
                     let material_base =
                         push_preview_materials(&mut materials, &preview, texture_base);
                     material_animation_bindings.resize_with(materials.len(), Vec::new);
-                    if model_render_layer == PreviewRenderLayer::Water {
-                        attach_model_texture_srt_animation(
-                            document,
-                            &asset_path,
-                            material_base,
-                            &preview.materials,
-                            &mut texture_srt_animations,
-                            &mut material_animation_bindings,
-                        );
-                    }
+                    attach_model_texture_srt_animation(
+                        document,
+                        &asset_path,
+                        material_base,
+                        &preview.materials,
+                        &mut texture_srt_animations,
+                        &mut material_animation_bindings,
+                    );
                     let packet_base = next_packet_index;
                     next_packet_index += preview
                         .triangles
@@ -2082,6 +2080,15 @@ impl SmsEditorApp {
             };
             let object_material_base =
                 push_object_preview_materials(&mut materials, cached, object);
+            material_animation_bindings.resize_with(materials.len(), Vec::new);
+            attach_model_texture_srt_animation(
+                document,
+                &model_path,
+                object_material_base,
+                &cached.preview.materials,
+                &mut texture_srt_animations,
+                &mut material_animation_bindings,
+            );
             loaded_models += 1;
             let model_index = loaded_models;
             object_model_indices.insert(object.id.clone(), model_index);
@@ -2728,6 +2735,8 @@ impl SmsEditorApp {
 }
 
 fn install_style(ctx: &egui::Context) {
+    install_japanese_font(ctx);
+
     let mut visuals = egui::Visuals::dark();
     visuals.panel_fill = egui::Color32::from_rgb(28, 30, 31);
     visuals.window_fill = egui::Color32::from_rgb(32, 34, 35);
@@ -2742,6 +2751,65 @@ fn install_style(ctx: &egui::Context) {
     style.spacing.button_padding = egui::vec2(10.0, 5.0);
     style.spacing.indent = 16.0;
     ctx.set_style_of(egui::Theme::Dark, style);
+}
+
+fn install_japanese_font(ctx: &egui::Context) {
+    let Some(font_bytes) = japanese_font_candidates()
+        .into_iter()
+        .find_map(|path| std::fs::read(path).ok())
+    else {
+        return;
+    };
+
+    const FONT_NAME: &str = "sms-japanese-fallback";
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        FONT_NAME.to_owned(),
+        std::sync::Arc::new(egui::FontData::from_owned(font_bytes)),
+    );
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        if let Some(family_fonts) = fonts.families.get_mut(&family) {
+            family_fonts.push(FONT_NAME.to_owned());
+        }
+    }
+    ctx.set_fonts(fonts);
+}
+
+fn japanese_font_candidates() -> Vec<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        let fonts = std::env::var_os("WINDIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+            .join("Fonts");
+        ["YuGothR.ttc", "meiryo.ttc", "msgothic.ttc"]
+            .into_iter()
+            .map(|name| fonts.join(name))
+            .collect()
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        [
+            "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
+            "/System/Library/Fonts/ヒラギノ丸ゴ ProN W4.ttc",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect()
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        [
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansJP-Regular.otf",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect()
+    }
 }
 
 fn command_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Response {
@@ -2840,10 +2908,9 @@ fn attach_model_texture_srt_animation(
     animations: &mut Vec<J3dTextureSrtAnimation>,
     material_bindings: &mut [Vec<PreviewMaterialAnimationBinding>],
 ) {
-    let Some(extension_offset) = model_path.rfind('.') else {
+    let Some(animation_path) = model_texture_srt_animation_path(model_path) else {
         return;
     };
-    let animation_path = format!("{}.btk", &model_path[..extension_offset]);
     let Some(asset) = document.assets.iter().find(|asset| {
         asset.kind == StageAssetKind::Animation
             && asset
@@ -2883,6 +2950,11 @@ fn attach_model_texture_srt_animation(
     if matched {
         animations.push(animation);
     }
+}
+
+fn model_texture_srt_animation_path(model_path: &str) -> Option<String> {
+    let extension_offset = model_path.rfind('.')?;
+    Some(format!("{}.btk", &model_path[..extension_offset]))
 }
 
 fn apply_model_material_table(
@@ -4756,6 +4828,27 @@ mod tests {
             PreviewRenderLayer::Goop
         );
         assert!(!is_camera_bounds_model_path(path));
+    }
+
+    #[test]
+    fn every_model_layer_uses_its_same_basename_btk() {
+        for (model, animation) in [
+            (
+                "stage.szs!/map/pollution/pollution00.bmd",
+                "stage.szs!/map/pollution/pollution00.btk",
+            ),
+            ("stage.szs!/map/map/sea.bmd", "stage.szs!/map/map/sea.btk"),
+            ("stage.szs!/map/map/sky.bmd", "stage.szs!/map/map/sky.btk"),
+            (
+                "stage.szs!/mapobj/animated.bdl",
+                "stage.szs!/mapobj/animated.btk",
+            ),
+        ] {
+            assert_eq!(
+                model_texture_srt_animation_path(model).as_deref(),
+                Some(animation)
+            );
+        }
     }
 
     #[test]
