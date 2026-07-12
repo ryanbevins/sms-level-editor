@@ -367,6 +367,18 @@ impl GpuSceneData {
                     .normals
                     .map(|normals| normals[vertex_index])
                     .unwrap_or(face_normal);
+                let colors = legacy_vertex_colors(triangle, face_normal);
+                vertex.color0 = triangle.color_channels[0]
+                    .map(|channels| color_u8_to_f32(channels[vertex_index]))
+                    .or_else(|| {
+                        triangle
+                            .vertex_colors
+                            .map(|channels| color_u8_to_f32(channels[vertex_index]))
+                    })
+                    .unwrap_or(colors[vertex_index]);
+                vertex.color1 = triangle.color_channels[1]
+                    .map(|channels| color_u8_to_f32(channels[vertex_index]))
+                    .unwrap_or([1.0; 4]);
             }
             dirty_batches.insert(location.batch_index);
         }
@@ -404,6 +416,8 @@ fn render_layer_id(layer: PreviewRenderLayer) -> u8 {
         PreviewRenderLayer::Goop => 3,
         PreviewRenderLayer::Shadow => 4,
         PreviewRenderLayer::Heatwave => 5,
+        PreviewRenderLayer::Particle => 6,
+        PreviewRenderLayer::ParticleDistortion => 7,
     }
 }
 
@@ -411,6 +425,8 @@ fn coordinate_space_for_render_layer(layer: PreviewRenderLayer) -> u32 {
     match layer {
         PreviewRenderLayer::Sky => 1,
         PreviewRenderLayer::Heatwave => 2,
+        PreviewRenderLayer::Particle => 3,
+        PreviewRenderLayer::ParticleDistortion => 4,
         _ => 0,
     }
 }
@@ -673,7 +689,10 @@ impl GpuMaterialState {
     }
 
     fn pipeline_key(self, render_layer: PreviewRenderLayer) -> GpuPipelineKey {
-        let pass = if render_layer == PreviewRenderLayer::Heatwave {
+        let pass = if matches!(
+            render_layer,
+            PreviewRenderLayer::Heatwave | PreviewRenderLayer::ParticleDistortion
+        ) {
             GpuBatchPass::Heatwave
         } else if render_layer == PreviewRenderLayer::Sky {
             GpuBatchPass::Sky

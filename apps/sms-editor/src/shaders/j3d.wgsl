@@ -51,7 +51,9 @@ struct VertexIn {
     @location(9) uv5: vec2<f32>,
     @location(10) uv6: vec2<f32>,
     @location(11) uv7: vec2<f32>,
-    // 0 = world, 1 = camera-relative world (sky), 2 = GX view space (shimmer).
+    // 0 = world, 1 = camera-relative world (sky), 2 = GX view space (shimmer),
+    // 3 = camera-facing JPA billboard, 4 = billboarded JPA EFB distortion;
+    // normal.xy is half-size and normal.z rotation for both.
     @location(12) coordinate_space: u32,
 };
 
@@ -68,6 +70,7 @@ struct VertexOut {
     @location(8) uv6: vec2<f32>,
     @location(9) uv7: vec2<f32>,
     @location(10) view_depth: f32,
+    @location(11) @interpolate(flat) coordinate_space: u32,
 };
 
 @group(0) @binding(0)
@@ -203,7 +206,7 @@ fn vs_main(input: VertexIn) -> VertexOut {
     let rel = select(
         input.position - camera.camera_position.xyz,
         input.position,
-        input.coordinate_space != 0u,
+        input.coordinate_space == 1u || input.coordinate_space == 2u,
     );
     var view_position = vec3<f32>(
         dot(rel, camera.right.xyz),
@@ -220,6 +223,17 @@ fn vs_main(input: VertexIn) -> VertexOut {
         // quad, so its model coordinates arrive in GX view space.
         view_position = vec3<f32>(input.position.xy, -input.position.z);
         view_normal = normalize(vec3<f32>(input.normal.xy, -input.normal.z));
+    } else if (input.coordinate_space == 3u || input.coordinate_space == 4u) {
+        let corner = input.uv0 * 2.0 - vec2<f32>(1.0);
+        let angle = input.normal.z * 3.14159265359;
+        let rotated = vec2<f32>(
+            corner.x * cos(angle) - corner.y * sin(angle),
+            corner.x * sin(angle) + corner.y * cos(angle),
+        );
+        let billboard_offset = rotated * input.normal.xy;
+        view_position.x = view_position.x + billboard_offset.x;
+        view_position.y = view_position.y + billboard_offset.y;
+        view_normal = vec3<f32>(0.0, 0.0, -1.0);
     }
     let depth = view_position.z;
     let clip_x = view_position.x * camera.projection.x + camera.projection.z * depth;
@@ -327,6 +341,7 @@ fn vs_main(input: VertexIn) -> VertexOut {
     out.uv6 = generated_uv(coords, 6u);
     out.uv7 = generated_uv(coords, 7u);
     out.view_depth = depth;
+    out.coordinate_space = input.coordinate_space;
     return out;
 }
 
@@ -727,6 +742,14 @@ fn apply_fog(color: vec4<f32>, depth: f32) -> vec4<f32> {
 
 @fragment
 fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
+    if (input.coordinate_space == 4u) {
+        let mask = textureSample(texture0, sampler0, input.uv0);
+        let target_size = vec2<f32>(textureDimensions(texture1));
+        let screen_uv = input.position.xy / target_size;
+        let displacement = (mask.rg - vec2<f32>(0.5)) * 0.035 * input.color0.a;
+        let scene = textureSample(texture1, sampler1, screen_uv + displacement);
+        return vec4<f32>(scene.rgb, mask.a * input.color0.a);
+    }
     var previous = vec4<f32>(0.0);
     var reg0 = material.tev_colors[0];
     var reg1 = material.tev_colors[1];

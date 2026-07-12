@@ -110,6 +110,9 @@ fn geometry_update_preview() -> ModelPreview {
         object_model_indices: BTreeMap::new(),
         animated_models: Vec::new(),
         level_transform_models: Vec::new(),
+        level_transform_particles: Vec::new(),
+        level_transform_duration_frames: 600.0,
+        level_transform_particle_end_frames: 600.0,
     }
 }
 
@@ -168,6 +171,14 @@ fn render_layers_select_their_runtime_coordinate_space() {
     assert_eq!(
         coordinate_space_for_render_layer(PreviewRenderLayer::Water),
         0
+    );
+    assert_eq!(
+        coordinate_space_for_render_layer(PreviewRenderLayer::Particle),
+        3
+    );
+    assert_eq!(
+        coordinate_space_for_render_layer(PreviewRenderLayer::ParticleDistortion),
+        4
     );
 }
 

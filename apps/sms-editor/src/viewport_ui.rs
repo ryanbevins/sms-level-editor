@@ -436,32 +436,48 @@ impl SmsEditorApp {
     }
 
     pub(super) fn update_level_transformation(&mut self, ctx: &egui::Context) {
-        const PREVIEW_SECONDS: f32 = 4.0;
+        let (duration_frames, particle_end_frames) = self
+            .model_preview
+            .as_ref()
+            .map(|preview| {
+                (
+                    preview.level_transform_duration_frames,
+                    preview.level_transform_particle_end_frames,
+                )
+            })
+            .unwrap_or((600.0, 600.0));
+        let mut particle_frame = if self.level_transform_progress >= 1.0 {
+            particle_end_frames
+        } else {
+            self.level_transform_progress * duration_frames
+        };
         if self.level_transform_playing {
-            let elapsed = self.level_transform_started_at.elapsed().as_secs_f32();
-            let amount = (elapsed / PREVIEW_SECONDS).clamp(0.0, 1.0);
-            self.level_transform_progress = self.level_transform_playback_origin
-                + (1.0 - self.level_transform_playback_origin) * amount;
-            if amount >= 1.0 {
+            let start_frame = self.level_transform_playback_origin * duration_frames;
+            particle_frame = start_frame
+                + self.level_transform_started_at.elapsed().as_secs_f32()
+                    * SMS_ANIMATION_FRAMES_PER_SECOND;
+            self.level_transform_progress = (particle_frame / duration_frames).clamp(0.0, 1.0);
+            if particle_frame >= particle_end_frames {
+                particle_frame = particle_end_frames;
                 self.level_transform_playing = false;
             } else {
                 ctx.request_repaint_after(std::time::Duration::from_millis(16));
             }
         }
 
-        let geometry_progress = if self.level_transform_playing {
-            (self.level_transform_progress * 120.0).floor() / 120.0
-        } else {
-            self.level_transform_progress
-        };
-        let progress_bits = geometry_progress.to_bits();
+        let geometry_progress = level_transform_sample_progress(
+            self.level_transform_progress,
+            duration_frames,
+            self.level_transform_playing,
+        );
+        let progress_bits = particle_frame.floor().to_bits();
         if progress_bits == self.last_level_transform_progress_bits {
             return;
         }
         let Some(preview) = self.model_preview.as_mut() else {
             return;
         };
-        if preview.level_transform_models.is_empty() {
+        if !preview.has_level_transformation() {
             self.last_level_transform_progress_bits = progress_bits;
             return;
         }
@@ -469,6 +485,7 @@ impl SmsEditorApp {
 
         let ModelPreview {
             level_transform_models,
+            level_transform_particles,
             points,
             triangles,
             ..
@@ -504,13 +521,20 @@ impl SmsEditorApp {
                 triangle.normals = posed.normals;
             }
         }
+        apply_level_transform_particles(level_transform_particles, particle_frame, triangles);
 
         if let Some(gpu_viewport) = &self.gpu_viewport {
-            let triangle_ranges = preview
+            let mut triangle_ranges = preview
                 .level_transform_models
                 .iter()
                 .map(|model| model.triangle_range.clone())
                 .collect::<Vec<_>>();
+            triangle_ranges.extend(
+                preview
+                    .level_transform_particles
+                    .iter()
+                    .map(|particles| particles.triangle_range.clone()),
+            );
             gpu_viewport.update_geometry(preview, &triangle_ranges);
         }
         self.clear_viewport_preview_cache();

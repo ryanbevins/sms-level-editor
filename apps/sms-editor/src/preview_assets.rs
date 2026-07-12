@@ -20,6 +20,7 @@ pub(super) fn level_transform_targets(
     }
 
     let mut targets = BTreeMap::<usize, LevelTransformTarget>::new();
+    let mut target_order = Vec::<usize>::new();
     for asset in document.assets.iter().filter(|asset| {
         asset.kind == StageAssetKind::Placement
             && asset
@@ -47,6 +48,9 @@ pub(super) fn level_transform_targets(
                 {
                     let object_index = usize::from(building.pollution_object_index);
                     if let Ok(Some(joint_index)) = file.runtime_joint_child_index(0, object_index) {
+                        if !targets.contains_key(&joint_index) {
+                            target_order.push(joint_index);
+                        }
                         targets.insert(
                             joint_index,
                             LevelTransformTarget {
@@ -60,6 +64,9 @@ pub(super) fn level_transform_targets(
                     if let Ok(Some(joint_index)) =
                         file.runtime_joint_child_index(0, object_index + 1)
                     {
+                        if !targets.contains_key(&joint_index) {
+                            target_order.push(joint_index);
+                        }
                         targets.insert(
                             joint_index,
                             LevelTransformTarget {
@@ -143,11 +150,17 @@ pub(super) fn level_transform_targets(
                         behavior: LevelTransformBehavior::Linear,
                     },
                 );
+                if !target_order.contains(&joint_index) {
+                    target_order.push(joint_index);
+                }
             }
         }
     }
 
-    targets.into_values().collect()
+    target_order
+        .into_iter()
+        .filter_map(|joint_index| targets.remove(&joint_index))
+        .collect()
 }
 
 pub(super) fn level_transform_overrides(
@@ -316,8 +329,15 @@ pub(super) fn push_preview_textures(
     textures: &mut Vec<PreviewTexture>,
     preview: &J3dGeometryPreview,
 ) -> usize {
+    push_j3d_preview_textures(textures, &preview.textures)
+}
+
+pub(super) fn push_j3d_preview_textures(
+    textures: &mut Vec<PreviewTexture>,
+    source: &[sms_formats::J3dTexturePreview],
+) -> usize {
     let texture_base = textures.len();
-    for texture in &preview.textures {
+    for texture in source {
         let expected_len = texture.width as usize * texture.height as usize * 4;
         if texture.rgba.len() == expected_len && expected_len > 0 {
             let has_alpha = texture.rgba.chunks_exact(4).any(|pixel| pixel[3] < 245);

@@ -513,6 +513,9 @@ fn preview_for_texture_alpha(has_alpha: bool, has_translucent_alpha: bool) -> Mo
         object_model_indices: BTreeMap::new(),
         animated_models: Vec::new(),
         level_transform_models: Vec::new(),
+        level_transform_particles: Vec::new(),
+        level_transform_duration_frames: 600.0,
+        level_transform_particle_end_frames: 600.0,
     }
 }
 
@@ -1238,6 +1241,9 @@ fn updating_object_transform_moves_cached_preview_mesh() {
             object_model_indices,
             animated_models: Vec::new(),
             level_transform_models: Vec::new(),
+            level_transform_particles: Vec::new(),
+            level_transform_duration_frames: 600.0,
+            level_transform_particle_end_frames: 600.0,
         }),
         ..SmsEditorApp::default()
     };

@@ -10,6 +10,7 @@ mod col;
 mod j3d;
 mod j3d_anim;
 mod jdrama;
+mod jpa;
 mod rarc;
 mod raw;
 mod stage_assets;
@@ -27,11 +28,14 @@ pub use j3d::{
 };
 pub use j3d_anim::{
     J3dJointAnimation, J3dJointTransform, J3dTexturePatternAnimation, J3dTexturePatternBinding,
-    J3dTextureSrt, J3dTextureSrtAnimation, J3dTextureSrtBinding,
+    J3dTextureSrt, J3dTextureSrtAnimation, J3dTextureSrtBinding, SMS_ANIMATION_FRAMES_PER_SECOND,
 };
 pub use jdrama::{
     parse_jdrama_object_records, JDramaMapEventBuilding, JDramaMapEventSinkParams, JDramaNpcParams,
     JDramaObjectRecord, JDramaTransform,
+};
+pub use jpa::{
+    JpaBaseShape, JpaChildShape, JpaEffect, JpaEmitter, JpaExtraShape, JpaField, JpaKeyframeCurve,
 };
 pub use rarc::{RarcArchive, RarcFileEntry, RarcHeader};
 pub use raw::{RawFile, RawFormat};

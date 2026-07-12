@@ -53,7 +53,7 @@ impl SmsEditorApp {
             if self
                 .model_preview
                 .as_ref()
-                .is_some_and(|preview| !preview.level_transform_models.is_empty())
+                .is_some_and(ModelPreview::has_level_transformation)
             {
                 ui.separator();
                 let label = if self.level_transform_playing {
@@ -63,7 +63,9 @@ impl SmsEditorApp {
                 };
                 if ui
                     .button(label)
-                    .on_hover_text("Preview the retail procedural map-joint transformation")
+                    .on_hover_text(
+                        "Preview the asset-driven level change at Sunshine's animation rate",
+                    )
                     .clicked()
                 {
                     if self.level_transform_playing {
@@ -195,10 +197,21 @@ impl SmsEditorApp {
         if self
             .model_preview
             .as_ref()
-            .is_some_and(|preview| !preview.level_transform_models.is_empty())
+            .is_some_and(ModelPreview::has_level_transformation)
         {
             ui.separator();
             ui.label("Level transformation");
+            if let Some(duration_frames) = self
+                .model_preview
+                .as_ref()
+                .map(|preview| preview.level_transform_duration_frames)
+            {
+                ui.small(format!(
+                    "Asset timeline: {:.1}s at {:.0} FPS",
+                    level_transform_duration_seconds(duration_frames),
+                    SMS_ANIMATION_FRAMES_PER_SECOND
+                ));
+            }
             ui.horizontal(|ui| {
                 let play_label = if self.level_transform_playing {
                     "Pause"

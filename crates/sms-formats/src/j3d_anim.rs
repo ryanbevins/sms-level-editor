@@ -6,6 +6,7 @@ use crate::binary::{
 use crate::{FormatError, PreserveBytes, Result};
 
 const FORMAT: &str = "J3D animation";
+pub const SMS_ANIMATION_FRAMES_PER_SECOND: f32 = 60.0;
 const FILE_HEADER_SIZE: usize = 0x20;
 const TTK1_HEADER_SIZE: usize = 0x60;
 const KEY_TABLE_SIZE: usize = 0x06;
@@ -449,7 +450,7 @@ fn playback_frame(attribute: u8, max_frame: u16, elapsed_seconds: f32) -> f32 {
     if !elapsed_seconds.is_finite() || end <= 0.0 {
         return 0.0;
     }
-    let frame = elapsed_seconds.max(0.0) * 60.0;
+    let frame = elapsed_seconds.max(0.0) * SMS_ANIMATION_FRAMES_PER_SECOND;
     match attribute {
         0 => frame.min((end - 0.001).max(0.0)),
         1 => {

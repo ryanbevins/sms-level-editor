@@ -22,6 +22,9 @@ pub(super) struct ModelPreview {
     pub(super) object_model_indices: BTreeMap<String, usize>,
     pub(super) animated_models: Vec<AnimatedModelPreview>,
     pub(super) level_transform_models: Vec<LevelTransformModelPreview>,
+    pub(super) level_transform_particles: Vec<LevelTransformParticlePreview>,
+    pub(super) level_transform_duration_frames: f32,
+    pub(super) level_transform_particle_end_frames: f32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -47,6 +50,10 @@ pub(super) struct PreviewTexturePatternBinding {
 }
 
 impl ModelPreview {
+    pub(super) fn has_level_transformation(&self) -> bool {
+        !self.level_transform_models.is_empty() || !self.level_transform_particles.is_empty()
+    }
+
     pub(super) fn center(&self) -> [f32; 3] {
         [
             (self.camera_bounds_min[0] + self.camera_bounds_max[0]) * 0.5,
@@ -67,6 +74,21 @@ impl ModelPreview {
             .max(self.sky_radius * 1.05)
             .max(20_000.0)
     }
+}
+
+#[derive(Clone)]
+pub(super) struct LevelTransformParticlePreview {
+    pub(super) effect: JpaEffect,
+    pub(super) kind: JpaParticleKind,
+    pub(super) origin_offset: [f32; 3],
+    pub(super) triangle_range: std::ops::Range<usize>,
+    pub(super) particle_capacity: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum JpaParticleKind {
+    Parent,
+    Child,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -106,6 +128,8 @@ pub(super) enum PreviewRenderLayer {
     Goop,
     Shadow,
     Heatwave,
+    Particle,
+    ParticleDistortion,
 }
 
 #[derive(Debug, Clone, Copy)]

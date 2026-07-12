@@ -13,9 +13,9 @@ use sms_formats::{
     decode_bti_texture, discover_scene_archives, parse_jdrama_object_records,
     read_stage_asset_bytes, J3dAlphaCompare, J3dBlendMode, J3dFile, J3dGeometryPreview,
     J3dJointAnimation, J3dJointTransformOverride, J3dMaterial, J3dMatrix34, J3dPreviewCombineMode,
-    J3dTexturePatternAnimation, J3dTextureSrtAnimation, J3dTriangle, J3dZMode, SceneArchiveInfo,
-    StageAsset, StageAssetKind, SMS_DEFAULT_OBJECT_MODEL_LOAD_FLAGS, SMS_MAP_MODEL_LOAD_FLAGS,
-    SMS_POLLUTION_MODEL_LOAD_FLAGS,
+    J3dTexturePatternAnimation, J3dTextureSrtAnimation, J3dTriangle, J3dZMode, JpaEffect,
+    SceneArchiveInfo, StageAsset, StageAssetKind, SMS_ANIMATION_FRAMES_PER_SECOND,
+    SMS_DEFAULT_OBJECT_MODEL_LOAD_FLAGS, SMS_MAP_MODEL_LOAD_FLAGS, SMS_POLLUTION_MODEL_LOAD_FLAGS,
 };
 use sms_render::{RenderScene, RendererConfig, ViewportRenderer};
 use sms_scene::{
@@ -575,7 +575,7 @@ impl SmsEditorApp {
         ));
         if let Some(preview) = &preview {
             self.log.push(format!(
-                "Viewport preview loaded {} model(s), {} sampled point(s), {} triangle(s), {} texture(s), {} BTK material animation(s), {} BCK skeletal animation(s), {} procedural map-joint transformation(s), {} source vertex/vertices.",
+                "Viewport preview loaded {} model(s), {} sampled point(s), {} triangle(s), {} texture(s), {} BTK material animation(s), {} BCK skeletal animation(s), {} procedural map-joint transformation(s), {} level-change JPA effect(s), {} source vertex/vertices.",
                 preview.loaded_models,
                 preview.points.len(),
                 preview.triangles.len(),
@@ -587,6 +587,7 @@ impl SmsEditorApp {
                     .iter()
                     .map(|model| model.targets.len())
                     .sum::<usize>(),
+                preview.level_transform_particles.len(),
                 preview.source_vertices
             ));
         } else if !scene.model_paths.is_empty() {
@@ -665,6 +666,7 @@ impl SmsEditorApp {
         let mut texture_pattern_animations = Vec::new();
         let mut material_animation_bindings = Vec::new();
         let mut level_transform_models = Vec::new();
+        let mut level_transform_particles = Vec::new();
         let mut next_packet_index = 0usize;
         let mut bounds_min = [f32::INFINITY; 3];
         let mut bounds_max = [f32::NEG_INFINITY; 3];
@@ -1188,6 +1190,20 @@ impl SmsEditorApp {
             })
             .collect();
 
+        push_level_transform_particle_previews(
+            document,
+            &level_transform_models,
+            &mut textures,
+            &mut triangles,
+            &mut next_packet_index,
+            &mut level_transform_particles,
+        );
+        let level_transform_duration_frames =
+            level_transform_duration_frames(&level_transform_particles);
+        let level_transform_particle_end_frames =
+            level_transform_particle_end_frames(&level_transform_particles)
+                .max(level_transform_duration_frames);
+
         if points.len() > POINT_BUDGET && animated_models.is_empty() {
             let stride = (points.len() / POINT_BUDGET).max(1);
             points = points
@@ -1240,6 +1256,9 @@ impl SmsEditorApp {
             object_model_indices,
             animated_models,
             level_transform_models,
+            level_transform_particles,
+            level_transform_duration_frames,
+            level_transform_particle_end_frames,
         })
     }
 
@@ -1344,6 +1363,9 @@ fn command_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Respon
 
 mod preview_assets;
 use preview_assets::*;
+
+mod preview_particles;
+use preview_particles::*;
 
 mod npc_accessories;
 use npc_accessories::*;
@@ -2290,7 +2312,9 @@ fn apply_layer_preview_tint(
         PreviewRenderLayer::Sky
         | PreviewRenderLayer::Main
         | PreviewRenderLayer::Shadow
-        | PreviewRenderLayer::Heatwave => color,
+        | PreviewRenderLayer::Heatwave
+        | PreviewRenderLayer::Particle
+        | PreviewRenderLayer::ParticleDistortion => color,
     }
 }
 
