@@ -1,5 +1,217 @@
 use super::*;
 
+enum RetailLevelTransform {
+    Sink { event_index: usize },
+    ScaleGate,
+    WallRock,
+}
+
+pub(super) fn level_transform_targets(
+    document: &StageDocument,
+    model_path: &str,
+    file: &J3dFile,
+) -> Vec<LevelTransformTarget> {
+    let normalized = model_path.replace('\\', "/").to_ascii_lowercase();
+    let is_map_model =
+        normalized.ends_with("!/map/map/map.bmd") || normalized.ends_with("/map/map/map.bmd");
+    let pollution_layer_index = pollution_layer_model_index(&normalized);
+    if !is_map_model && pollution_layer_index.is_none() {
+        return Vec::new();
+    }
+
+    let mut targets = BTreeMap::<usize, LevelTransformTarget>::new();
+    for asset in document.assets.iter().filter(|asset| {
+        asset.kind == StageAssetKind::Placement
+            && asset
+                .path
+                .to_string_lossy()
+                .replace('\\', "/")
+                .to_ascii_lowercase()
+                .ends_with("!/map/scene.bin")
+    }) {
+        let Ok(bytes) = read_stage_asset_bytes(&asset.path) else {
+            continue;
+        };
+        let Ok(records) = parse_jdrama_object_records(&bytes) else {
+            continue;
+        };
+        for record in records {
+            let lower_type = record.type_name.to_ascii_lowercase();
+            if let (Some(layer_index), Some(event)) =
+                (pollution_layer_index, record.map_event_sink.as_ref())
+            {
+                for building in event
+                    .buildings
+                    .iter()
+                    .filter(|building| usize::from(building.pollution_layer_index) == layer_index)
+                {
+                    let object_index = usize::from(building.pollution_object_index);
+                    if let Ok(Some(joint_index)) = file.runtime_joint_child_index(0, object_index) {
+                        targets.insert(
+                            joint_index,
+                            LevelTransformTarget {
+                                joint_index,
+                                translation_offset: [0.0; 3],
+                                scale_multiplier: [1.0; 3],
+                                behavior: LevelTransformBehavior::HideAfterStart,
+                            },
+                        );
+                    }
+                    if let Ok(Some(joint_index)) =
+                        file.runtime_joint_child_index(0, object_index + 1)
+                    {
+                        targets.insert(
+                            joint_index,
+                            LevelTransformTarget {
+                                joint_index,
+                                translation_offset: [0.0; 3],
+                                scale_multiplier: [1.0; 3],
+                                behavior: LevelTransformBehavior::AlwaysHidden,
+                            },
+                        );
+                    }
+                }
+                continue;
+            }
+            if !is_map_model {
+                continue;
+            }
+            let mut event_targets = Vec::<(u16, RetailLevelTransform)>::new();
+            if let Some(event) = record.map_event_sink {
+                for (event_index, building) in event.buildings.into_iter().enumerate() {
+                    event_targets.push((
+                        building.building_index,
+                        RetailLevelTransform::Sink { event_index },
+                    ));
+                }
+            } else if lower_type == "dolpiceventriccogate" {
+                event_targets.push((1, RetailLevelTransform::ScaleGate));
+            } else if lower_type == "dolpiceventmammagate" {
+                event_targets.push((2, RetailLevelTransform::ScaleGate));
+            } else if lower_type == "mareeventwallrock" {
+                for building_index in 1..=7 {
+                    event_targets.push((building_index, RetailLevelTransform::WallRock));
+                }
+            }
+
+            for (building_index, transform) in event_targets {
+                let Ok(Some(joint_index)) =
+                    file.map_building_joint_index(usize::from(building_index))
+                else {
+                    continue;
+                };
+                let (bounds_min, bounds_max) = file
+                    .joint_bounds(joint_index)
+                    .unwrap_or(([0.0; 3], [0.0; 3]));
+                let (translation_offset, scale_multiplier) = match transform {
+                    RetailLevelTransform::Sink { event_index } => {
+                        let bounds_depth = (bounds_max[1] - bounds_min[1]).abs();
+                        let sink_depth = match lower_type.as_str() {
+                            "mapeventsinkbianco" if event_index == 0 => 1700.0,
+                            "mapeventsinkbianco" => 1500.0,
+                            "mapeventsirenasink" => 3500.0,
+                            _ if bounds_depth.is_finite() && bounds_depth > 0.0 => bounds_depth,
+                            _ => 1000.0,
+                        };
+                        ([0.0, -sink_depth, 0.0], [1.0; 3])
+                    }
+                    RetailLevelTransform::ScaleGate => ([0.0, 295.0, 0.0], [1.0, 0.008, 1.0]),
+                    RetailLevelTransform::WallRock => {
+                        let bounds_depth = (bounds_max[2] - bounds_min[2]).abs();
+                        (
+                            [
+                                0.0,
+                                0.0,
+                                100.0
+                                    + if bounds_depth.is_finite() {
+                                        bounds_depth
+                                    } else {
+                                        0.0
+                                    },
+                            ],
+                            [1.0; 3],
+                        )
+                    }
+                };
+                targets.insert(
+                    joint_index,
+                    LevelTransformTarget {
+                        joint_index,
+                        translation_offset,
+                        scale_multiplier,
+                        behavior: LevelTransformBehavior::Linear,
+                    },
+                );
+            }
+        }
+    }
+
+    targets.into_values().collect()
+}
+
+pub(super) fn level_transform_overrides(
+    targets: &[LevelTransformTarget],
+    progress: f32,
+) -> Vec<J3dJointTransformOverride> {
+    let progress = progress.clamp(0.0, 1.0);
+    let remaining = 1.0 - progress;
+    targets
+        .iter()
+        .map(|target| {
+            let (translation_offset, scale_multiplier) = match target.behavior {
+                LevelTransformBehavior::Linear => (
+                    target.translation_offset.map(|value| value * remaining),
+                    target
+                        .scale_multiplier
+                        .map(|value| value + (1.0 - value) * progress),
+                ),
+                LevelTransformBehavior::AlwaysHidden | LevelTransformBehavior::HideAfterStart => {
+                    ([0.0; 3], [1.0; 3])
+                }
+            };
+            J3dJointTransformOverride {
+                joint_index: target.joint_index,
+                translation_offset,
+                scale_multiplier,
+            }
+        })
+        .collect()
+}
+
+pub(super) fn apply_level_transform_visibility(
+    file: &J3dFile,
+    targets: &[LevelTransformTarget],
+    progress: f32,
+    triangles: &mut [J3dTriangle],
+) {
+    let mut hidden_shapes = BTreeSet::new();
+    for target in targets
+        .iter()
+        .filter(|target| level_transform_target_is_hidden(target, progress))
+    {
+        if let Ok(shapes) = file.joint_subtree_shape_indices(target.joint_index) {
+            hidden_shapes.extend(shapes);
+        }
+    }
+    for triangle in triangles
+        .iter_mut()
+        .filter(|triangle| hidden_shapes.contains(&triangle.shape_index))
+    {
+        triangle.vertices = [triangle.vertices[0]; 3];
+    }
+}
+
+pub(super) fn level_transform_target_is_hidden(
+    target: &LevelTransformTarget,
+    progress: f32,
+) -> bool {
+    match target.behavior {
+        LevelTransformBehavior::Linear => false,
+        LevelTransformBehavior::AlwaysHidden => true,
+        LevelTransformBehavior::HideAfterStart => progress > f32::EPSILON,
+    }
+}
+
 pub(super) fn apply_pollution_bitmap_mask(
     document: &StageDocument,
     model_path: &str,

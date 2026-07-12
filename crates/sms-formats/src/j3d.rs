@@ -542,6 +542,13 @@ struct TevAlphaArgs {
 pub type J3dMatrix34 = [[f32; 4]; 3];
 type Mtx34 = J3dMatrix34;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct J3dJointTransformOverride {
+    pub joint_index: usize,
+    pub translation_offset: [f32; 3],
+    pub scale_multiplier: [f32; 3],
+}
+
 #[derive(Debug, Clone, Copy)]
 struct JointPreviewTransform {
     scale_compensate: bool,
@@ -675,7 +682,7 @@ impl J3dFile {
         &self,
         loader_flags: u32,
     ) -> Result<J3dGeometryPreview> {
-        self.geometry_preview_with_pose(loader_flags, None)
+        self.geometry_preview_with_pose(loader_flags, None, &[])
     }
 
     pub fn geometry_preview_with_joint_animation(
@@ -685,7 +692,15 @@ impl J3dFile {
         elapsed_seconds: f32,
     ) -> Result<J3dGeometryPreview> {
         let frame = animation.playback_frame(elapsed_seconds);
-        self.geometry_preview_with_pose(loader_flags, Some((animation, frame)))
+        self.geometry_preview_with_pose(loader_flags, Some((animation, frame)), &[])
+    }
+
+    pub fn geometry_preview_with_joint_overrides(
+        &self,
+        loader_flags: u32,
+        overrides: &[J3dJointTransformOverride],
+    ) -> Result<J3dGeometryPreview> {
+        self.geometry_preview_with_pose(loader_flags, None, overrides)
     }
 
     pub fn animated_triangles_with_joint_animation(
@@ -714,7 +729,47 @@ impl J3dFile {
                 message: "missing SHP1 section".to_string(),
             })?;
         let frame = animation.playback_frame(elapsed_seconds);
-        let draw_matrices = self.preview_draw_matrices(loader_flags, Some((animation, frame)))?;
+        let draw_matrices =
+            self.preview_draw_matrices(loader_flags, Some((animation, frame)), &[])?;
+        self.read_shape_triangles(
+            shp1.offset as usize,
+            &vertex_preview.positions,
+            &attr_formats,
+            position_format,
+            vertex_arrays,
+            &[],
+            &[],
+            &[],
+            &[],
+            &draw_matrices,
+        )
+    }
+
+    pub fn triangles_with_joint_overrides(
+        &self,
+        loader_flags: u32,
+        overrides: &[J3dJointTransformOverride],
+    ) -> Result<Vec<J3dTriangle>> {
+        let vertex_preview = self.vertex_preview()?;
+        let vtx1 = self
+            .section("VTX1")
+            .ok_or_else(|| FormatError::Unsupported {
+                format: FORMAT,
+                message: "missing VTX1 section".to_string(),
+            })?;
+        let vtx_offset = vtx1.offset as usize;
+        let attr_formats = self.attribute_formats(
+            vtx_offset + be_u32(&self.bytes, vtx_offset + 0x08, FORMAT)? as usize,
+        )?;
+        let position_format = position_format_from(&attr_formats)?;
+        let vertex_arrays = vertex_arrays(&self.bytes, vtx_offset, &attr_formats);
+        let shp1 = self
+            .section("SHP1")
+            .ok_or_else(|| FormatError::Unsupported {
+                format: FORMAT,
+                message: "missing SHP1 section".to_string(),
+            })?;
+        let draw_matrices = self.preview_draw_matrices(loader_flags, None, overrides)?;
         self.read_shape_triangles(
             shp1.offset as usize,
             &vertex_preview.positions,
@@ -749,17 +804,96 @@ impl J3dFile {
         elapsed_seconds: f32,
     ) -> Result<Vec<J3dMatrix34>> {
         let frame = animation.playback_frame(elapsed_seconds);
-        self.preview_joint_matrices(loader_flags, Some((animation, frame)))
+        self.preview_joint_matrices(loader_flags, Some((animation, frame)), &[])
     }
 
     pub fn joint_matrices(&self, loader_flags: u32) -> Result<Vec<J3dMatrix34>> {
-        self.preview_joint_matrices(loader_flags, None)
+        self.preview_joint_matrices(loader_flags, None, &[])
+    }
+
+    pub fn map_building_joint_index(&self, building_index: usize) -> Result<Option<usize>> {
+        let Some(jnt1) = self.section("JNT1") else {
+            return Ok(None);
+        };
+        let joint_count = be_u16(&self.bytes, jnt1.offset as usize + 0x08, FORMAT)? as usize;
+        let parents = self.joint_parent_indices(joint_count)?;
+        let root = parents.iter().position(Option::is_none);
+        let first_child =
+            root.and_then(|root| parents.iter().position(|parent| *parent == Some(root)));
+        Ok(first_child
+            .and_then(|parent| runtime_child_joint_index(&parents, parent, building_index)))
+    }
+
+    pub fn runtime_joint_child_index(
+        &self,
+        parent_joint_index: usize,
+        child_index: usize,
+    ) -> Result<Option<usize>> {
+        let Some(jnt1) = self.section("JNT1") else {
+            return Ok(None);
+        };
+        let joint_count = be_u16(&self.bytes, jnt1.offset as usize + 0x08, FORMAT)? as usize;
+        let parents = self.joint_parent_indices(joint_count)?;
+        Ok(runtime_child_joint_index(
+            &parents,
+            parent_joint_index,
+            child_index,
+        ))
+    }
+
+    pub fn joint_subtree_shape_indices(&self, joint_index: usize) -> Result<Vec<usize>> {
+        let Some(jnt1) = self.section("JNT1") else {
+            return Ok(Vec::new());
+        };
+        let joint_count = be_u16(&self.bytes, jnt1.offset as usize + 0x08, FORMAT)? as usize;
+        let parents = self.joint_parent_indices(joint_count)?;
+        let owners = self.shape_joint_indices()?;
+        Ok(owners
+            .into_iter()
+            .enumerate()
+            .filter_map(|(shape, owner)| {
+                owner
+                    .is_some_and(|owner| joint_is_in_subtree(owner, joint_index, &parents))
+                    .then_some(shape)
+            })
+            .collect())
+    }
+
+    pub fn joint_bounds(&self, joint_index: usize) -> Result<([f32; 3], [f32; 3])> {
+        let jnt1 = self
+            .section("JNT1")
+            .ok_or_else(|| FormatError::Unsupported {
+                format: FORMAT,
+                message: "missing JNT1 section".to_string(),
+            })?;
+        let base = jnt1.offset as usize;
+        let joint_count = be_u16(&self.bytes, base + 0x08, FORMAT)? as usize;
+        if joint_index >= joint_count {
+            return Err(invalid_offset(joint_index, joint_count));
+        }
+        let init_offset = relative_offset(&self.bytes, base, 0x0C)?;
+        let index_table_offset = relative_offset(&self.bytes, base, 0x10)?;
+        let init_index =
+            be_u16(&self.bytes, index_table_offset + joint_index * 2, FORMAT)? as usize;
+        let offset = init_offset + init_index * J3D_JOINT_INIT_DATA_SIZE;
+        let min = [
+            be_f32(&self.bytes, offset + 0x28, FORMAT)?,
+            be_f32(&self.bytes, offset + 0x2C, FORMAT)?,
+            be_f32(&self.bytes, offset + 0x30, FORMAT)?,
+        ];
+        let max = [
+            be_f32(&self.bytes, offset + 0x34, FORMAT)?,
+            be_f32(&self.bytes, offset + 0x38, FORMAT)?,
+            be_f32(&self.bytes, offset + 0x3C, FORMAT)?,
+        ];
+        Ok((min, max))
     }
 
     fn geometry_preview_with_pose(
         &self,
         loader_flags: u32,
         animation: Option<(&J3dJointAnimation, f32)>,
+        overrides: &[J3dJointTransformOverride],
     ) -> Result<J3dGeometryPreview> {
         let vertex_preview = self.vertex_preview()?;
         let vtx1 = self
@@ -801,7 +935,7 @@ impl J3dFile {
             .material_texture_bindings(&textures, &material_colors)
             .unwrap_or_default();
         let draw_matrices = self
-            .preview_draw_matrices(loader_flags, animation)
+            .preview_draw_matrices(loader_flags, animation, overrides)
             .unwrap_or_default();
         let triangles = self.read_shape_triangles(
             shp1.offset as usize,
@@ -1051,8 +1185,9 @@ impl J3dFile {
         &self,
         loader_flags: u32,
         animation: Option<(&J3dJointAnimation, f32)>,
+        overrides: &[J3dJointTransformOverride],
     ) -> Result<Vec<Option<Mtx34>>> {
-        let joint_matrices = self.preview_joint_matrices(loader_flags, animation)?;
+        let joint_matrices = self.preview_joint_matrices(loader_flags, animation, overrides)?;
         let envelope_matrices = self
             .preview_envelope_matrices(&joint_matrices)
             .unwrap_or_default();
@@ -1118,6 +1253,7 @@ impl J3dFile {
         &self,
         loader_flags: u32,
         animation: Option<(&J3dJointAnimation, f32)>,
+        overrides: &[J3dJointTransformOverride],
     ) -> Result<Vec<Mtx34>> {
         let Some(jnt1) = self.section("JNT1") else {
             return Ok(vec![identity_mtx34()]);
@@ -1146,6 +1282,26 @@ impl J3dFile {
                 transform.scale = sample.scale;
                 transform.rotation = sample.rotation_degrees.map(degrees_to_j3d_angle);
                 transform.translation = sample.translation;
+            }
+        }
+
+        for joint_override in overrides {
+            let Some(transform) = local.get_mut(joint_override.joint_index) else {
+                continue;
+            };
+            for (translation, offset) in transform
+                .translation
+                .iter_mut()
+                .zip(joint_override.translation_offset)
+            {
+                *translation += offset;
+            }
+            for (scale, multiplier) in transform
+                .scale
+                .iter_mut()
+                .zip(joint_override.scale_multiplier)
+            {
+                *scale *= multiplier;
             }
         }
 
@@ -1265,6 +1421,46 @@ impl J3dFile {
         }
 
         Ok(materials)
+    }
+
+    fn shape_joint_indices(&self) -> Result<Vec<Option<usize>>> {
+        let shape_count = self
+            .section("SHP1")
+            .map(|section| be_u16(&self.bytes, section.offset as usize + 0x08, FORMAT))
+            .transpose()?
+            .unwrap_or(0) as usize;
+        let mut owners = vec![None; shape_count];
+        let info = self
+            .section("INF1")
+            .ok_or_else(|| FormatError::Unsupported {
+                format: FORMAT,
+                message: "missing INF1 section".to_string(),
+            })?;
+        let hierarchy_offset = relative_offset(&self.bytes, info.offset as usize, 0x14)?;
+        let mut current_joint = None;
+        let mut stack = Vec::new();
+
+        for index in 0..8192 {
+            let offset = hierarchy_offset
+                .checked_add(index * 4)
+                .ok_or_else(|| invalid_offset(hierarchy_offset, self.bytes.len()))?;
+            checked_slice(FORMAT, &self.bytes, offset, 4)?;
+            let node_type = be_u16(&self.bytes, offset, FORMAT)?;
+            let value = be_u16(&self.bytes, offset + 0x02, FORMAT)? as usize;
+            match node_type {
+                J3D_HIERARCHY_END => break,
+                J3D_HIERARCHY_BEGIN_CHILD => stack.push(current_joint),
+                J3D_HIERARCHY_END_CHILD => current_joint = stack.pop().flatten(),
+                J3D_HIERARCHY_JOINT => current_joint = Some(value),
+                J3D_HIERARCHY_SHAPE => {
+                    if let Some(owner) = owners.get_mut(value) {
+                        *owner = current_joint;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(owners)
     }
 
     fn material_preview_colors(&self) -> Result<Vec<[u8; 4]>> {
@@ -1932,6 +2128,33 @@ impl J3dFile {
         }
 
         Ok(materials)
+    }
+}
+
+fn runtime_child_joint_index(
+    parents: &[Option<usize>],
+    parent: usize,
+    child_index: usize,
+) -> Option<usize> {
+    // TJointObj::initChildren walks younger siblings forward while filling its
+    // child array from the end, so runtime indices reverse INF1 sibling order.
+    parents
+        .iter()
+        .enumerate()
+        .filter_map(|(joint, joint_parent)| (*joint_parent == Some(parent)).then_some(joint))
+        .rev()
+        .nth(child_index)
+}
+
+fn joint_is_in_subtree(mut joint: usize, subtree_root: usize, parents: &[Option<usize>]) -> bool {
+    loop {
+        if joint == subtree_root {
+            return true;
+        }
+        let Some(parent) = parents.get(joint).copied().flatten() else {
+            return false;
+        };
+        joint = parent;
     }
 }
 

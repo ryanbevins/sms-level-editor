@@ -18,6 +18,19 @@ pub struct JDramaObjectRecord {
     pub transform: Option<JDramaTransform>,
     pub stream_strings: Vec<String>,
     pub npc_params: Option<JDramaNpcParams>,
+    pub map_event_sink: Option<JDramaMapEventSinkParams>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JDramaMapEventSinkParams {
+    pub buildings: Vec<JDramaMapEventBuilding>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JDramaMapEventBuilding {
+    pub building_index: u16,
+    pub pollution_layer_index: u16,
+    pub pollution_object_index: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,6 +89,7 @@ fn parse_record_at(
         .unwrap_or_default();
     let npc_params =
         transform.and_then(|_| read_npc_params(bytes, after_name + 36, end, &type_name));
+    let map_event_sink = read_map_event_sink_params(bytes, after_name, end, &type_name);
 
     records.push(JDramaObjectRecord {
         offset,
@@ -85,6 +99,7 @@ fn parse_record_at(
         transform,
         stream_strings,
         npc_params,
+        map_event_sink,
     });
 
     let mut scan = after_type;
@@ -98,6 +113,41 @@ fn parse_record_at(
     }
 
     Ok(size)
+}
+
+fn read_map_event_sink_params(
+    bytes: &[u8],
+    start: usize,
+    end: usize,
+    type_name: &str,
+) -> Option<JDramaMapEventSinkParams> {
+    let lower_type = type_name.to_ascii_lowercase();
+    if !lower_type.contains("event") || !lower_type.contains("sink") {
+        return None;
+    }
+
+    let building_count = be_u32(bytes, start, FORMAT).ok()? as usize;
+    let first_building = be_u32(bytes, start.checked_add(4)?, FORMAT).ok()? as usize;
+    if building_count == 0 || building_count > 64 || first_building > u16::MAX as usize {
+        return None;
+    }
+    let entries_end = start.checked_add(8 + building_count.checked_mul(8)?)?;
+    if entries_end > end {
+        return None;
+    }
+
+    let buildings = (0..building_count)
+        .map(|index| {
+            let entry = start + 8 + index * 8;
+            Some(JDramaMapEventBuilding {
+                building_index: u16::try_from(first_building + index).ok()?,
+                pollution_layer_index: u16::try_from(be_u32(bytes, entry, FORMAT).ok()?).ok()?,
+                pollution_object_index: u16::try_from(be_u32(bytes, entry + 4, FORMAT).ok()?)
+                    .ok()?,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(JDramaMapEventSinkParams { buildings })
 }
 
 fn read_npc_params(
@@ -315,6 +365,29 @@ mod tests {
         assert_eq!(params.parts_color_indices, [1, 255, 2]);
         assert_eq!(params.parts_mask, 264);
         assert_eq!(params.action_flags, 100);
+    }
+
+    #[test]
+    fn reads_map_event_sink_building_range() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&2_u32.to_be_bytes());
+        bytes.extend_from_slice(&1_u32.to_be_bytes());
+        bytes.extend_from_slice(&0_u32.to_be_bytes());
+        bytes.extend_from_slice(&1_u32.to_be_bytes());
+        bytes.extend_from_slice(&1_u32.to_be_bytes());
+        bytes.extend_from_slice(&1_u32.to_be_bytes());
+
+        let params =
+            read_map_event_sink_params(&bytes, 0, bytes.len(), "MapEventSinkBianco").unwrap();
+        assert_eq!(params.buildings.len(), 2);
+        assert_eq!(params.buildings[0].building_index, 1);
+        assert_eq!(params.buildings[0].pollution_layer_index, 0);
+        assert_eq!(params.buildings[0].pollution_object_index, 1);
+        assert_eq!(params.buildings[1].building_index, 2);
+        assert_eq!(params.buildings[1].pollution_layer_index, 1);
+        assert_eq!(params.buildings[1].pollution_object_index, 1);
+        assert!(read_map_event_sink_params(&bytes, 0, bytes.len(), "MapEventSirenaSink").is_some());
+        assert!(read_map_event_sink_params(&bytes, 0, bytes.len(), "MapObjBase").is_none());
     }
 
     fn put_len_string(bytes: &mut Vec<u8>, value: &[u8]) {

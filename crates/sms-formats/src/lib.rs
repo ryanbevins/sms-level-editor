@@ -19,17 +19,19 @@ pub use col::{ColFile, ColHeader};
 pub use j3d::{
     decode_bti_texture, J3dAlphaCompare, J3dBlendMode, J3dColorChannel, J3dFile, J3dFog,
     J3dGeometryPreview, J3dHeader, J3dIndirectMaterial, J3dIndirectMatrix, J3dIndirectOrder,
-    J3dIndirectScale, J3dIndirectTevStage, J3dMaterial, J3dMaterialRenderState, J3dMatrix34,
-    J3dPreviewCombineMode, J3dSection, J3dTevOrder, J3dTevStage, J3dTexGen, J3dTexMatrix,
-    J3dTextureMipPreview, J3dTexturePreview, J3dTriangle, J3dZMode,
-    SMS_DEFAULT_OBJECT_MODEL_LOAD_FLAGS, SMS_MAP_MODEL_LOAD_FLAGS, SMS_POLLUTION_MODEL_LOAD_FLAGS,
+    J3dIndirectScale, J3dIndirectTevStage, J3dJointTransformOverride, J3dMaterial,
+    J3dMaterialRenderState, J3dMatrix34, J3dPreviewCombineMode, J3dSection, J3dTevOrder,
+    J3dTevStage, J3dTexGen, J3dTexMatrix, J3dTextureMipPreview, J3dTexturePreview, J3dTriangle,
+    J3dZMode, SMS_DEFAULT_OBJECT_MODEL_LOAD_FLAGS, SMS_MAP_MODEL_LOAD_FLAGS,
+    SMS_POLLUTION_MODEL_LOAD_FLAGS,
 };
 pub use j3d_anim::{
     J3dJointAnimation, J3dJointTransform, J3dTexturePatternAnimation, J3dTexturePatternBinding,
     J3dTextureSrt, J3dTextureSrtAnimation, J3dTextureSrtBinding,
 };
 pub use jdrama::{
-    parse_jdrama_object_records, JDramaNpcParams, JDramaObjectRecord, JDramaTransform,
+    parse_jdrama_object_records, JDramaMapEventBuilding, JDramaMapEventSinkParams, JDramaNpcParams,
+    JDramaObjectRecord, JDramaTransform,
 };
 pub use rarc::{RarcArchive, RarcFileEntry, RarcHeader};
 pub use raw::{RawFile, RawFormat};

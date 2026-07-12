@@ -378,6 +378,7 @@ impl SmsEditorApp {
         painter: &egui::Painter,
         rect: egui::Rect,
     ) {
+        self.update_level_transformation(ctx);
         self.update_skeletal_animations();
         let has_triangles = self
             .model_preview
@@ -432,6 +433,87 @@ impl SmsEditorApp {
                 self.paint_preview_bounds(painter, rect, preview);
             }
         }
+    }
+
+    pub(super) fn update_level_transformation(&mut self, ctx: &egui::Context) {
+        const PREVIEW_SECONDS: f32 = 4.0;
+        if self.level_transform_playing {
+            let elapsed = self.level_transform_started_at.elapsed().as_secs_f32();
+            let amount = (elapsed / PREVIEW_SECONDS).clamp(0.0, 1.0);
+            self.level_transform_progress = self.level_transform_playback_origin
+                + (1.0 - self.level_transform_playback_origin) * amount;
+            if amount >= 1.0 {
+                self.level_transform_playing = false;
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            }
+        }
+
+        let geometry_progress = if self.level_transform_playing {
+            (self.level_transform_progress * 120.0).floor() / 120.0
+        } else {
+            self.level_transform_progress
+        };
+        let progress_bits = geometry_progress.to_bits();
+        if progress_bits == self.last_level_transform_progress_bits {
+            return;
+        }
+        let Some(preview) = self.model_preview.as_mut() else {
+            return;
+        };
+        if preview.level_transform_models.is_empty() {
+            self.last_level_transform_progress_bits = progress_bits;
+            return;
+        }
+        self.last_level_transform_progress_bits = progress_bits;
+
+        let ModelPreview {
+            level_transform_models,
+            points,
+            triangles,
+            ..
+        } = preview;
+        for source in level_transform_models.iter() {
+            let overrides = level_transform_overrides(&source.targets, geometry_progress);
+            let Ok(mut posed_triangles) = source
+                .file
+                .triangles_with_joint_overrides(source.loader_flags, &overrides)
+            else {
+                continue;
+            };
+            apply_level_transform_visibility(
+                &source.file,
+                &source.targets,
+                geometry_progress,
+                &mut posed_triangles,
+            );
+            for (point, position) in points[source.point_range.clone()].iter_mut().zip(
+                posed_triangles
+                    .iter()
+                    .flat_map(|triangle| triangle.vertices)
+                    .step_by(source.point_stride),
+            ) {
+                point.position = position;
+            }
+            for (triangle, posed) in triangles[source.triangle_range.clone()].iter_mut().zip(
+                posed_triangles
+                    .iter()
+                    .filter(|triangle| triangle_vertices_are_finite(triangle.vertices)),
+            ) {
+                triangle.vertices = posed.vertices;
+                triangle.normals = posed.normals;
+            }
+        }
+
+        if let Some(gpu_viewport) = &self.gpu_viewport {
+            let triangle_ranges = preview
+                .level_transform_models
+                .iter()
+                .map(|model| model.triangle_range.clone())
+                .collect::<Vec<_>>();
+            gpu_viewport.update_geometry(preview, &triangle_ranges);
+        }
+        self.clear_viewport_preview_cache();
     }
 
     pub(super) fn update_skeletal_animations(&mut self) {

@@ -50,6 +50,43 @@ impl SmsEditorApp {
                 }
             }
 
+            if self
+                .model_preview
+                .as_ref()
+                .is_some_and(|preview| !preview.level_transform_models.is_empty())
+            {
+                ui.separator();
+                let label = if self.level_transform_playing {
+                    "Pause Level Change"
+                } else {
+                    "Play Level Change"
+                };
+                if ui
+                    .button(label)
+                    .on_hover_text("Preview the retail procedural map-joint transformation")
+                    .clicked()
+                {
+                    if self.level_transform_playing {
+                        self.level_transform_playing = false;
+                    } else {
+                        if self.level_transform_progress >= 1.0 {
+                            self.level_transform_progress = 0.0;
+                        }
+                        self.level_transform_playback_origin = self.level_transform_progress;
+                        self.level_transform_started_at = Instant::now();
+                        self.level_transform_playing = true;
+                    }
+                }
+                if ui
+                    .button("Reset Level Change")
+                    .on_hover_text("Return the map and linked pollution to the retail start state")
+                    .clicked()
+                {
+                    self.level_transform_playing = false;
+                    self.level_transform_progress = 0.0;
+                }
+            }
+
             ui.separator();
             if ui
                 .add_enabled(self.can_undo(), egui::Button::new("Undo"))
@@ -148,12 +185,62 @@ impl SmsEditorApp {
                 SmsEditorApp::build_model_preview(document, self.preview_visibility())
             });
             self.model_preview = model_preview;
+            self.last_level_transform_progress_bits = u32::MAX;
             self.rebuild_gpu_viewport_scene();
             self.clear_viewport_preview_cache();
             self.reset_camera();
         }
         ui.add(egui::Slider::new(&mut self.viewport_zoom, 0.35..=2.5).text("Zoom"));
         ui.add(egui::Slider::new(&mut self.camera_speed, 0.1..=8.0).text("Speed"));
+        if self
+            .model_preview
+            .as_ref()
+            .is_some_and(|preview| !preview.level_transform_models.is_empty())
+        {
+            ui.separator();
+            ui.label("Level transformation");
+            ui.horizontal(|ui| {
+                let play_label = if self.level_transform_playing {
+                    "Pause"
+                } else {
+                    "Play"
+                };
+                if ui
+                    .button(play_label)
+                    .on_hover_text("Preview the retail map-joint transformation")
+                    .clicked()
+                {
+                    if self.level_transform_playing {
+                        self.level_transform_playing = false;
+                    } else {
+                        if self.level_transform_progress >= 1.0 {
+                            self.level_transform_progress = 0.0;
+                        }
+                        self.level_transform_playback_origin = self.level_transform_progress;
+                        self.level_transform_started_at = Instant::now();
+                        self.level_transform_playing = true;
+                    }
+                }
+                if ui.button("Reset").clicked() {
+                    self.level_transform_playing = false;
+                    self.level_transform_progress = 0.0;
+                }
+                if ui.button("End").clicked() {
+                    self.level_transform_playing = false;
+                    self.level_transform_progress = 1.0;
+                }
+            });
+            if ui
+                .add(
+                    egui::Slider::new(&mut self.level_transform_progress, 0.0..=1.0)
+                        .show_value(false),
+                )
+                .on_hover_text("Scrub from the retail starting state to the recovered state")
+                .changed()
+            {
+                self.level_transform_playing = false;
+            }
+        }
         if ui.button("Frame Selection").clicked() {
             self.frame_selected();
         }

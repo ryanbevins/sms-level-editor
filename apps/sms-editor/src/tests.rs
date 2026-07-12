@@ -211,6 +211,52 @@ fn npc_starting_animation_uses_family_wait_resource() {
 }
 
 #[test]
+fn level_transformation_overrides_scrub_from_retail_start_to_bind_pose() {
+    let target = LevelTransformTarget {
+        joint_index: 7,
+        translation_offset: [0.0, -1500.0, 0.0],
+        scale_multiplier: [1.0, 0.008, 1.0],
+        behavior: LevelTransformBehavior::Linear,
+    };
+
+    let start = level_transform_overrides(&[target], 0.0)[0];
+    assert_eq!(start.translation_offset, [0.0, -1500.0, 0.0]);
+    assert_eq!(start.scale_multiplier, [1.0, 0.008, 1.0]);
+
+    let middle = level_transform_overrides(&[target], 0.5)[0];
+    assert_eq!(middle.translation_offset, [0.0, -750.0, 0.0]);
+    assert!((middle.scale_multiplier[1] - 0.504).abs() < 0.0001);
+
+    let end = level_transform_overrides(&[target], 1.0)[0];
+    assert_eq!(end.translation_offset, [0.0; 3]);
+    assert_eq!(end.scale_multiplier, [1.0; 3]);
+}
+
+#[test]
+fn linked_pollution_meshes_follow_retail_visibility_swap() {
+    let hidden = LevelTransformTarget {
+        joint_index: 3,
+        translation_offset: [0.0; 3],
+        scale_multiplier: [1.0; 3],
+        behavior: LevelTransformBehavior::AlwaysHidden,
+    };
+    let cleaned = LevelTransformTarget {
+        joint_index: 4,
+        translation_offset: [0.0; 3],
+        scale_multiplier: [1.0; 3],
+        behavior: LevelTransformBehavior::HideAfterStart,
+    };
+
+    assert!(level_transform_target_is_hidden(&hidden, 0.0));
+    assert!(!level_transform_target_is_hidden(&cleaned, 0.0));
+    assert!(level_transform_target_is_hidden(&cleaned, 0.1));
+    assert_eq!(
+        level_transform_overrides(&[hidden], 0.0)[0].scale_multiplier,
+        [1.0; 3]
+    );
+}
+
+#[test]
 fn gatekeeper_uses_retail_sleep_and_texture_animations() {
     let gatekeeper = SceneObject::new("boss", "GateKeeper");
     let model = "C:/game/dolpic0.szs!/gatekeeper/gene_pakkun_model1.bmd";
@@ -466,6 +512,7 @@ fn preview_for_texture_alpha(has_alpha: bool, has_translucent_alpha: bool) -> Mo
         source_textures: 1,
         object_model_indices: BTreeMap::new(),
         animated_models: Vec::new(),
+        level_transform_models: Vec::new(),
     }
 }
 
@@ -1190,6 +1237,7 @@ fn updating_object_transform_moves_cached_preview_mesh() {
             source_textures: 0,
             object_model_indices,
             animated_models: Vec::new(),
+            level_transform_models: Vec::new(),
         }),
         ..SmsEditorApp::default()
     };

@@ -1,6 +1,24 @@
 use super::*;
 
 #[test]
+fn runtime_joint_children_reverse_inf1_sibling_order() {
+    let parents = [None, Some(0), Some(1), Some(1), Some(1)];
+
+    assert_eq!(runtime_child_joint_index(&parents, 1, 0), Some(4));
+    assert_eq!(runtime_child_joint_index(&parents, 1, 1), Some(3));
+    assert_eq!(runtime_child_joint_index(&parents, 1, 2), Some(2));
+}
+
+#[test]
+fn joint_subtree_membership_follows_parent_chain() {
+    let parents = [None, Some(0), Some(1), Some(1), Some(3)];
+
+    assert!(joint_is_in_subtree(4, 1, &parents));
+    assert!(joint_is_in_subtree(3, 3, &parents));
+    assert!(!joint_is_in_subtree(2, 3, &parents));
+}
+
+#[test]
 fn reads_cull_modes_as_big_endian_gx_enums() {
     let table = [
         0, 0, 0, 0, // GX_CULL_NONE

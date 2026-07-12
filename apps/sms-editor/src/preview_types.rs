@@ -21,6 +21,7 @@ pub(super) struct ModelPreview {
     pub(super) source_textures: usize,
     pub(super) object_model_indices: BTreeMap<String, usize>,
     pub(super) animated_models: Vec<AnimatedModelPreview>,
+    pub(super) level_transform_models: Vec<LevelTransformModelPreview>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -173,6 +174,31 @@ pub(super) struct AnimatedModelPreview {
     pub(super) animation: J3dJointAnimation,
     pub(super) loader_flags: u32,
     pub(super) instances: Vec<AnimatedModelInstance>,
+}
+
+#[derive(Clone)]
+pub(super) struct LevelTransformModelPreview {
+    pub(super) file: J3dFile,
+    pub(super) loader_flags: u32,
+    pub(super) targets: Vec<LevelTransformTarget>,
+    pub(super) point_range: std::ops::Range<usize>,
+    pub(super) point_stride: usize,
+    pub(super) triangle_range: std::ops::Range<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct LevelTransformTarget {
+    pub(super) joint_index: usize,
+    pub(super) translation_offset: [f32; 3],
+    pub(super) scale_multiplier: [f32; 3],
+    pub(super) behavior: LevelTransformBehavior,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LevelTransformBehavior {
+    Linear,
+    AlwaysHidden,
+    HideAfterStart,
 }
 
 #[derive(Debug, Clone)]

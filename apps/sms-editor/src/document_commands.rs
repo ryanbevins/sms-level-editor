@@ -359,6 +359,7 @@ impl SmsEditorApp {
         self.model_preview = self.document.as_ref().and_then(|document| {
             SmsEditorApp::build_model_preview(document, self.preview_visibility())
         });
+        self.last_level_transform_progress_bits = u32::MAX;
         self.rebuild_gpu_viewport_scene();
         self.clear_viewport_preview_cache();
     }

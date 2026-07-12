@@ -10,11 +10,12 @@ use std::time::Instant;
 
 use eframe::egui;
 use sms_formats::{
-    decode_bti_texture, discover_scene_archives, read_stage_asset_bytes, J3dAlphaCompare,
-    J3dBlendMode, J3dFile, J3dGeometryPreview, J3dJointAnimation, J3dMaterial, J3dMatrix34,
-    J3dPreviewCombineMode, J3dTexturePatternAnimation, J3dTextureSrtAnimation, J3dTriangle,
-    J3dZMode, SceneArchiveInfo, StageAsset, StageAssetKind, SMS_DEFAULT_OBJECT_MODEL_LOAD_FLAGS,
-    SMS_MAP_MODEL_LOAD_FLAGS, SMS_POLLUTION_MODEL_LOAD_FLAGS,
+    decode_bti_texture, discover_scene_archives, parse_jdrama_object_records,
+    read_stage_asset_bytes, J3dAlphaCompare, J3dBlendMode, J3dFile, J3dGeometryPreview,
+    J3dJointAnimation, J3dJointTransformOverride, J3dMaterial, J3dMatrix34, J3dPreviewCombineMode,
+    J3dTexturePatternAnimation, J3dTextureSrtAnimation, J3dTriangle, J3dZMode, SceneArchiveInfo,
+    StageAsset, StageAssetKind, SMS_DEFAULT_OBJECT_MODEL_LOAD_FLAGS, SMS_MAP_MODEL_LOAD_FLAGS,
+    SMS_POLLUTION_MODEL_LOAD_FLAGS,
 };
 use sms_render::{RenderScene, RendererConfig, ViewportRenderer};
 use sms_scene::{
@@ -186,6 +187,11 @@ struct SmsEditorApp {
     background_label: Option<String>,
     animation_started_at: Instant,
     last_skeletal_animation_tick: u64,
+    level_transform_progress: f32,
+    level_transform_playing: bool,
+    level_transform_started_at: Instant,
+    level_transform_playback_origin: f32,
+    last_level_transform_progress_bits: u32,
 }
 
 impl Default for SmsEditorApp {
@@ -247,6 +253,11 @@ impl Default for SmsEditorApp {
             background_label: None,
             animation_started_at: Instant::now(),
             last_skeletal_animation_tick: u64::MAX,
+            level_transform_progress: 0.0,
+            level_transform_playing: false,
+            level_transform_started_at: Instant::now(),
+            level_transform_playback_origin: 0.0,
+            last_level_transform_progress_bits: u32::MAX,
         }
     }
 }
@@ -564,13 +575,18 @@ impl SmsEditorApp {
         ));
         if let Some(preview) = &preview {
             self.log.push(format!(
-                "Viewport preview loaded {} model(s), {} sampled point(s), {} triangle(s), {} texture(s), {} BTK material animation(s), {} BCK skeletal animation(s), {} source vertex/vertices.",
+                "Viewport preview loaded {} model(s), {} sampled point(s), {} triangle(s), {} texture(s), {} BTK material animation(s), {} BCK skeletal animation(s), {} procedural map-joint transformation(s), {} source vertex/vertices.",
                 preview.loaded_models,
                 preview.points.len(),
                 preview.triangles.len(),
                 preview.textures.len(),
                 preview.texture_srt_animations.len(),
                 preview.animated_models.len(),
+                preview
+                    .level_transform_models
+                    .iter()
+                    .map(|model| model.targets.len())
+                    .sum::<usize>(),
                 preview.source_vertices
             ));
         } else if !scene.model_paths.is_empty() {
@@ -584,6 +600,10 @@ impl SmsEditorApp {
         self.model_preview = preview;
         self.animation_started_at = Instant::now();
         self.last_skeletal_animation_tick = u64::MAX;
+        self.level_transform_progress = 0.0;
+        self.level_transform_playing = false;
+        self.level_transform_playback_origin = 0.0;
+        self.last_level_transform_progress_bits = u32::MAX;
         self.rebuild_gpu_viewport_scene();
         self.clear_viewport_preview_cache();
         self.selected_object_id = None;
@@ -644,6 +664,7 @@ impl SmsEditorApp {
         let mut texture_srt_animations = Vec::new();
         let mut texture_pattern_animations = Vec::new();
         let mut material_animation_bindings = Vec::new();
+        let mut level_transform_models = Vec::new();
         let mut next_packet_index = 0usize;
         let mut bounds_min = [f32::INFINITY; 3];
         let mut bounds_max = [f32::NEG_INFINITY; 3];
@@ -673,8 +694,21 @@ impl SmsEditorApp {
             };
 
             let loader_flags = model_loader_flags_for_path(&asset_path);
-            match file.geometry_preview_with_loader_flags(loader_flags) {
+            let level_targets = level_transform_targets(document, &asset_path, &file);
+            let initial_overrides = level_transform_overrides(&level_targets, 0.0);
+            let preview_result = if initial_overrides.is_empty() {
+                file.geometry_preview_with_loader_flags(loader_flags)
+            } else {
+                file.geometry_preview_with_joint_overrides(loader_flags, &initial_overrides)
+            };
+            match preview_result {
                 Ok(mut preview) => {
+                    apply_level_transform_visibility(
+                        &file,
+                        &level_targets,
+                        0.0,
+                        &mut preview.triangles,
+                    );
                     apply_model_material_table(document, &asset_path, loader_flags, &mut preview);
                     apply_pollution_bitmap_mask(document, &asset_path, &mut preview);
                     loaded_models += 1;
@@ -722,8 +756,9 @@ impl SmsEditorApp {
                         camera_bound_points.extend(preview.positions.iter().copied());
                     }
 
+                    let point_stride = (preview.positions.len() / POINTS_PER_MODEL).max(1);
+                    let point_start = points.len();
                     if !is_sky {
-                        let point_stride = (preview.positions.len() / POINTS_PER_MODEL).max(1);
                         for position in preview.positions.iter().step_by(point_stride) {
                             points.push(PreviewPoint {
                                 position: *position,
@@ -732,6 +767,7 @@ impl SmsEditorApp {
                         }
                     }
 
+                    let triangle_start = triangles.len();
                     for triangle in &preview.triangles {
                         if triangle_vertices_are_finite(triangle.vertices) {
                             triangles.push(PreviewTriangle {
@@ -765,6 +801,16 @@ impl SmsEditorApp {
                                 z_mode: triangle.z_mode,
                             });
                         }
+                    }
+                    if !level_targets.is_empty() {
+                        level_transform_models.push(LevelTransformModelPreview {
+                            file: file.clone(),
+                            loader_flags,
+                            targets: level_targets,
+                            point_range: point_start..points.len(),
+                            point_stride,
+                            triangle_range: triangle_start..triangles.len(),
+                        });
                     }
                 }
                 Err(_) => {
@@ -1193,6 +1239,7 @@ impl SmsEditorApp {
             source_textures,
             object_model_indices,
             animated_models,
+            level_transform_models,
         })
     }
 

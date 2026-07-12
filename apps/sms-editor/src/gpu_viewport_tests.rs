@@ -109,6 +109,7 @@ fn geometry_update_preview() -> ModelPreview {
         source_textures: 0,
         object_model_indices: BTreeMap::new(),
         animated_models: Vec::new(),
+        level_transform_models: Vec::new(),
     }
 }
 
