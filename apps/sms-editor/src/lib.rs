@@ -815,7 +815,7 @@ impl SmsEditorApp {
             let Some(model_path) = object_preview_model_path(object, &world_model_paths) else {
                 continue;
             };
-            let loader_flags = npc_model_loader_flags(object)
+            let loader_flags = actor_model_loader_flags(object)
                 .unwrap_or_else(|| model_loader_flags_for_path(&model_path));
             let object_render_layer = preview_render_layer_for_model_path(&model_path);
             let object_preview_transform = if object_render_layer == PreviewRenderLayer::Heatwave {
@@ -846,7 +846,7 @@ impl SmsEditorApp {
                     continue;
                 };
                 apply_model_material_table(document, &model_path, loader_flags, &mut preview);
-                apply_npc_runtime_textures(document, object, &mut preview);
+                apply_actor_runtime_textures(document, object, &mut preview);
                 apply_npc_eye_decal_culling(object, &mut preview);
                 let texture_base = push_preview_textures(&mut textures, &preview);
                 let material_base = push_preview_materials(&mut materials, &preview, texture_base);
@@ -2080,9 +2080,12 @@ fn model_loader_flags_for_path(path: &str) -> u32 {
     }
 }
 
-fn npc_model_loader_flags(object: &SceneObject) -> Option<u32> {
+fn actor_model_loader_flags(object: &SceneObject) -> Option<u32> {
     let factory = object.factory_name.to_ascii_lowercase();
     Some(match factory.as_str() {
+        // TBiancoGateKeeperManager::createModelData uses these flags for
+        // gene_pakkun_model1.bmd.
+        "gatekeeper" => 0x1121_0000,
         "npcmontem" | "npcmontema" | "npcmontemc" | "npcmontew" | "npcmontewa" => 0x1030_0000,
         "npcmontemb" | "npcmontemd" | "npcmontemf" | "npcmontemg" | "npcmontemh" | "npcmontewb"
         | "npcmontewc" => 0x1021_0000,

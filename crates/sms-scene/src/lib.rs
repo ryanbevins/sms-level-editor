@@ -624,11 +624,11 @@ fn infer_preview_model_path(
     object: &SceneObject,
     model_index: &[(String, String)],
 ) -> Option<String> {
-    if let Some((directory, model_name)) = npc_preview_model_identity(&object.factory_name) {
-        let archive_directory = format!("!/{directory}/");
+    if let Some((directory, model_name)) = actor_preview_model_identity(&object.factory_name) {
+        let resource_directory = format!("/{directory}/");
         if let Some((path, _)) = model_index.iter().find(|(path, _)| {
             let lower = path.to_ascii_lowercase();
-            lower.contains(&archive_directory)
+            lower.contains(&resource_directory)
                 && lower
                     .rsplit('/')
                     .next()
@@ -683,8 +683,11 @@ fn infer_preview_model_path(
     None
 }
 
-fn npc_preview_model_identity(factory_name: &str) -> Option<(&'static str, &'static str)> {
+fn actor_preview_model_identity(factory_name: &str) -> Option<(&'static str, &'static str)> {
     match factory_name.to_ascii_lowercase().as_str() {
+        // TBiancoGateKeeperManager::createModelData registers this model, while
+        // the placement factory is simply `GateKeeper`.
+        "gatekeeper" => Some(("gatekeeper", "gene_pakkun_model1.bmd")),
         "npcmontem" => Some(("montem", "mom_model.bmd")),
         "npcmontema" => Some(("montema", "moma_model.bmd")),
         "npcmontemb" => Some(("montemb", "momb_model.bmd")),
@@ -957,6 +960,26 @@ mod tests {
         assert_eq!(
             infer_preview_model_path(&kinopio, &models).as_deref(),
             Some("stage.szs!/kinopio/kinopio_body.bmd")
+        );
+    }
+
+    #[test]
+    fn resolves_gatekeeper_model_from_decomp_manager_resource_name() {
+        let models = vec![
+            (
+                "stage.szs!/gatekeeper/gene_pakkun_model1.bmd".to_string(),
+                "genepakkunmodel1".to_string(),
+            ),
+            (
+                "stage.szs!/gatekeeper/stamp_keeper_model1.bmd".to_string(),
+                "stampkeepermodel1".to_string(),
+            ),
+        ];
+        let object = SceneObject::new("bianco boss", "GateKeeper");
+
+        assert_eq!(
+            infer_preview_model_path(&object, &models).as_deref(),
+            Some("stage.szs!/gatekeeper/gene_pakkun_model1.bmd")
         );
     }
 

@@ -187,48 +187,69 @@ pub(super) fn attach_model_texture_srt_animation(
     animations: &mut Vec<J3dTextureSrtAnimation>,
     material_bindings: &mut [Vec<PreviewMaterialAnimationBinding>],
 ) {
-    let Some(animation_path) = model_texture_srt_animation_path(model_path) else {
-        return;
-    };
-    let Some(asset) = document.assets.iter().find(|asset| {
-        asset.kind == StageAssetKind::Animation
-            && asset
-                .path
-                .to_string_lossy()
-                .replace('\\', "/")
-                .eq_ignore_ascii_case(&animation_path)
-    }) else {
-        return;
-    };
-    let Ok(bytes) = read_stage_asset_bytes(&asset.path) else {
-        return;
-    };
-    let Ok(animation) = J3dTextureSrtAnimation::parse(&bytes) else {
-        return;
-    };
+    for animation_path in model_texture_srt_animation_paths(model_path) {
+        let Some(asset) = document.assets.iter().find(|asset| {
+            asset.kind == StageAssetKind::Animation
+                && asset
+                    .path
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .eq_ignore_ascii_case(&animation_path)
+        }) else {
+            continue;
+        };
+        let Ok(bytes) = read_stage_asset_bytes(&asset.path) else {
+            continue;
+        };
+        let Ok(animation) = J3dTextureSrtAnimation::parse(&bytes) else {
+            continue;
+        };
 
-    let animation_index = animations.len();
-    let mut matched = false;
-    for (binding_index, binding) in animation.bindings.iter().enumerate() {
-        let Some(material_index) = model_materials
-            .iter()
-            .position(|material| material.name == binding.material_name)
-        else {
-            continue;
-        };
-        let global_material_index = material_base + material_index;
-        let Some(bindings) = material_bindings.get_mut(global_material_index) else {
-            continue;
-        };
-        bindings.push(PreviewMaterialAnimationBinding {
-            animation_index,
-            binding_index,
-        });
-        matched = true;
+        let animation_index = animations.len();
+        let mut matched = false;
+        for (binding_index, binding) in animation.bindings.iter().enumerate() {
+            let Some(material_index) = model_materials
+                .iter()
+                .position(|material| material.name == binding.material_name)
+            else {
+                continue;
+            };
+            let global_material_index = material_base + material_index;
+            let Some(bindings) = material_bindings.get_mut(global_material_index) else {
+                continue;
+            };
+            bindings.push(PreviewMaterialAnimationBinding {
+                animation_index,
+                binding_index,
+            });
+            matched = true;
+        }
+        if matched {
+            animations.push(animation);
+        }
     }
-    if matched {
-        animations.push(animation);
+}
+
+pub(super) fn model_texture_srt_animation_paths(model_path: &str) -> Vec<String> {
+    let normalized = model_path.replace('\\', "/");
+    let Some((directory, file_name)) = normalized.rsplit_once('/') else {
+        return model_texture_srt_animation_path(&normalized)
+            .into_iter()
+            .collect();
+    };
+    if file_name.eq_ignore_ascii_case("gene_pakkun_model1.bmd")
+        || file_name.eq_ignore_ascii_case("gene_pakkun_model1.bdl")
+    {
+        // TBiancoGateKeeper::init constructs a TMultiBtk with both manager
+        // animations, rather than using the model's basename.
+        return ["gene_pakkun_tex0.btk", "gene_pakkun_tex1.btk"]
+            .into_iter()
+            .map(|name| format!("{directory}/{name}"))
+            .collect();
     }
+    model_texture_srt_animation_path(&normalized)
+        .into_iter()
+        .collect()
 }
 
 pub(super) fn model_texture_srt_animation_path(model_path: &str) -> Option<String> {
@@ -279,6 +300,10 @@ pub(super) fn starting_joint_animation_candidates(
         &["peach/peach_wait.bck"]
     } else if factory == "npcraccoondog" {
         &["raccoondog/tanuki_wait_a.bck"]
+    } else if factory == "gatekeeper" {
+        // TNerveBGKSleep starts BCK index 10, which is wait1 in the manager's
+        // alphabetically indexed GateKeeper animation resources.
+        &["gatekeeper/gene_pakkun_wait1.bck"]
     } else {
         &[]
     };
@@ -489,27 +514,15 @@ fn apply_material_table_to_preview(
     }
 }
 
-pub(super) fn apply_npc_runtime_textures(
+pub(super) fn apply_actor_runtime_textures(
     document: &StageDocument,
     object: &SceneObject,
     preview: &mut J3dGeometryPreview,
 ) {
-    if !object.factory_name.to_ascii_lowercase().starts_with("npc") {
-        return;
-    }
     let factory = object.factory_name.to_ascii_lowercase();
-    let mut replacements = Vec::new();
-    let monte_uses_pollution_texture = matches!(
-        factory.as_str(),
-        "npcmontem" | "npcmontema" | "npcmontemc" | "npcmontew" | "npcmontewa"
-    );
-    if !factory.starts_with("npcmonte") || monte_uses_pollution_texture {
-        replacements.push(("H_ma_rak_dummy", "/map/pollution/h_ma_rak.bti"));
-    }
-    if factory.starts_with("npcmontem") && factory != "npcmonteme" {
-        replacements.push(("I_mom_mino_dummyI4", "/montemcommon/i_mom_mino_rgba.bti"));
-    } else if factory.starts_with("npcmontew") {
-        replacements.push(("I_mow_mino_dummyI4", "/montewcommon/i_mow_mino_rgba.bti"));
+    let replacements = actor_runtime_texture_replacements(&factory);
+    if replacements.is_empty() {
+        return;
     }
 
     for (dummy_name, asset_suffix) in replacements {
@@ -549,6 +562,35 @@ pub(super) fn apply_npc_runtime_textures(
             preview.textures[texture_index] = texture.clone();
         }
     }
+}
+
+pub(super) fn actor_runtime_texture_replacements(
+    factory: &str,
+) -> Vec<(&'static str, &'static str)> {
+    if factory == "gatekeeper" {
+        // TBiancoGateKeeper::init replaces this authored dummy texture with
+        // the current stage's pollution texture.
+        return vec![("Q_kepper_dummy_128IA4", "/map/pollution/h_ma_rak.bti")];
+    }
+    if !factory.starts_with("npc") {
+        return Vec::new();
+    }
+
+    let mut replacements = Vec::new();
+    let monte_uses_pollution_texture = matches!(
+        factory,
+        "npcmontem" | "npcmontema" | "npcmontemc" | "npcmontew" | "npcmontewa"
+    );
+    if !factory.starts_with("npcmonte") || monte_uses_pollution_texture {
+        replacements.push(("H_ma_rak_dummy", "/map/pollution/h_ma_rak.bti"));
+    }
+    if factory.starts_with("npcmontem") && factory != "npcmonteme" {
+        replacements.push(("I_mom_mino_dummyI4", "/montemcommon/i_mom_mino_rgba.bti"));
+    } else if factory.starts_with("npcmontew") {
+        replacements.push(("I_mow_mino_dummyI4", "/montewcommon/i_mow_mino_rgba.bti"));
+    }
+
+    replacements
 }
 
 pub(super) fn apply_npc_eye_decal_culling(object: &SceneObject, preview: &mut J3dGeometryPreview) {

@@ -211,6 +211,32 @@ fn npc_starting_animation_uses_family_wait_resource() {
 }
 
 #[test]
+fn gatekeeper_uses_retail_sleep_and_texture_animations() {
+    let gatekeeper = SceneObject::new("boss", "GateKeeper");
+    let model = "C:/game/dolpic0.szs!/gatekeeper/gene_pakkun_model1.bmd";
+
+    assert_eq!(
+        starting_joint_animation_candidates(&gatekeeper, model),
+        ["C:/game/dolpic0.szs!/gatekeeper/gene_pakkun_wait1.bck"]
+    );
+    assert_eq!(
+        model_texture_srt_animation_paths(model),
+        [
+            "C:/game/dolpic0.szs!/gatekeeper/gene_pakkun_tex0.btk",
+            "C:/game/dolpic0.szs!/gatekeeper/gene_pakkun_tex1.btk",
+        ]
+    );
+}
+
+#[test]
+fn gatekeeper_replaces_its_dummy_with_the_stage_pollution_texture() {
+    assert_eq!(
+        actor_runtime_texture_replacements("gatekeeper"),
+        [("Q_kepper_dummy_128IA4", "/map/pollution/h_ma_rak.bti")]
+    );
+}
+
+#[test]
 fn monte_starting_eye_pattern_uses_retail_variant_resource() {
     let monte = SceneObject::new("monte", "NPCMonteMA");
     assert_eq!(
@@ -344,12 +370,16 @@ fn npc_circle_shadow_uses_retail_default_radius() {
 #[test]
 fn monte_model_loader_flags_follow_manager_entries() {
     assert_eq!(
-        npc_model_loader_flags(&SceneObject::new("ma", "NPCMonteMA")),
+        actor_model_loader_flags(&SceneObject::new("ma", "NPCMonteMA")),
         Some(0x1030_0000)
     );
     assert_eq!(
-        npc_model_loader_flags(&SceneObject::new("md", "NPCMonteMD")),
+        actor_model_loader_flags(&SceneObject::new("md", "NPCMonteMD")),
         Some(0x1021_0000)
+    );
+    assert_eq!(
+        actor_model_loader_flags(&SceneObject::new("boss", "GateKeeper")),
+        Some(0x1121_0000)
     );
 }
 
