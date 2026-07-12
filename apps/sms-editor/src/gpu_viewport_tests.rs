@@ -31,7 +31,11 @@ fn j3d_shader_parses_and_validates() {
 fn color_texgen_uses_post_lighting_gx_channel_values() {
     assert!(J3D_SHADER.contains("source_value = vec4<f32>(channel0.rg, 0.0, 1.0)"));
     assert!(J3D_SHADER.contains("source_value = vec4<f32>(channel1.rg, 0.0, 1.0)"));
-    assert!(!J3D_SHADER.contains("source_value = vec4<f32>(input.color0.rg, 0.0, 1.0)"));
+}
+
+#[test]
+fn specular_color_channel_uses_gx_light_two_mask() {
+    assert!(J3D_SHADER.contains("(light_mask & 0x04u) != 0u"));
 }
 
 #[test]

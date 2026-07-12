@@ -185,7 +185,7 @@ fn compute_color_channel(
         let denominator = max(25.0 - 24.0 * cosine_squared, 0.000001);
         let facing_light = dot(normalized_normal, light_direction) >= 0.0;
         let specular = select(0.0, cosine_squared / denominator, facing_light);
-        let enabled_specular = select(0.0, specular, (light_mask & 0x01u) != 0u);
+        let enabled_specular = select(0.0, specular, (light_mask & 0x04u) != 0u);
         return clamp(
             mat * (ambient + light_color * enabled_specular),
             vec4<f32>(0.0),
