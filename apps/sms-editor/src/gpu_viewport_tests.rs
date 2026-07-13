@@ -57,6 +57,7 @@ fn unclamped_tev_outputs_wrap_to_u8_when_reused_by_coin_material() {
     assert_eq!(stage0 & 255, 0);
     assert_eq!(regular(173, 255, stage0, 0, 0, 1), 173);
     assert!(J3D_SHADER.contains("return tev_s10(value) & 255;"));
+    assert!(J3D_SHADER.contains("f32(tev_input_u8(previous.r)) / 255.0"));
 }
 
 #[test]
@@ -103,6 +104,25 @@ fn geometry_updates_keep_dynamic_particle_shape_metadata() {
     assert_eq!(&vertex.billboard_center_mode[..2], &[1.0, 2.0]);
     assert_eq!(vertex.billboard_axis_y, [7.0, 8.0, 9.0]);
     assert_eq!(vertex.uv0, [0.0, 0.7]);
+}
+
+#[test]
+fn mirror_scene_includes_sky_and_actor_models_but_not_level_water() {
+    let preview = geometry_update_preview();
+    let level = preview.triangles[0];
+    let actor = preview.triangles[1];
+    let actor_models = BTreeSet::from([actor.model_index]);
+
+    assert!(!triangle_is_mirror_visible(&level, &actor_models));
+    assert!(triangle_is_mirror_visible(&actor, &actor_models));
+
+    let mut sky = level;
+    sky.render_layer = PreviewRenderLayer::Sky;
+    assert!(triangle_is_mirror_visible(&sky, &actor_models));
+
+    let mut water = actor;
+    water.render_layer = PreviewRenderLayer::Water;
+    assert!(!triangle_is_mirror_visible(&water, &actor_models));
 }
 
 fn geometry_update_preview() -> ModelPreview {
@@ -219,6 +239,10 @@ fn render_layers_select_their_runtime_coordinate_space() {
         0
     );
     assert_eq!(
+        coordinate_space_for_render_layer(PreviewRenderLayer::MirrorSurface),
+        5
+    );
+    assert_eq!(
         coordinate_space_for_render_layer(PreviewRenderLayer::Particle),
         3
     );
@@ -226,6 +250,41 @@ fn render_layers_select_their_runtime_coordinate_space() {
         coordinate_space_for_render_layer(PreviewRenderLayer::ParticleDistortion),
         4
     );
+}
+
+#[test]
+fn mirror_camera_reflects_across_surface_and_widens_fov() {
+    let frame = GpuViewportFrame {
+        camera_position: [10.0, 20.0, 30.0],
+        right: [1.0, 0.0, 0.0],
+        up: [0.0, 1.0, 0.0],
+        forward: [0.0, 0.0, 1.0],
+        focal: 500.0,
+        viewport_size: [800.0, 600.0],
+        ..Default::default()
+    };
+
+    let mirrored = mirror_viewport_frame(frame, Some(100.0));
+
+    assert_eq!(mirrored.camera_position, [10.0, 180.0, 30.0]);
+    assert_eq!(mirrored.right, [-1.0, 0.0, -0.0]);
+    assert_eq!(mirrored.up, [0.0, -1.0, 0.0]);
+    assert_eq!(mirrored.forward, [0.0, -0.0, 1.0]);
+    assert!(mirrored.focal < frame.focal);
+}
+
+#[test]
+fn mirror_projection_preserves_q_until_fragment_sampling() {
+    assert!(J3D_SHADER.contains("@location(12) mirror_coord: vec3<f32>"));
+    assert!(J3D_SHADER.contains("return input.mirror_coord.xy / q;"));
+    assert!(!J3D_SHADER.contains("projected_world_uv"));
+}
+
+#[test]
+fn mirror_sample_uses_sunshines_rgb5a3_copy_precision() {
+    assert!(J3D_SHADER.contains("fn rgb5a3_copy_value"));
+    assert!(J3D_SHADER.contains("tex = rgb5a3_copy_value(tex);"));
+    assert!(J3D_SHADER.contains("if (rgba8.a >= 224.0)"));
 }
 
 #[test]

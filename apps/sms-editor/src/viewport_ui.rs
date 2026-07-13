@@ -866,8 +866,10 @@ impl SmsEditorApp {
         }
 
         for triangle in preview.triangles.iter().filter(|triangle| {
-            triangle.render_layer != PreviewRenderLayer::Sky
-                && !preview_triangle_is_translucent(preview, triangle)
+            !matches!(
+                triangle.render_layer,
+                PreviewRenderLayer::Sky | PreviewRenderLayer::MirrorScene
+            ) && !preview_triangle_is_translucent(preview, triangle)
         }) {
             if let Some(projected) = self.project_preview_triangle(rect, size, triangle) {
                 rasterize_projected_preview_triangle(
@@ -880,8 +882,10 @@ impl SmsEditorApp {
             .triangles
             .iter()
             .filter(|triangle| {
-                triangle.render_layer != PreviewRenderLayer::Sky
-                    && preview_triangle_is_translucent(preview, triangle)
+                !matches!(
+                    triangle.render_layer,
+                    PreviewRenderLayer::Sky | PreviewRenderLayer::MirrorScene
+                ) && preview_triangle_is_translucent(preview, triangle)
             })
             .filter_map(|triangle| self.project_preview_triangle(rect, size, triangle))
             .collect();

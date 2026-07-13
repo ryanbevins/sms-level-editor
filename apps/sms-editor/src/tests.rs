@@ -639,11 +639,42 @@ fn move_drag_rotates_with_camera_yaw() {
 }
 
 #[test]
-fn reflection_helper_meshes_are_effect_meshes() {
-    let path = "stage.szs!/map/map/reflectsky.bmd";
+fn authored_water_reflections_follow_environment_visibility() {
+    let path = "stage.szs!/map/map/reflectparts.bmd";
 
-    assert!(!is_default_preview_model_path(path, true, true, false));
-    assert!(is_default_preview_model_path(path, true, true, true));
+    assert!(path_is_water_reflection_model_path(path));
+    assert!(is_default_preview_model_path(path, true, true, false));
+    assert!(!is_default_preview_model_path(path, false, true, true));
+    assert_eq!(
+        preview_render_layer_for_model_path(path),
+        PreviewRenderLayer::MirrorScene
+    );
+    assert!(!is_camera_bounds_model_path(path));
+
+    // Sunshine copies the main sky's material table onto ReflectSky before
+    // drawing it. The editor mirrors its already-loaded sky instead of showing
+    // the unpatched helper geometry.
+    let reflect_sky = "stage.szs!/map/map/reflectsky.bmd";
+    assert!(!path_is_water_reflection_model_path(reflect_sky));
+    assert!(!is_default_preview_model_path(
+        reflect_sky,
+        true,
+        true,
+        false
+    ));
+}
+
+#[test]
+fn authored_mirror_surface_follows_environment_visibility() {
+    let path = "stage.szs!/map/mirror/mirror00.bmd";
+
+    assert!(path_is_mirror_surface_model_path(path));
+    assert!(is_default_preview_model_path(path, true, true, false));
+    assert!(!is_default_preview_model_path(path, false, true, true));
+    assert_eq!(
+        preview_render_layer_for_model_path(path),
+        PreviewRenderLayer::MirrorSurface
+    );
     assert!(!is_camera_bounds_model_path(path));
 }
 

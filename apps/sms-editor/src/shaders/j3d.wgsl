@@ -52,7 +52,8 @@ struct VertexIn {
     @location(10) uv6: vec2<f32>,
     @location(11) uv7: vec2<f32>,
     // 0 = world, 1 = camera-relative world (sky), 2 = GX view space (shimmer),
-    // 3 = camera-facing JPA billboard, 4 = billboarded JPA EFB distortion;
+    // 3 = camera-facing JPA billboard, 4 = billboarded JPA EFB distortion,
+    // 5 = mirror surface with projective reflection coordinates;
     // normal.xy is half-size and normal.z rotation for both.
     @location(12) coordinate_space: u32,
     // xyz = joint center, w = 0 none / 1 full / 2 Y-axis billboard.
@@ -75,10 +76,14 @@ struct VertexOut {
     @location(9) uv7: vec2<f32>,
     @location(10) view_depth: f32,
     @location(11) @interpolate(flat) coordinate_space: u32,
+    @location(12) mirror_coord: vec3<f32>,
 };
 
 @group(0) @binding(0)
 var<uniform> camera: Camera;
+
+@group(0) @binding(1)
+var<uniform> mirror_camera: Camera;
 
 @group(1) @binding(0)
 var<uniform> material: Material;
@@ -126,6 +131,25 @@ fn generated_uv(coords: array<vec3<f32>, 8>, index: u32) -> vec2<f32> {
         case 7u: { return coords[7].xy; }
         default: { return vec2<f32>(0.0); }
     }
+}
+
+fn projected_world_coord(projection_camera: Camera, position: vec3<f32>) -> vec3<f32> {
+    let relative = position - projection_camera.camera_position.xyz;
+    let view_position = vec3<f32>(
+        dot(relative, projection_camera.right.xyz),
+        dot(relative, projection_camera.up.xyz),
+        dot(relative, projection_camera.forward.xyz),
+    );
+    let depth = view_position.z;
+    let clip_x = view_position.x * projection_camera.projection.x
+        + projection_camera.projection.z * depth;
+    let clip_y = view_position.y * projection_camera.projection.y
+        + projection_camera.projection.w * depth;
+    return vec3<f32>(
+        0.5 * (clip_x + depth),
+        0.5 * (depth - clip_y),
+        depth,
+    );
 }
 
 fn apply_effect_matrix(matrix_index: u32, value: vec4<f32>) -> vec4<f32> {
@@ -357,6 +381,15 @@ fn vs_main(input: VertexIn) -> VertexOut {
         }
 
         let matrix_plus_one = config.z;
+        if (input.coordinate_space == 5u && i == 0u) {
+            // TMirrorModelManager projects the mirror-camera texture
+            // through texgen 0 after reflecting the live camera across the
+            // authored mirror plane.
+            // Keep S/T/Q homogeneous here. Dividing at each vertex makes the
+            // large mirror00 polygons warp affinely as the camera rotates.
+            coords[i] = projected_world_coord(mirror_camera, input.position);
+            continue;
+        }
         if (input.coordinate_space == 2u && i == 1u) {
             // SMS_GetLightPerspectiveForEffectMtx maps this view-space quad
             // onto the current EFB. Use the live editor projection so resizing,
@@ -420,10 +453,15 @@ fn vs_main(input: VertexIn) -> VertexOut {
     out.uv7 = generated_uv(coords, 7u);
     out.view_depth = depth;
     out.coordinate_space = input.coordinate_space;
+    out.mirror_coord = projected_world_coord(mirror_camera, input.position);
     return out;
 }
 
 fn tex_coord(input: VertexOut, index: u32) -> vec2<f32> {
+    if (input.coordinate_space == 5u && index == 0u) {
+        let q = select(input.mirror_coord.z, 0.000001, abs(input.mirror_coord.z) < 0.000001);
+        return input.mirror_coord.xy / q;
+    }
     switch index {
         case 0u: { return input.uv0; }
         case 1u: { return input.uv1; }
@@ -451,6 +489,21 @@ fn sample_texture(slot: u32, uv: vec2<f32>) -> vec4<f32> {
         case 7u: { return textureSampleGrad(texture7, sampler7, uv, uv_dx, uv_dy); }
         default: { return vec4<f32>(1.0); }
     }
+}
+
+fn rgb5a3_copy_value(value: vec4<f32>) -> vec4<f32> {
+    // TMirrorCamera allocates its EFB copy as GX_TF_RGB5A3. Preserve that
+    // conversion even though the editor renders the copy at viewport
+    // resolution: opaque texels use RGB555, while translucent texels use
+    // A3RGB4. TEV therefore receives the same color and alpha precision as SMS.
+    let rgba8 = clamp(floor(value * 255.0 + 0.5), vec4<f32>(0.0), vec4<f32>(255.0));
+    if (rgba8.a >= 224.0) {
+        let rgb5 = floor(rgba8.rgb / 8.0);
+        return vec4<f32>(rgb5 / 31.0, 1.0);
+    }
+    let rgb4 = floor(rgba8.rgb / 16.0);
+    let alpha3 = floor(rgba8.a / 32.0);
+    return vec4<f32>(rgb4 / 15.0, alpha3 / 7.0);
 }
 
 fn swap_color(value: vec4<f32>, table_index: u32) -> vec4<f32> {
@@ -851,6 +904,9 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
             let texture_size = material.texture_sizes[order.y - 1u].xy;
             uv = uv + indirect_offset(stage_index, input) / texture_size;
             tex = sample_texture(order.y - 1u, uv);
+            if (input.coordinate_space == 5u && order.y == 1u) {
+                tex = rgb5a3_copy_value(tex);
+            }
         }
         tex = swap_color(tex, selectors.w);
         let ras = swap_color(raster_color(input, order.z), selectors.z);
@@ -904,13 +960,17 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
         }
     }
 
-    if (!alpha_compare_passes(previous.a)) {
+    // The pixel engine consumes the low eight bits of the final signed TEV
+    // registers. This is a wrap, not a saturating clamp: BiancoRiver's last
+    // water stage deliberately scales an unclamped result by 4x.
+    let output = vec4<f32>(
+        f32(tev_input_u8(previous.r)) / 255.0,
+        f32(tev_input_u8(previous.g)) / 255.0,
+        f32(tev_input_u8(previous.b)) / 255.0,
+        f32(tev_input_u8(previous.a)) / 255.0,
+    );
+    if (!alpha_compare_passes(output.a)) {
         discard;
     }
-    // GX TEV registers retain signed 10-bit values between stages when their
-    // clamp bit is clear, but the pixel engine consumes 8-bit RGBA for alpha
-    // compare and framebuffer blending. Do not let an unclamped final TEV
-    // value become a floating-point blend input: BiancoRiver deliberately
-    // scales its last water stage by 4x and relies on this EFB quantization.
-    return clamp(apply_fog(previous, input.view_depth), vec4<f32>(0.0), vec4<f32>(1.0));
+    return clamp(apply_fog(output, input.view_depth), vec4<f32>(0.0), vec4<f32>(1.0));
 }

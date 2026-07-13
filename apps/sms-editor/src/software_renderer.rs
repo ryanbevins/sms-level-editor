@@ -180,7 +180,10 @@ pub(super) fn preview_triangle_is_translucent(
     preview: &ModelPreview,
     triangle: &PreviewTriangle,
 ) -> bool {
-    if triangle.render_layer == PreviewRenderLayer::Water {
+    if matches!(
+        triangle.render_layer,
+        PreviewRenderLayer::Water | PreviewRenderLayer::MirrorSurface
+    ) {
         return true;
     }
     if preview_triangle_uses_alpha_test(preview, triangle) {
@@ -208,7 +211,10 @@ pub(super) fn preview_triangle_uses_alpha_test(
     preview: &ModelPreview,
     triangle: &PreviewTriangle,
 ) -> bool {
-    if triangle.render_layer == PreviewRenderLayer::Water {
+    if matches!(
+        triangle.render_layer,
+        PreviewRenderLayer::Water | PreviewRenderLayer::MirrorSurface
+    ) {
         return false;
     }
 

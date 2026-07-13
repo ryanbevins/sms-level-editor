@@ -135,6 +135,8 @@ pub(super) enum PreviewRenderLayer {
     Sky,
     Main,
     Water,
+    MirrorSurface,
+    MirrorScene,
     Goop,
     Shadow,
     Heatwave,

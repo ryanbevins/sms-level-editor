@@ -1888,7 +1888,9 @@ fn robust_preview_bounds(
     let has_world_triangles = triangles.iter().any(|triangle| {
         !matches!(
             triangle.render_layer,
-            PreviewRenderLayer::Sky | PreviewRenderLayer::Heatwave
+            PreviewRenderLayer::Sky
+                | PreviewRenderLayer::MirrorScene
+                | PreviewRenderLayer::Heatwave
         )
     });
     if !has_world_triangles {
@@ -1903,7 +1905,9 @@ fn robust_preview_bounds(
         for triangle in triangles.iter().filter(|triangle| {
             !matches!(
                 triangle.render_layer,
-                PreviewRenderLayer::Sky | PreviewRenderLayer::Heatwave
+                PreviewRenderLayer::Sky
+                    | PreviewRenderLayer::MirrorScene
+                    | PreviewRenderLayer::Heatwave
             )
         }) {
             for vertex in triangle.vertices {
@@ -2017,6 +2021,9 @@ fn is_default_preview_model_path(
     if path_is_indirect_water_model_path(&path) {
         return false;
     }
+    if path_is_mirror_surface_model_path(&path) || path_is_water_reflection_model_path(&path) {
+        return show_environment_meshes;
+    }
     if path_is_water_model_path(&path) {
         return show_environment_meshes;
     }
@@ -2050,6 +2057,10 @@ fn preview_render_layer_for_model_path(path: &str) -> PreviewRenderLayer {
     let path = path.to_ascii_lowercase();
     if path_is_shimmer_model_path(&path) {
         PreviewRenderLayer::Heatwave
+    } else if path_is_water_reflection_model_path(&path) {
+        PreviewRenderLayer::MirrorScene
+    } else if path_is_mirror_surface_model_path(&path) {
+        PreviewRenderLayer::MirrorSurface
     } else if path_is_sky_model_path(&path) {
         PreviewRenderLayer::Sky
     } else if path_is_goop_model_path(&path) {
@@ -2147,6 +2158,25 @@ fn path_is_water_model_path(path: &str) -> bool {
         || path.contains("/map/map/puddle")
         || path.contains("/map/map/yogan")
         || path.contains("/map/map/lava")
+}
+
+fn path_is_water_reflection_model_path(path: &str) -> bool {
+    let path = path.replace('\\', "/").to_ascii_lowercase();
+    path.rsplit('/')
+        .next()
+        .is_some_and(|name| matches!(name, "reflectparts.bmd" | "reflectparts.bdl"))
+}
+
+fn path_is_mirror_surface_model_path(path: &str) -> bool {
+    let path = path.replace('\\', "/").to_ascii_lowercase();
+    if !path.contains("/map/mirror/") {
+        return false;
+    }
+    path.rsplit('/').next().is_some_and(|name| {
+        let stem = name.trim_end_matches(".bmd").trim_end_matches(".bdl");
+        stem.strip_prefix("mirror")
+            .is_some_and(|suffix| !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()))
+    })
 }
 
 fn path_is_indirect_water_model_path(path: &str) -> bool {
@@ -2376,7 +2406,7 @@ fn apply_layer_preview_tint(
 ) -> egui::Color32 {
     let rgba = color32_to_rgba(color);
     match render_layer {
-        PreviewRenderLayer::Water => {
+        PreviewRenderLayer::Water | PreviewRenderLayer::MirrorSurface => {
             let water = [0.35, 0.78, 0.96];
             rgba_to_color32([
                 rgba[0] * 0.72 + water[0] * 0.28,
@@ -2396,6 +2426,7 @@ fn apply_layer_preview_tint(
         }
         PreviewRenderLayer::Sky
         | PreviewRenderLayer::Main
+        | PreviewRenderLayer::MirrorScene
         | PreviewRenderLayer::Shadow
         | PreviewRenderLayer::Heatwave
         | PreviewRenderLayer::Particle
