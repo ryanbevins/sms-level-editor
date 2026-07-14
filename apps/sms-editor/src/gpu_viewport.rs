@@ -34,13 +34,15 @@ pub struct GpuViewportScene {
 
 impl GpuViewportScene {
     pub fn from_preview(preview: &ModelPreview, target_format: wgpu::TextureFormat) -> Self {
+        let scene = GpuSceneData::from_preview(preview);
+        let dirty_vertex_ranges = vec![None; scene.batches.len()];
         Self {
             shared: Arc::new(Mutex::new(GpuViewportShared {
-                scene: GpuSceneData::from_preview(preview),
+                scene,
                 frame: GpuViewportFrame::default(),
                 generation: NEXT_SCENE_GENERATION.fetch_add(1, Ordering::Relaxed),
                 geometry_generation: 0,
-                dirty_batches: BTreeSet::new(),
+                dirty_vertex_ranges,
                 dirty_materials: BTreeSet::new(),
                 target_format,
             })),
@@ -59,10 +61,14 @@ impl GpuViewportScene {
         triangle_ranges: &[std::ops::Range<usize>],
     ) {
         if let Ok(mut shared) = self.shared.lock() {
-            let dirty = shared.scene.update_geometry(preview, triangle_ranges);
-            if !dirty.is_empty() {
-                shared.dirty_batches.extend(dirty);
-                shared.geometry_generation = shared.geometry_generation.wrapping_add(1);
+            let GpuViewportShared {
+                scene,
+                geometry_generation,
+                dirty_vertex_ranges,
+                ..
+            } = &mut *shared;
+            if scene.update_geometry(preview, triangle_ranges, dirty_vertex_ranges) {
+                *geometry_generation = (*geometry_generation).wrapping_add(1);
             }
         }
     }
@@ -115,7 +121,7 @@ pub(super) fn render_preview_offscreen(
     let scene = GpuSceneData::from_preview(preview);
     let mut resources = GpuViewportResources::new(&device, GX_COLOR_FORMAT);
     resources.ensure_viewport_target(&device, size);
-    resources.ensure_scene(&device, &queue, &scene, 1, 0, true);
+    resources.ensure_scene(&device, &queue, &scene, 1, 0);
     resources.write_frame(&queue, frame, &scene);
 
     let bytes_per_pixel = 4u32;
@@ -225,7 +231,7 @@ struct GpuViewportShared {
     frame: GpuViewportFrame,
     generation: u64,
     geometry_generation: u64,
-    dirty_batches: BTreeSet<usize>,
+    dirty_vertex_ranges: Vec<Option<std::ops::Range<usize>>>,
     dirty_materials: BTreeSet<usize>,
     target_format: wgpu::TextureFormat,
 }
@@ -258,25 +264,41 @@ impl CallbackTrait for GpuViewportCallback {
                 .max(1.0) as u32,
         ];
         let target_changed = resources.ensure_viewport_target(device, target_size);
-        resources.ensure_scene(
+        let scene_rebuilt = resources.ensure_scene(
             device,
             queue,
             &shared.scene,
             shared.generation,
             shared.geometry_generation,
-            target_changed,
         );
-        resources.write_geometry(
+        if target_changed && !scene_rebuilt {
+            resources.rebuild_target_material_bind_groups(device, &shared.scene);
+        }
+        let geometry_changed = resources.write_geometry(
             queue,
             &shared.scene,
-            &shared.dirty_batches,
+            &shared.dirty_vertex_ranges,
             shared.geometry_generation,
         );
-        shared.dirty_batches.clear();
-        resources.write_materials(device, queue, &shared.scene, &shared.dirty_materials);
+        if geometry_changed || scene_rebuilt {
+            shared.dirty_vertex_ranges.fill(None);
+        }
+        let materials_changed =
+            resources.write_materials(device, queue, &shared.scene, &shared.dirty_materials);
         shared.dirty_materials.clear();
-        resources.write_frame(queue, shared.frame, &shared.scene);
-        resources.render_scene(egui_encoder);
+        let frame_state = GpuOffscreenFrameState::new(shared.frame, shared.scene.mirror_plane_y);
+        let invalidation = GpuOffscreenInvalidation {
+            target: target_changed,
+            scene: scene_rebuilt,
+            geometry: geometry_changed,
+            materials: materials_changed,
+            time_animation: !resources.animated_materials.is_empty(),
+        };
+        if offscreen_render_required(resources.offscreen_frame_state, frame_state, invalidation) {
+            resources.write_frame(queue, shared.frame, &shared.scene);
+            resources.render_scene(egui_encoder);
+            resources.offscreen_frame_state = Some(frame_state);
+        }
         Vec::new()
     }
 
@@ -305,6 +327,8 @@ struct GpuSceneData {
 struct GpuTriangleLocation {
     batch_index: usize,
     vertex_offset: usize,
+    billboard_attributes_dynamic: bool,
+    surface_attributes_dynamic: bool,
 }
 
 impl GpuSceneData {
@@ -381,7 +405,6 @@ impl GpuSceneData {
                         render_layer: triangle.render_layer,
                         mirror_visible,
                         vertices: Vec::new(),
-                        indices: Vec::new(),
                     });
                     index
                 });
@@ -390,6 +413,11 @@ impl GpuSceneData {
             triangle_vertices[triangle_index] = Some(GpuTriangleLocation {
                 batch_index,
                 vertex_offset: base as usize,
+                billboard_attributes_dynamic: triangle.billboard.is_some()
+                    || triangle.particle_type.is_some()
+                    || triangle.particle_pivot.is_some()
+                    || triangle.particle_direction.is_some(),
+                surface_attributes_dynamic: triangle.particle_type.is_some(),
             });
             let face_normal = preview_triangle_normal(triangle);
             let legacy_colors = legacy_vertex_colors(triangle, face_normal);
@@ -465,7 +493,6 @@ impl GpuSceneData {
                         .unwrap_or([0.0, 1.0, 0.0]),
                 });
             }
-            batch.indices.extend_from_slice(&[base, base + 1, base + 2]);
         }
 
         for batch in &batches {
@@ -477,13 +504,7 @@ impl GpuSceneData {
             }
         }
 
-        let mirror_plane_y = preview
-            .triangles
-            .iter()
-            .filter(|triangle| triangle.render_layer == PreviewRenderLayer::MirrorSurface)
-            .flat_map(|triangle| triangle.vertices)
-            .map(|vertex| vertex[1])
-            .find(|height| height.is_finite());
+        let mirror_plane_y = mirror_plane_y_from_preview(preview);
 
         Self {
             textures,
@@ -498,12 +519,15 @@ impl GpuSceneData {
         &mut self,
         preview: &ModelPreview,
         triangle_ranges: &[std::ops::Range<usize>],
-    ) -> BTreeSet<usize> {
-        let mut dirty_batches = BTreeSet::new();
+        dirty_vertex_ranges: &mut [Option<std::ops::Range<usize>>],
+    ) -> bool {
+        let mut geometry_changed = false;
+        let mut mirror_surface_updated = false;
         for triangle_index in triangle_ranges.iter().flat_map(|range| range.clone()) {
             let Some(triangle) = preview.triangles.get(triangle_index) else {
                 continue;
             };
+            mirror_surface_updated |= triangle.render_layer == PreviewRenderLayer::MirrorSurface;
             let Some(location) = self
                 .triangle_vertices
                 .get(triangle_index)
@@ -512,87 +536,167 @@ impl GpuSceneData {
             else {
                 continue;
             };
+            let Some(dirty_range) = dirty_vertex_ranges.get_mut(location.batch_index) else {
+                continue;
+            };
             let Some(batch) = self.batches.get_mut(location.batch_index) else {
                 continue;
             };
-            let face_normal = preview_triangle_normal(triangle);
-            for vertex_index in 0..3 {
-                let Some(vertex) = batch
-                    .vertices
-                    .get_mut(location.vertex_offset + vertex_index)
-                else {
-                    continue;
-                };
-                vertex.position = triangle.vertices[vertex_index];
-                vertex.normal = triangle
-                    .billboard
-                    .and_then(|billboard| billboard.normals)
-                    .map(|normals| normals[vertex_index])
-                    .or_else(|| triangle.normals.map(|normals| normals[vertex_index]))
-                    .unwrap_or(face_normal);
-                vertex.billboard_center_mode = triangle
-                    .billboard
-                    .map(|billboard| {
-                        [
-                            billboard.center[0],
-                            billboard.center[1],
-                            billboard.center[2],
-                            match billboard.mode {
-                                J3dBillboardMode::Full => 1.0,
-                                J3dBillboardMode::YAxis => 2.0,
-                            },
-                        ]
-                    })
-                    .unwrap_or([
-                        triangle.particle_pivot.map_or(0.0, |pivot| pivot[0]),
-                        triangle.particle_pivot.map_or(0.0, |pivot| pivot[1]),
-                        0.0,
-                        triangle.particle_type.map_or(0.0, f32::from),
-                    ]);
-                vertex.billboard_offset = triangle
-                    .billboard
-                    .map(|billboard| billboard.offsets[vertex_index])
-                    .unwrap_or([0.0; 3]);
-                vertex.billboard_axis_y = triangle
-                    .particle_direction
-                    .or_else(|| triangle.billboard.map(|billboard| billboard.axes[1]))
-                    .unwrap_or([0.0, 1.0, 0.0]);
-                let colors = legacy_vertex_colors(triangle, face_normal);
-                vertex.color0 = triangle.color_channels[0]
-                    .map(|channels| color_u8_to_f32(channels[vertex_index]))
-                    .or_else(|| {
-                        triangle
-                            .vertex_colors
-                            .map(|channels| color_u8_to_f32(channels[vertex_index]))
-                    })
-                    .unwrap_or(colors[vertex_index]);
-                vertex.color1 = triangle.color_channels[1]
-                    .map(|channels| color_u8_to_f32(channels[vertex_index]))
-                    .unwrap_or([1.0; 4]);
-                let tex_coords: [[f32; 2]; TEXTURE_SLOT_COUNT] = std::array::from_fn(|slot| {
-                    triangle.tex_coord_sets[slot]
-                        .map(|coords| coords[vertex_index])
-                        .or_else(|| {
-                            (slot == 0)
-                                .then_some(triangle.tex_coords)
-                                .flatten()
-                                .map(|coords| coords[vertex_index])
-                        })
-                        .unwrap_or([0.0; 2])
-                });
-                vertex.uv0 = tex_coords[0];
-                vertex.uv1 = tex_coords[1];
-                vertex.uv2 = tex_coords[2];
-                vertex.uv3 = tex_coords[3];
-                vertex.uv4 = tex_coords[4];
-                vertex.uv5 = tex_coords[5];
-                vertex.uv6 = tex_coords[6];
-                vertex.uv7 = tex_coords[7];
-            }
-            dirty_batches.insert(location.batch_index);
+            let Some(vertex_end) = location.vertex_offset.checked_add(3) else {
+                continue;
+            };
+            let Some(vertices) = batch.vertices.get_mut(location.vertex_offset..vertex_end) else {
+                continue;
+            };
+            update_gpu_triangle_geometry(
+                vertices,
+                triangle,
+                location.billboard_attributes_dynamic,
+                location.surface_attributes_dynamic,
+            );
+            extend_dirty_vertex_range(dirty_range, location.vertex_offset..vertex_end);
+            geometry_changed = true;
         }
-        dirty_batches
+        if mirror_surface_updated {
+            self.mirror_plane_y = mirror_plane_y_from_preview(preview);
+        }
+        geometry_changed
     }
+}
+
+fn update_gpu_triangle_geometry(
+    vertices: &mut [GpuVertex],
+    triangle: &PreviewTriangle,
+    billboard_attributes_dynamic: bool,
+    surface_attributes_dynamic: bool,
+) {
+    debug_assert_eq!(vertices.len(), 3);
+    let billboard = triangle.billboard;
+    let explicit_normals = billboard
+        .and_then(|billboard| billboard.normals)
+        .or(triangle.normals);
+    let procedural_color = triangle.color_channels[0].is_none()
+        && triangle.vertex_colors.is_none()
+        && triangle.color.is_none();
+    let face_normal = if explicit_normals.is_none() || procedural_color {
+        preview_triangle_normal(triangle)
+    } else {
+        [0.0; 3]
+    };
+    let normals = explicit_normals.unwrap_or([face_normal; 3]);
+    for (vertex_index, vertex) in vertices.iter_mut().enumerate() {
+        vertex.position = triangle.vertices[vertex_index];
+        vertex.normal = normals[vertex_index];
+    }
+
+    if billboard_attributes_dynamic
+        || billboard.is_some()
+        || triangle.particle_type.is_some()
+        || triangle.particle_pivot.is_some()
+        || triangle.particle_direction.is_some()
+    {
+        let billboard_center_mode = billboard
+            .map(|billboard| {
+                [
+                    billboard.center[0],
+                    billboard.center[1],
+                    billboard.center[2],
+                    match billboard.mode {
+                        J3dBillboardMode::Full => 1.0,
+                        J3dBillboardMode::YAxis => 2.0,
+                    },
+                ]
+            })
+            .unwrap_or([
+                triangle.particle_pivot.map_or(0.0, |pivot| pivot[0]),
+                triangle.particle_pivot.map_or(0.0, |pivot| pivot[1]),
+                0.0,
+                triangle.particle_type.map_or(0.0, f32::from),
+            ]);
+        let billboard_offsets = billboard.map_or([[0.0; 3]; 3], |billboard| billboard.offsets);
+        let billboard_axis_y = triangle
+            .particle_direction
+            .or_else(|| billboard.map(|billboard| billboard.axes[1]))
+            .unwrap_or([0.0, 1.0, 0.0]);
+        for (vertex_index, vertex) in vertices.iter_mut().enumerate() {
+            vertex.billboard_center_mode = billboard_center_mode;
+            vertex.billboard_offset = billboard_offsets[vertex_index];
+            vertex.billboard_axis_y = billboard_axis_y;
+        }
+    }
+
+    // Skeletal, rotation, level-transform, and object-transform updates only
+    // change the geometry fields above. JPA particle slots also animate their
+    // colors and texture coordinates, so retain full surface updates for any
+    // slot that was or is a particle. Procedural fallback color is geometry-
+    // dependent and must likewise be refreshed for otherwise-static surfaces.
+    if surface_attributes_dynamic || triangle.particle_type.is_some() {
+        update_gpu_triangle_surface(vertices, triangle, face_normal);
+    } else if procedural_color {
+        let colors = legacy_vertex_colors(triangle, face_normal);
+        for (vertex, color) in vertices.iter_mut().zip(colors) {
+            vertex.color0 = color;
+        }
+    }
+}
+
+fn update_gpu_triangle_surface(
+    vertices: &mut [GpuVertex],
+    triangle: &PreviewTriangle,
+    face_normal: [f32; 3],
+) {
+    let color0 = triangle.color_channels[0]
+        .map(|colors| colors.map(color_u8_to_f32))
+        .or_else(|| {
+            triangle
+                .vertex_colors
+                .map(|colors| colors.map(color_u8_to_f32))
+        })
+        .unwrap_or_else(|| legacy_vertex_colors(triangle, face_normal));
+    let color1 = triangle.color_channels[1]
+        .map(|colors| colors.map(color_u8_to_f32))
+        .unwrap_or([[1.0; 4]; 3]);
+    let tex_coords: [[[f32; 2]; 3]; TEXTURE_SLOT_COUNT] = std::array::from_fn(|slot| {
+        triangle.tex_coord_sets[slot]
+            .or_else(|| (slot == 0).then_some(triangle.tex_coords).flatten())
+            .unwrap_or([[0.0; 2]; 3])
+    });
+
+    for (vertex_index, vertex) in vertices.iter_mut().enumerate() {
+        vertex.color0 = color0[vertex_index];
+        vertex.color1 = color1[vertex_index];
+        vertex.uv0 = tex_coords[0][vertex_index];
+        vertex.uv1 = tex_coords[1][vertex_index];
+        vertex.uv2 = tex_coords[2][vertex_index];
+        vertex.uv3 = tex_coords[3][vertex_index];
+        vertex.uv4 = tex_coords[4][vertex_index];
+        vertex.uv5 = tex_coords[5][vertex_index];
+        vertex.uv6 = tex_coords[6][vertex_index];
+        vertex.uv7 = tex_coords[7][vertex_index];
+    }
+}
+
+fn extend_dirty_vertex_range(
+    dirty: &mut Option<std::ops::Range<usize>>,
+    update: std::ops::Range<usize>,
+) {
+    match dirty {
+        Some(dirty) => {
+            dirty.start = dirty.start.min(update.start);
+            dirty.end = dirty.end.max(update.end);
+        }
+        None => *dirty = Some(update),
+    }
+}
+
+fn mirror_plane_y_from_preview(preview: &ModelPreview) -> Option<f32> {
+    preview
+        .triangles
+        .iter()
+        .filter(|triangle| triangle.render_layer == PreviewRenderLayer::MirrorSurface)
+        .flat_map(|triangle| triangle.vertices)
+        .map(|vertex| vertex[1])
+        .find(|height| height.is_finite())
 }
 
 fn triangle_is_mirror_visible(
@@ -1302,7 +1406,6 @@ struct GpuBatchData {
     render_layer: PreviewRenderLayer,
     mirror_visible: bool,
     vertices: Vec<GpuVertex>,
-    indices: Vec<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1407,7 +1510,7 @@ impl GpuVertex {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
 struct GpuCameraUniform {
     camera_position: [f32; 4],
     right: [f32; 4],
@@ -1419,6 +1522,43 @@ struct GpuCameraUniform {
     light_color: [f32; 4],
     ambient_color: [f32; 4],
     lighting_meta: [f32; 4],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct GpuOffscreenFrameState {
+    camera: GpuCameraUniform,
+    mirror_camera: GpuCameraUniform,
+}
+
+impl GpuOffscreenFrameState {
+    fn new(frame: GpuViewportFrame, mirror_plane_y: Option<f32>) -> Self {
+        Self {
+            camera: GpuCameraUniform::from(frame),
+            mirror_camera: GpuCameraUniform::from(mirror_viewport_frame(frame, mirror_plane_y)),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct GpuOffscreenInvalidation {
+    target: bool,
+    scene: bool,
+    geometry: bool,
+    materials: bool,
+    time_animation: bool,
+}
+
+fn offscreen_render_required(
+    previous: Option<GpuOffscreenFrameState>,
+    current: GpuOffscreenFrameState,
+    invalidation: GpuOffscreenInvalidation,
+) -> bool {
+    previous != Some(current)
+        || invalidation.target
+        || invalidation.scene
+        || invalidation.geometry
+        || invalidation.materials
+        || invalidation.time_animation
 }
 
 impl From<GpuViewportFrame> for GpuCameraUniform {
@@ -1480,10 +1620,12 @@ struct GpuViewportResources {
     material_bind_groups: Vec<wgpu::BindGroup>,
     heatwave_materials: BTreeSet<usize>,
     mirror_surface_materials: BTreeSet<usize>,
+    animated_materials: BTreeSet<usize>,
     batches: Vec<GpuBatchResources>,
     draw_order: Vec<GpuDrawCommand>,
     generation: u64,
     geometry_generation: u64,
+    offscreen_frame_state: Option<GpuOffscreenFrameState>,
 }
 
 impl GpuViewportResources {
@@ -1625,10 +1767,12 @@ impl GpuViewportResources {
             material_bind_groups: Vec::new(),
             heatwave_materials: BTreeSet::new(),
             mirror_surface_materials: BTreeSet::new(),
+            animated_materials: BTreeSet::new(),
             batches: Vec::new(),
             draw_order: Vec::new(),
             generation: 0,
             geometry_generation: 0,
+            offscreen_frame_state: None,
         }
     }
 
@@ -1639,10 +1783,9 @@ impl GpuViewportResources {
         scene: &GpuSceneData,
         generation: u64,
         geometry_generation: u64,
-        force_rebuild: bool,
-    ) {
-        if self.generation == generation && !force_rebuild {
-            return;
+    ) -> bool {
+        if self.generation == generation {
+            return false;
         }
         for batch in &scene.batches {
             self.ensure_pipeline(device, batch.pipeline_key);
@@ -1666,6 +1809,12 @@ impl GpuViewportResources {
             .filter(|batch| batch.render_layer == PreviewRenderLayer::MirrorSurface)
             .map(|batch| batch.material_index)
             .collect();
+        self.animated_materials = scene
+            .materials
+            .iter()
+            .enumerate()
+            .filter_map(|(index, material)| (!material.animations.is_empty()).then_some(index))
+            .collect();
         for (index, material) in scene.materials.iter().enumerate() {
             let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("sms viewport J3D material uniform"),
@@ -1679,47 +1828,56 @@ impl GpuViewportResources {
         self.batches = scene
             .batches
             .iter()
-            .filter(|batch| !batch.vertices.is_empty() && !batch.indices.is_empty())
+            .filter(|batch| !batch.vertices.is_empty())
             .map(|batch| GpuBatchResources::new(device, batch))
             .collect();
         self.draw_order = sorted_gpu_draw_order(&self.batches);
         self.generation = generation;
         self.geometry_generation = geometry_generation;
+        true
     }
 
     fn write_geometry(
         &mut self,
         queue: &wgpu::Queue,
         scene: &GpuSceneData,
-        dirty_batches: &BTreeSet<usize>,
+        dirty_vertex_ranges: &[Option<std::ops::Range<usize>>],
         geometry_generation: u64,
-    ) {
+    ) -> bool {
         if self.geometry_generation == geometry_generation {
-            return;
+            return false;
         }
-        for batch_index in dirty_batches {
-            let Some(data) = scene.batches.get(*batch_index) else {
+        for (batch_index, dirty_range) in dirty_vertex_ranges.iter().enumerate() {
+            let Some(dirty_range) = dirty_range.as_ref() else {
                 continue;
             };
-            let Some(resources) = self.batches.get(*batch_index) else {
+            let Some(data) = scene.batches.get(batch_index) else {
+                continue;
+            };
+            let Some(resources) = self.batches.get(batch_index) else {
+                continue;
+            };
+            let Some(vertices) = data.vertices.get(dirty_range.clone()) else {
                 continue;
             };
             queue.write_buffer(
                 &resources.vertex_buffer,
-                0,
-                bytemuck::cast_slice(&data.vertices),
+                (dirty_range.start * std::mem::size_of::<GpuVertex>()) as wgpu::BufferAddress,
+                bytemuck::cast_slice(vertices),
             );
         }
         self.geometry_generation = geometry_generation;
+        true
     }
 
     fn write_materials(
         &mut self,
         device: &wgpu::Device,
-        _queue: &wgpu::Queue,
+        queue: &wgpu::Queue,
         scene: &GpuSceneData,
         dirty_materials: &BTreeSet<usize>,
-    ) {
+    ) -> bool {
+        let materials_changed = !dirty_materials.is_empty();
         for index in dirty_materials.iter().copied() {
             let Some(material) = scene.materials.get(index) else {
                 continue;
@@ -1727,14 +1885,37 @@ impl GpuViewportResources {
             if index >= self.material_buffers.len() || index >= self.material_bind_groups.len() {
                 continue;
             }
-            let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("sms viewport animated J3D material uniform"),
-                contents: bytemuck::bytes_of(&material.uniform),
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            });
-            let bind_group = self.create_material_bind_group(device, index, material, &buffer);
-            self.material_buffers[index] = buffer;
+            let buffer = &self.material_buffers[index];
+            queue.write_buffer(buffer, 0, bytemuck::bytes_of(&material.uniform));
+            let bind_group = self.create_material_bind_group(device, index, material, buffer);
             self.material_bind_groups[index] = bind_group;
+            if material.animations.is_empty() {
+                self.animated_materials.remove(&index);
+            } else {
+                self.animated_materials.insert(index);
+            }
+        }
+        materials_changed
+    }
+
+    fn rebuild_target_material_bind_groups(&mut self, device: &wgpu::Device, scene: &GpuSceneData) {
+        let target_materials = self
+            .heatwave_materials
+            .union(&self.mirror_surface_materials)
+            .copied()
+            .collect::<Vec<_>>();
+        for index in target_materials {
+            let Some(material) = scene.materials.get(index) else {
+                continue;
+            };
+            let Some(buffer) = self.material_buffers.get(index) else {
+                continue;
+            };
+            if index >= self.material_bind_groups.len() {
+                continue;
+            }
+            self.material_bind_groups[index] =
+                self.create_material_bind_group(device, index, material, buffer);
         }
     }
 
@@ -1819,10 +2000,13 @@ impl GpuViewportResources {
             0,
             bytemuck::bytes_of(&GpuCameraUniform::from(mirror_frame)),
         );
-        for (material, buffer) in scene.materials.iter().zip(&self.material_buffers) {
-            if material.animations.is_empty() {
+        for index in self.animated_materials.iter().copied() {
+            let Some(material) = scene.materials.get(index) else {
                 continue;
-            }
+            };
+            let Some(buffer) = self.material_buffers.get(index) else {
+                continue;
+            };
             let uniform = material.uniform_at_time(frame.animation_seconds);
             queue.write_buffer(buffer, 0, bytemuck::bytes_of(&uniform));
         }
@@ -1877,9 +2061,7 @@ impl GpuViewportResources {
                 mirror_pass.set_pipeline(pipeline);
                 mirror_pass.set_bind_group(1, material, &[]);
                 mirror_pass.set_vertex_buffer(0, batch.vertex_buffer.slice(..));
-                mirror_pass
-                    .set_index_buffer(batch.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                mirror_pass.draw_indexed(0..batch.index_count, 0, 0..1);
+                mirror_pass.draw(0..batch.vertex_count, 0..1);
             }
         }
         let has_heatwave = self
@@ -1935,9 +2117,7 @@ impl GpuViewportResources {
                 render_pass.set_pipeline(pipeline);
                 render_pass.set_bind_group(1, material, &[]);
                 render_pass.set_vertex_buffer(0, batch.vertex_buffer.slice(..));
-                render_pass
-                    .set_index_buffer(batch.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                render_pass.draw_indexed(0..batch.index_count, 0, 0..1);
+                render_pass.draw(0..batch.vertex_count, 0..1);
             }
         }
 
@@ -2001,8 +2181,7 @@ impl GpuViewportResources {
             render_pass.set_pipeline(pipeline);
             render_pass.set_bind_group(1, material, &[]);
             render_pass.set_vertex_buffer(0, batch.vertex_buffer.slice(..));
-            render_pass.set_index_buffer(batch.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-            render_pass.draw_indexed(0..batch.index_count, 0, 0..1);
+            render_pass.draw(0..batch.vertex_count, 0..1);
         }
     }
 
@@ -2215,8 +2394,7 @@ struct GpuBatchResources {
     render_layer: PreviewRenderLayer,
     mirror_visible: bool,
     vertex_buffer: wgpu::Buffer,
-    index_buffer: wgpu::Buffer,
-    index_count: u32,
+    vertex_count: u32,
 }
 
 impl GpuBatchResources {
@@ -2232,12 +2410,7 @@ impl GpuBatchResources {
                 contents: bytemuck::cast_slice(&batch.vertices),
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             }),
-            index_buffer: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("sms viewport J3D index buffer"),
-                contents: bytemuck::cast_slice(&batch.indices),
-                usage: wgpu::BufferUsages::INDEX,
-            }),
-            index_count: batch.indices.len() as u32,
+            vertex_count: batch.vertices.len() as u32,
         }
     }
 }

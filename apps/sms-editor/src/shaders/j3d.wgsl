@@ -360,6 +360,9 @@ fn vs_main(input: VertexIn) -> VertexOut {
 
     var coords: array<vec3<f32>, 8>;
     for (var i = 0u; i < 8u; i = i + 1u) {
+        if (i >= material.counts.y) {
+            break;
+        }
         let config = material.tex_gens[i];
         let source = config.y;
         let mode = config.w & 0xffu;

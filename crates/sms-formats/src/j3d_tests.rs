@@ -569,6 +569,224 @@ fn envelope_matrices_accumulate_weighted_joint_transforms() {
 }
 
 #[test]
+fn precomputed_joint_matrices_preserve_direct_draw_matrix_selection() {
+    let mut bytes = vec![0; 0x28];
+    bytes[0x08..0x0A].copy_from_slice(&1u16.to_be_bytes());
+    bytes[0x0C..0x10].copy_from_slice(&0x20u32.to_be_bytes());
+    bytes[0x10..0x14].copy_from_slice(&0x22u32.to_be_bytes());
+    bytes[0x20] = 0;
+    bytes[0x22..0x24].copy_from_slice(&1u16.to_be_bytes());
+    let file = J3dFile {
+        header: J3dHeader {
+            file_type: "bmd3".to_string(),
+            file_size: bytes.len() as u32,
+            section_count: 1,
+        },
+        sections: vec![J3dSection {
+            tag: "DRW1".to_string(),
+            offset: 0,
+            size: bytes.len() as u32,
+        }],
+        bytes: bytes.into(),
+    };
+    let identity = identity_mtx34();
+    let mut translated = identity;
+    translated[0][3] = 42.0;
+
+    let draw_matrices = file
+        .preview_draw_matrices_from_joint_matrices(&[identity, translated])
+        .unwrap();
+
+    assert_eq!(draw_matrices, vec![Some(translated)]);
+}
+
+#[test]
+fn draw_matrix_refactor_preserves_joint_only_models() {
+    let file = J3dFile {
+        header: J3dHeader {
+            file_type: "bmd3".to_string(),
+            file_size: 0,
+            section_count: 0,
+        },
+        sections: Vec::new(),
+        bytes: Arc::from([]),
+    };
+    let joint_matrices = file.preview_joint_matrices(0, None, &[]).unwrap();
+
+    assert_eq!(
+        file.preview_draw_matrices(0, None, &[]).unwrap(),
+        file.preview_draw_matrices_from_joint_matrices(&joint_matrices)
+            .unwrap()
+    );
+}
+
+#[test]
+fn prepared_source_guard_survives_j3d_file_clone() {
+    let mut bytes = vec![0; 0x20];
+    bytes[0..4].copy_from_slice(b"J3D2");
+    bytes[4..8].copy_from_slice(b"bmd3");
+    bytes[8..12].copy_from_slice(&0x28u32.to_be_bytes());
+    bytes[12..16].copy_from_slice(&1u32.to_be_bytes());
+    bytes.extend_from_slice(b"INF1");
+    bytes.extend_from_slice(&8u32.to_be_bytes());
+    let file = J3dFile::parse(&bytes).unwrap();
+    let prepared = J3dPreparedAnimatedTriangles {
+        source: PreparedModelSource(Arc::clone(&file.bytes)),
+        packets: Vec::new(),
+        source_triangle_count: 0,
+        max_packet_vertex_count: 0,
+    };
+
+    let cloned = file.clone();
+    assert!(Arc::ptr_eq(&file.bytes, &cloned.bytes));
+    assert!(cloned.prepared_animation_source_matches(&prepared));
+
+    let independently_parsed = J3dFile::parse(&bytes).unwrap();
+    assert!(!independently_parsed.prepared_animation_source_matches(&prepared));
+}
+
+#[test]
+fn prepared_display_lists_match_legacy_pose_and_topology_exactly() {
+    let descs = [
+        VertexDesc {
+            attr: GX_VA_PNMTXIDX,
+            attr_type: GX_DIRECT,
+        },
+        VertexDesc {
+            attr: GX_VA_POS,
+            attr_type: GX_DIRECT,
+        },
+        VertexDesc {
+            attr: GX_VA_NRM,
+            attr_type: GX_DIRECT,
+        },
+    ];
+    let attr_formats = [
+        AttributeFormat {
+            attr: GX_VA_POS,
+            cnt: GX_POS_XYZ,
+            component_type: GX_F32,
+            frac: 0,
+        },
+        AttributeFormat {
+            attr: GX_VA_NRM,
+            cnt: GX_NRM_XYZ,
+            component_type: GX_F32,
+            frac: 0,
+        },
+    ];
+    let position_format = PositionFormat {
+        component_type: GX_F32,
+        frac: 0,
+    };
+    let vertex_arrays = VertexArrays {
+        normal_offset: None,
+        normal_format: Some(NormalFormat {
+            component_type: GX_F32,
+            frac: 0,
+            components: 3,
+        }),
+        color_offsets: [None; 2],
+        color_formats: [None; 2],
+        tex_offsets: [None; TEX_COORD_COUNT],
+        tex_formats: [None; TEX_COORD_COUNT],
+    };
+    let group_matrices = [0, 1];
+    let mut display_list = Vec::new();
+    display_list.push(GX_DRAW_TRIANGLE_STRIP);
+    display_list.extend_from_slice(&4u16.to_be_bytes());
+    push_direct_test_vertex(&mut display_list, 0, [0.0, 0.0, 0.0], [1.0, 1.0, 0.0]);
+    push_direct_test_vertex(&mut display_list, 0, [1.0, 0.0, 0.0], [1.0, 1.0, 0.0]);
+    push_direct_test_vertex(&mut display_list, 3, [0.0, 1.0, 0.0], [0.0, 1.0, 1.0]);
+    push_direct_test_vertex(&mut display_list, 3, [1.0, 1.0, 0.0], [0.0, 1.0, 1.0]);
+    display_list.push(GX_DRAW_QUADS);
+    display_list.extend_from_slice(&4u16.to_be_bytes());
+    for (matrix_slot, position) in [
+        (0, [2.0, 0.0, 0.0]),
+        (3, [3.0, 0.0, 0.0]),
+        (3, [3.0, 1.0, 0.0]),
+        (0, [2.0, 1.0, 0.0]),
+    ] {
+        push_direct_test_vertex(&mut display_list, matrix_slot, position, [0.0, 0.0, 1.0]);
+    }
+    display_list.push(0);
+
+    let prepared_display_list = decode_prepared_display_list(
+        &display_list,
+        &[],
+        &[],
+        &descs,
+        &attr_formats,
+        position_format,
+        vertex_arrays,
+        &group_matrices,
+    )
+    .unwrap();
+    let source_triangle_count = prepared_display_list.triangle_indices.len();
+    let max_packet_vertex_count = prepared_display_list.vertices.len();
+    let prepared = J3dPreparedAnimatedTriangles {
+        source: PreparedModelSource(Arc::from([])),
+        packets: vec![PreparedAnimatedPacket {
+            vertices: prepared_display_list.vertices,
+            triangle_indices: prepared_display_list.triangle_indices,
+            shape_index: 0,
+            packet_index: 0,
+            billboard: None,
+        }],
+        source_triangle_count,
+        max_packet_vertex_count,
+    };
+    assert_eq!(prepared.source_triangle_count(), 4);
+
+    let mut translated = identity_mtx34();
+    translated[0][3] = 4.0;
+    translated[1][3] = -2.0;
+    let nonuniform = [
+        [2.0, 0.0, 0.0, 1.0],
+        [0.0, 0.5, 0.0, 2.0],
+        [0.0, 0.0, 3.0, 3.0],
+    ];
+    let collapsed = [[0.0; 4]; 3];
+    for draw_matrices in [
+        vec![Some(identity_mtx34()), Some(identity_mtx34())],
+        vec![Some(identity_mtx34()), Some(translated)],
+        vec![Some(nonuniform), Some(translated)],
+        vec![None, Some(nonuniform)],
+        vec![Some(collapsed), Some(collapsed)],
+    ] {
+        let legacy = decode_display_list(
+            &display_list,
+            &[],
+            &[],
+            &descs,
+            &attr_formats,
+            position_format,
+            vertex_arrays,
+            &group_matrices,
+            &draw_matrices,
+            None,
+            J3dMaterialRenderState::default(),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(prepared.pose(&draw_matrices), legacy);
+    }
+}
+
+fn push_direct_test_vertex(
+    bytes: &mut Vec<u8>,
+    matrix_slot: u8,
+    position: [f32; 3],
+    normal: [f32; 3],
+) {
+    bytes.push(matrix_slot);
+    for component in position.into_iter().chain(normal) {
+        bytes.extend_from_slice(&component.to_bits().to_be_bytes());
+    }
+}
+
+#[test]
 fn compact_pe_blocks_use_material_mode_presets() {
     let explicit = (
         J3dAlphaCompare {

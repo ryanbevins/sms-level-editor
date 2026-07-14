@@ -1,5 +1,43 @@
 use super::*;
 
+#[derive(Debug, Clone, Copy)]
+pub(super) struct CameraProjection {
+    frame: CameraFrame,
+    screen_center: egui::Pos2,
+    focal: f32,
+}
+
+impl CameraProjection {
+    pub(super) fn project_world_to_screen(&self, point: [f32; 3]) -> Option<(egui::Pos2, f32)> {
+        let rel = vec3_sub(point, self.frame.position);
+        let depth = vec3_dot(rel, self.frame.forward);
+        if depth < VIEWPORT_NEAR_CLIP || !depth.is_finite() {
+            return None;
+        }
+
+        let x = vec3_dot(rel, self.frame.right) / depth * self.focal;
+        let y = vec3_dot(rel, self.frame.up) / depth * self.focal;
+        if !x.is_finite() || !y.is_finite() {
+            return None;
+        }
+
+        Some((self.screen_center + egui::vec2(x, -y), depth))
+    }
+
+    pub(super) fn project_world_segment_to_screen(
+        &self,
+        start: [f32; 3],
+        end: [f32; 3],
+    ) -> Option<[egui::Pos2; 2]> {
+        let [start, end] =
+            clip_world_segment_to_near_plane(self.frame, start, end, VIEWPORT_NEAR_CLIP)?;
+        Some([
+            self.project_world_to_screen(start)?.0,
+            self.project_world_to_screen(end)?.0,
+        ])
+    }
+}
+
 impl SmsEditorApp {
     pub(super) fn issue_counts(&self) -> (usize, usize) {
         let warnings = self
@@ -19,6 +57,7 @@ impl SmsEditorApp {
         &self,
         rect: egui::Rect,
     ) -> Vec<(String, egui::Pos2, String)> {
+        let projection = self.camera_projection(rect);
         self.document
             .as_ref()
             .map(|document| {
@@ -26,7 +65,8 @@ impl SmsEditorApp {
                     .objects
                     .iter()
                     .filter_map(|object| {
-                        self.project_world_to_screen(rect, object.transform.translation)
+                        projection
+                            .project_world_to_screen(object.transform.translation)
                             .map(|(screen, _)| {
                                 (object.id.clone(), screen, object.factory_name.clone())
                             })
@@ -47,35 +87,15 @@ impl SmsEditorApp {
         rect: egui::Rect,
         point: [f32; 3],
     ) -> Option<(egui::Pos2, f32)> {
-        let frame = self.camera_frame();
-        let rel = vec3_sub(point, frame.position);
-        let depth = vec3_dot(rel, frame.forward);
-        if depth < VIEWPORT_NEAR_CLIP || !depth.is_finite() {
-            return None;
-        }
-
-        let focal = perspective_focal_length(rect, self.viewport_zoom);
-        let x = vec3_dot(rel, frame.right) / depth * focal;
-        let y = vec3_dot(rel, frame.up) / depth * focal;
-        if !x.is_finite() || !y.is_finite() {
-            return None;
-        }
-
-        Some((rect.center() + self.viewport_pan + egui::vec2(x, -y), depth))
+        self.camera_projection(rect).project_world_to_screen(point)
     }
 
-    pub(super) fn project_world_segment_to_screen(
-        &self,
-        rect: egui::Rect,
-        start: [f32; 3],
-        end: [f32; 3],
-    ) -> Option<[egui::Pos2; 2]> {
-        let [start, end] =
-            clip_world_segment_to_near_plane(self.camera_frame(), start, end, VIEWPORT_NEAR_CLIP)?;
-        Some([
-            self.project_world_to_screen(rect, start)?.0,
-            self.project_world_to_screen(rect, end)?.0,
-        ])
+    pub(super) fn camera_projection(&self, rect: egui::Rect) -> CameraProjection {
+        CameraProjection {
+            frame: self.camera_frame(),
+            screen_center: rect.center() + self.viewport_pan,
+            focal: perspective_focal_length(rect, self.viewport_zoom),
+        }
     }
 
     pub(super) fn camera_frame(&self) -> CameraFrame {

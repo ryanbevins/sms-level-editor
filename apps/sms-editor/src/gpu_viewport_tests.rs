@@ -6,8 +6,8 @@ fn j3d_vertex_layout_fits_webgpu_minimum_attribute_limit() {
 }
 use crate::{PreviewPoint, PreviewRenderLayer};
 use sms_formats::{
-    J3dColorChannel, J3dIndirectMaterial, J3dPreviewCombineMode, J3dTevOrder, J3dTexGen,
-    SMS_MAP_MODEL_LOAD_FLAGS,
+    J3dBillboard, J3dBillboardMode, J3dColorChannel, J3dIndirectMaterial, J3dPreviewCombineMode,
+    J3dTevOrder, J3dTexGen, SMS_MAP_MODEL_LOAD_FLAGS,
 };
 
 #[test]
@@ -25,6 +25,110 @@ fn j3d_shader_parses_and_validates() {
     )
     .validate(&module)
     .expect("J3D WGSL validates");
+}
+
+#[test]
+fn j3d_vertex_shader_stops_after_the_material_texgen_count() {
+    assert!(J3D_SHADER.contains("i >= material.counts.y"));
+}
+
+#[test]
+fn offscreen_cache_reuses_an_unchanged_static_frame() {
+    let state = GpuOffscreenFrameState::new(GpuViewportFrame::default(), None);
+
+    assert!(offscreen_render_required(
+        None,
+        state,
+        GpuOffscreenInvalidation::default()
+    ));
+    assert!(!offscreen_render_required(
+        Some(state),
+        state,
+        GpuOffscreenInvalidation::default()
+    ));
+}
+
+#[test]
+fn offscreen_cache_tracks_camera_lighting_and_mirror_projection_state() {
+    let frame = GpuViewportFrame::default();
+    let state = GpuOffscreenFrameState::new(frame, None);
+
+    let mut moved_camera = frame;
+    moved_camera.camera_position[0] = 25.0;
+    assert!(offscreen_render_required(
+        Some(state),
+        GpuOffscreenFrameState::new(moved_camera, None),
+        GpuOffscreenInvalidation::default()
+    ));
+
+    let mut changed_light = frame;
+    changed_light.light_color[1] = 0.25;
+    assert!(offscreen_render_required(
+        Some(state),
+        GpuOffscreenFrameState::new(changed_light, None),
+        GpuOffscreenInvalidation::default()
+    ));
+
+    assert!(offscreen_render_required(
+        Some(state),
+        GpuOffscreenFrameState::new(frame, Some(48.0)),
+        GpuOffscreenInvalidation::default()
+    ));
+}
+
+#[test]
+fn offscreen_cache_invalidates_for_scene_resource_and_animation_changes() {
+    let state = GpuOffscreenFrameState::new(GpuViewportFrame::default(), None);
+    let invalidations = [
+        GpuOffscreenInvalidation {
+            target: true,
+            ..Default::default()
+        },
+        GpuOffscreenInvalidation {
+            scene: true,
+            ..Default::default()
+        },
+        GpuOffscreenInvalidation {
+            geometry: true,
+            ..Default::default()
+        },
+        GpuOffscreenInvalidation {
+            materials: true,
+            ..Default::default()
+        },
+        GpuOffscreenInvalidation {
+            time_animation: true,
+            ..Default::default()
+        },
+    ];
+
+    for invalidation in invalidations {
+        assert!(offscreen_render_required(Some(state), state, invalidation));
+    }
+}
+
+#[test]
+fn offscreen_cache_ignores_time_for_static_materials() {
+    let frame = GpuViewportFrame::default();
+    let state = GpuOffscreenFrameState::new(frame, None);
+    let mut later = frame;
+    later.animation_seconds = 120.0;
+    let later_state = GpuOffscreenFrameState::new(later, None);
+
+    assert_eq!(state, later_state);
+    assert!(!offscreen_render_required(
+        Some(state),
+        later_state,
+        GpuOffscreenInvalidation::default()
+    ));
+    assert!(offscreen_render_required(
+        Some(state),
+        later_state,
+        GpuOffscreenInvalidation {
+            time_animation: true,
+            ..Default::default()
+        }
+    ));
 }
 
 #[test]
@@ -68,11 +172,16 @@ fn geometry_updates_touch_only_requested_triangle_batches() {
     let animated_location = scene.triangle_vertices[1].unwrap();
     let static_position =
         scene.batches[static_location.batch_index].vertices[static_location.vertex_offset].position;
+    let mut dirty_vertex_ranges = vec![None; scene.batches.len()];
 
     preview.triangles[1].vertices[0] = [50.0, 60.0, 70.0];
-    let dirty = scene.update_geometry(&preview, &[0..0, 1..2]);
+    let changed = scene.update_geometry(&preview, &[0..0, 1..2], &mut dirty_vertex_ranges);
 
-    assert_eq!(dirty, BTreeSet::from([animated_location.batch_index]));
+    assert!(changed);
+    assert_eq!(
+        dirty_vertex_ranges[animated_location.batch_index],
+        Some(animated_location.vertex_offset..animated_location.vertex_offset + 3)
+    );
     assert_eq!(
         scene.batches[animated_location.batch_index].vertices[animated_location.vertex_offset]
             .position,
@@ -96,7 +205,12 @@ fn geometry_updates_keep_dynamic_particle_shape_metadata() {
     preview.triangles[1].particle_direction = Some([7.0, 8.0, 9.0]);
     preview.triangles[1].tex_coords = Some([[0.0, 0.7], [1.0, 0.7], [1.0, 0.8]]);
     let particle_range = 1..2;
-    scene.update_geometry(&preview, std::slice::from_ref(&particle_range));
+    let mut dirty_vertex_ranges = vec![None; scene.batches.len()];
+    scene.update_geometry(
+        &preview,
+        std::slice::from_ref(&particle_range),
+        &mut dirty_vertex_ranges,
+    );
 
     let location = scene.triangle_vertices[1].unwrap();
     let vertex = scene.batches[location.batch_index].vertices[location.vertex_offset];
@@ -104,6 +218,197 @@ fn geometry_updates_keep_dynamic_particle_shape_metadata() {
     assert_eq!(&vertex.billboard_center_mode[..2], &[1.0, 2.0]);
     assert_eq!(vertex.billboard_axis_y, [7.0, 8.0, 9.0]);
     assert_eq!(vertex.uv0, [0.0, 0.7]);
+}
+
+#[test]
+fn geometry_only_updates_match_a_full_gpu_repack_byte_for_byte() {
+    let mut preview = geometry_update_preview();
+    let triangle = &mut preview.triangles[1];
+    triangle.color = None;
+    triangle.tex_coord_sets[0] = Some([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]);
+    triangle.tex_coord_sets[4] = Some([[0.2, 0.3], [0.4, 0.5], [0.6, 0.7]]);
+    triangle.billboard = Some(J3dBillboard {
+        mode: J3dBillboardMode::Full,
+        center: [10.0, 20.0, 30.0],
+        axes: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        offsets: [[-1.0, -2.0, 0.0], [1.0, -2.0, 0.0], [-1.0, 2.0, 0.0]],
+        normals: Some([[0.0, 0.0, 1.0]; 3]),
+    });
+    let mut incrementally_updated = GpuSceneData::from_preview(&preview);
+
+    let triangle = &mut preview.triangles[1];
+    triangle.vertices = [[50.0, 60.0, 70.0], [54.0, 60.0, 70.0], [50.0, 66.0, 70.0]];
+    triangle.billboard = Some(J3dBillboard {
+        mode: J3dBillboardMode::YAxis,
+        center: [51.0, 62.0, 73.0],
+        axes: [[0.0, 0.0, -1.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]],
+        offsets: [[-2.0, -3.0, 0.0], [2.0, -3.0, 0.0], [-2.0, 3.0, 0.0]],
+        normals: Some([[1.0, 0.0, 0.0]; 3]),
+    });
+    let triangle_range = 1..2;
+    let mut dirty_vertex_ranges = vec![None; incrementally_updated.batches.len()];
+    incrementally_updated.update_geometry(
+        &preview,
+        std::slice::from_ref(&triangle_range),
+        &mut dirty_vertex_ranges,
+    );
+    let fully_repacked = GpuSceneData::from_preview(&preview);
+
+    assert_eq!(
+        gpu_triangle_vertex_bytes(&incrementally_updated, 1),
+        gpu_triangle_vertex_bytes(&fully_repacked, 1)
+    );
+}
+
+#[test]
+fn plain_mesh_updates_match_a_full_gpu_repack_byte_for_byte() {
+    let mut preview = geometry_update_preview();
+    let triangle = &mut preview.triangles[1];
+    triangle.color_channels[0] = Some([[10, 20, 30, 40]; 3]);
+    triangle.color_channels[1] = Some([[50, 60, 70, 80]; 3]);
+    triangle.tex_coord_sets[0] = Some([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]);
+    let mut incrementally_updated = GpuSceneData::from_preview(&preview);
+
+    let triangle = &mut preview.triangles[1];
+    triangle.vertices = [[50.0, 60.0, 70.0], [54.0, 60.0, 70.0], [50.0, 66.0, 70.0]];
+    triangle.normals = Some([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
+    let triangle_range = 1..2;
+    let mut dirty_vertex_ranges = vec![None; incrementally_updated.batches.len()];
+    incrementally_updated.update_geometry(
+        &preview,
+        std::slice::from_ref(&triangle_range),
+        &mut dirty_vertex_ranges,
+    );
+    let fully_repacked = GpuSceneData::from_preview(&preview);
+
+    assert_eq!(
+        gpu_triangle_vertex_bytes(&incrementally_updated, 1),
+        gpu_triangle_vertex_bytes(&fully_repacked, 1)
+    );
+}
+
+#[test]
+fn particle_updates_match_a_full_gpu_repack_byte_for_byte() {
+    let mut preview = geometry_update_preview();
+    let triangle = &mut preview.triangles[1];
+    triangle.render_layer = PreviewRenderLayer::Particle;
+    triangle.particle_type = Some(3);
+    triangle.particle_pivot = Some([1.0, 2.0]);
+    triangle.particle_direction = Some([0.0, 1.0, 0.0]);
+    triangle.color_channels[0] = Some([[10, 20, 30, 40]; 3]);
+    triangle.color_channels[1] = Some([[50, 60, 70, 80]; 3]);
+    triangle.tex_coord_sets[0] = Some([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]);
+    triangle.tex_coord_sets[3] = Some([[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]]);
+    let mut incrementally_updated = GpuSceneData::from_preview(&preview);
+
+    let triangle = &mut preview.triangles[1];
+    triangle.vertices = [
+        [100.0, 200.0, 300.0],
+        [110.0, 200.0, 300.0],
+        [100.0, 210.0, 300.0],
+    ];
+    triangle.normals = Some([[4.0, 5.0, 6.0]; 3]);
+    triangle.particle_type = Some(6);
+    triangle.particle_pivot = Some([2.0, 0.0]);
+    triangle.particle_direction = Some([7.0, 8.0, 9.0]);
+    triangle.color_channels[0] = Some([[11, 21, 31, 41], [12, 22, 32, 42], [13, 23, 33, 43]]);
+    triangle.color_channels[1] = Some([[51, 61, 71, 81], [52, 62, 72, 82], [53, 63, 73, 83]]);
+    triangle.tex_coord_sets[0] = Some([[0.0, 0.7], [1.0, 0.7], [0.0, 0.8]]);
+    triangle.tex_coord_sets[3] = Some([[0.2, 0.3], [0.4, 0.5], [0.6, 0.7]]);
+    let triangle_range = 1..2;
+    let mut dirty_vertex_ranges = vec![None; incrementally_updated.batches.len()];
+    incrementally_updated.update_geometry(
+        &preview,
+        std::slice::from_ref(&triangle_range),
+        &mut dirty_vertex_ranges,
+    );
+    let fully_repacked = GpuSceneData::from_preview(&preview);
+
+    assert_eq!(
+        gpu_triangle_vertex_bytes(&incrementally_updated, 1),
+        gpu_triangle_vertex_bytes(&fully_repacked, 1)
+    );
+}
+
+#[test]
+fn geometry_updates_limit_uploads_to_the_dirty_vertex_span() {
+    let mut preview = geometry_update_preview();
+    preview.triangles[1].packet_index = preview.triangles[0].packet_index;
+    let mut scene = GpuSceneData::from_preview(&preview);
+    let first = scene.triangle_vertices[0].unwrap();
+    let second = scene.triangle_vertices[1].unwrap();
+    assert_eq!(first.batch_index, second.batch_index);
+    let mut dirty_vertex_ranges = vec![None; scene.batches.len()];
+
+    preview.triangles[1].vertices[0] = [50.0, 60.0, 70.0];
+    let second_range = 1..2;
+    scene.update_geometry(
+        &preview,
+        std::slice::from_ref(&second_range),
+        &mut dirty_vertex_ranges,
+    );
+
+    let dirty = dirty_vertex_ranges[first.batch_index].clone().unwrap();
+    assert_eq!(dirty, second.vertex_offset..second.vertex_offset + 3);
+    assert_eq!(
+        dirty.len() * std::mem::size_of::<GpuVertex>(),
+        3 * std::mem::size_of::<GpuVertex>()
+    );
+    assert!(dirty.len() < scene.batches[first.batch_index].vertices.len());
+
+    let first_range = 0..1;
+    scene.update_geometry(
+        &preview,
+        std::slice::from_ref(&first_range),
+        &mut dirty_vertex_ranges,
+    );
+    assert_eq!(
+        dirty_vertex_ranges[first.batch_index],
+        Some(first.vertex_offset..second.vertex_offset + 3)
+    );
+}
+
+#[test]
+fn geometry_updates_refresh_the_mirror_plane_height() {
+    let mut preview = geometry_update_preview();
+    preview.triangles[0].render_layer = PreviewRenderLayer::MirrorSurface;
+    for vertex in &mut preview.triangles[0].vertices {
+        vertex[1] = 12.0;
+    }
+    let mut scene = GpuSceneData::from_preview(&preview);
+    assert_eq!(scene.mirror_plane_y, Some(12.0));
+
+    for vertex in &mut preview.triangles[0].vertices {
+        vertex[1] = 48.0;
+    }
+    let mirror_range = 0..1;
+    let mut dirty_vertex_ranges = vec![None; scene.batches.len()];
+    scene.update_geometry(
+        &preview,
+        std::slice::from_ref(&mirror_range),
+        &mut dirty_vertex_ranges,
+    );
+
+    assert_eq!(scene.mirror_plane_y, Some(48.0));
+}
+
+#[test]
+fn gpu_batches_store_direct_nonindexed_triangle_lists() {
+    let preview = geometry_update_preview();
+    let scene = GpuSceneData::from_preview(&preview);
+
+    assert_eq!(
+        scene
+            .batches
+            .iter()
+            .map(|batch| batch.vertices.len())
+            .sum::<usize>(),
+        preview.triangles.len() * 3
+    );
+    assert!(scene
+        .batches
+        .iter()
+        .all(|batch| batch.vertices.len() % 3 == 0));
 }
 
 #[test]
@@ -180,6 +485,14 @@ fn geometry_update_preview() -> ModelPreview {
         level_transform_duration_frames: 600.0,
         level_transform_particle_end_frames: 600.0,
     }
+}
+
+fn gpu_triangle_vertex_bytes(scene: &GpuSceneData, triangle_index: usize) -> &[u8] {
+    let location = scene.triangle_vertices[triangle_index].unwrap();
+    bytemuck::cast_slice(
+        &scene.batches[location.batch_index].vertices
+            [location.vertex_offset..location.vertex_offset + 3],
+    )
 }
 
 #[test]

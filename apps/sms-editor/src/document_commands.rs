@@ -42,6 +42,7 @@ impl SmsEditorApp {
             {
                 Ok(manifest) => {
                     self.saved_objects = document.objects.clone();
+                    self.document_dirty = false;
                     self.log.push(format!(
                         "Saved editor project with {} file(s).",
                         manifest.changed_files.len()
@@ -159,8 +160,21 @@ impl SmsEditorApp {
                 object.transform = transform;
             }
         });
-        if self.update_object_preview_transform(&selected_id, old_transform, transform) {
-            self.rebuild_gpu_viewport_scene();
+        let has_rendered_model = self
+            .model_preview
+            .as_ref()
+            .is_some_and(|preview| preview.object_model_indices.contains_key(&selected_id));
+        if !has_rendered_model {
+            return;
+        }
+        if let Some(triangle_ranges) =
+            self.update_object_preview_transform(&selected_id, old_transform, transform)
+        {
+            if let (Some(gpu_viewport), Some(preview)) =
+                (self.gpu_viewport.as_ref(), self.model_preview.as_ref())
+            {
+                gpu_viewport.update_geometry(preview, &triangle_ranges);
+            }
             self.clear_viewport_preview_cache();
         } else {
             self.rebuild_model_preview_from_document();
@@ -192,14 +206,28 @@ impl SmsEditorApp {
         }
         if let Some(document) = &mut self.document {
             mutate(document);
-            if let Err(err) = document.queue_editor_overlay_change() {
-                self.log.push(format!("Scene overlay update failed: {err}"));
-            }
-            self.issues = document.validate();
-            if !in_transaction {
-                self.log.push(format!("{label}."));
-            }
         }
+        self.document_dirty = if in_transaction {
+            true
+        } else {
+            self.document
+                .as_ref()
+                .is_some_and(|document| document.objects != self.saved_objects)
+        };
+        if !in_transaction {
+            self.flush_document_change();
+            self.log.push(format!("{label}."));
+        }
+    }
+
+    fn flush_document_change(&mut self) {
+        let Some(document) = &mut self.document else {
+            return;
+        };
+        if let Err(err) = document.queue_editor_overlay_change() {
+            self.log.push(format!("Scene overlay update failed: {err}"));
+        }
+        self.issues = document.validate();
     }
 
     pub(super) fn begin_undo_transaction(&mut self) {
@@ -215,10 +243,17 @@ impl SmsEditorApp {
         let Some(before) = self.undo_transaction.take() else {
             return;
         };
+        if let Some(preview) = &mut self.model_preview {
+            recompute_model_preview_bounds(preview);
+        }
         let changed = self
             .document
             .as_ref()
             .is_some_and(|document| document.objects != before);
+        self.document_dirty = self
+            .document
+            .as_ref()
+            .is_some_and(|document| document.objects != self.saved_objects);
         if !changed {
             return;
         }
@@ -227,6 +262,7 @@ impl SmsEditorApp {
             self.undo_stack.remove(0);
         }
         self.redo_stack.clear();
+        self.flush_document_change();
         self.log.push(format!("{label}."));
     }
 
@@ -249,6 +285,7 @@ impl SmsEditorApp {
         };
         self.redo_stack.push(document.objects.clone());
         document.objects = previous;
+        self.document_dirty = document.objects != self.saved_objects;
         if let Err(err) = document.queue_editor_overlay_change() {
             self.log.push(format!("Scene overlay update failed: {err}"));
         }
@@ -267,6 +304,7 @@ impl SmsEditorApp {
         };
         self.undo_stack.push(document.objects.clone());
         document.objects = next;
+        self.document_dirty = document.objects != self.saved_objects;
         if let Err(err) = document.queue_editor_overlay_change() {
             self.log.push(format!("Scene overlay update failed: {err}"));
         }
@@ -285,9 +323,7 @@ impl SmsEditorApp {
     }
 
     pub(super) fn is_dirty(&self) -> bool {
-        self.document
-            .as_ref()
-            .is_some_and(|document| document.objects != self.saved_objects)
+        self.document_dirty
     }
 
     pub(super) fn unsaved_changes_dialog(&mut self, ctx: &egui::Context) {
@@ -356,9 +392,16 @@ impl SmsEditorApp {
     }
 
     pub(super) fn rebuild_model_preview_from_document(&mut self) {
-        self.model_preview = self.document.as_ref().and_then(|document| {
-            SmsEditorApp::build_model_preview(document, self.preview_visibility())
-        });
+        let visibility = self.preview_visibility();
+        let (render_scene, model_preview) =
+            self.document.as_ref().map_or((None, None), |document| {
+                (
+                    Some(RenderScene::from_document(document)),
+                    SmsEditorApp::build_model_preview(document, visibility),
+                )
+            });
+        self.render_scene = render_scene;
+        self.model_preview = model_preview;
         self.last_level_transform_progress_bits = u32::MAX;
         self.rebuild_gpu_viewport_scene();
         self.clear_viewport_preview_cache();
@@ -369,16 +412,14 @@ impl SmsEditorApp {
         object_id: &str,
         old_transform: Transform,
         new_transform: Transform,
-    ) -> bool {
+    ) -> Option<Vec<std::ops::Range<usize>>> {
+        let defer_full_bounds_recompute = self.undo_transaction.is_some();
         if !transform_has_invertible_scale(old_transform) {
-            return false;
+            return None;
         }
-        let Some(preview) = self.model_preview.as_mut() else {
-            return false;
-        };
-        let Some(model_index) = preview.object_model_indices.get(object_id).copied() else {
-            return false;
-        };
+        let preview = self.model_preview.as_mut()?;
+        let model_index = preview.object_model_indices.get(object_id).copied()?;
+        let triangle_ranges = preview_triangle_ranges_for_model_index(preview, model_index);
 
         let (old_preview_transform, new_preview_transform) = self
             .document
@@ -436,8 +477,8 @@ impl SmsEditorApp {
                 changed = true;
             }
         }
-        for triangle in &mut preview.triangles {
-            if triangle.model_index == model_index {
+        for range in &triangle_ranges {
+            for triangle in &mut preview.triangles[range.clone()] {
                 triangle.vertices = triangle.vertices.map(|vertex| {
                     retransform_preview_point(vertex, old_preview_transform, new_preview_transform)
                 });
@@ -470,9 +511,13 @@ impl SmsEditorApp {
             }
         }
         if changed {
-            recompute_model_preview_bounds(preview);
+            if defer_full_bounds_recompute {
+                expand_model_preview_bounds(preview, model_index, &triangle_ranges);
+            } else {
+                recompute_model_preview_bounds(preview);
+            }
         }
-        changed
+        changed.then_some(triangle_ranges)
     }
 
     pub(super) fn rebuild_gpu_viewport_scene(&mut self) {
@@ -573,4 +618,34 @@ impl SmsEditorApp {
             ));
         }
     }
+}
+
+#[cfg(test)]
+pub(super) fn preview_triangle_ranges_for_model(
+    preview: &ModelPreview,
+    object_id: &str,
+) -> Vec<std::ops::Range<usize>> {
+    let Some(model_index) = preview.object_model_indices.get(object_id).copied() else {
+        return Vec::new();
+    };
+    preview_triangle_ranges_for_model_index(preview, model_index)
+}
+
+fn preview_triangle_ranges_for_model_index(
+    preview: &ModelPreview,
+    model_index: usize,
+) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut start = None;
+    for (index, triangle) in preview.triangles.iter().enumerate() {
+        if triangle.model_index == model_index {
+            start.get_or_insert(index);
+        } else if let Some(start) = start.take() {
+            ranges.push(start..index);
+        }
+    }
+    if let Some(start) = start {
+        ranges.push(start..preview.triangles.len());
+    }
+    ranges
 }

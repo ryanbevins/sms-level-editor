@@ -79,7 +79,8 @@ impl SmsEditorApp {
             self.mark_viewport_interaction(ui);
         }
 
-        if moving_object && response.drag_stopped_by(egui::PointerButton::Primary) {
+        if self.undo_transaction.is_some() && response.drag_stopped_by(egui::PointerButton::Primary)
+        {
             self.commit_undo_transaction("Moved object");
         }
 
@@ -260,12 +261,13 @@ impl SmsEditorApp {
             self.paint_grid(painter, rect);
         }
 
-        let object_positions = self.object_screen_positions(rect);
-        for (id, pos, label) in object_positions {
-            let selected = self.selected_object_id.as_deref() == Some(&id);
-            if self.view_mode != ViewMode::Objects && !selected {
+        let projection = self.camera_projection(rect);
+        for object in self.viewport_marker_objects() {
+            let Some((pos, _)) = projection.project_world_to_screen(object.transform.translation)
+            else {
                 continue;
-            }
+            };
+            let selected = self.selected_object_id.as_deref() == Some(object.id.as_str());
             let color = if selected {
                 egui::Color32::from_rgb(255, 214, 102)
             } else {
@@ -285,7 +287,7 @@ impl SmsEditorApp {
             painter.text(
                 pos + egui::vec2(14.0, -8.0),
                 egui::Align2::LEFT_TOP,
-                label,
+                &object.factory_name,
                 egui::FontId::proportional(12.0),
                 egui::Color32::from_rgb(232, 236, 238),
             );
@@ -298,7 +300,17 @@ impl SmsEditorApp {
         self.paint_viewport_overlays(ui, painter, rect);
     }
 
+    pub(super) fn viewport_marker_objects(&self) -> impl Iterator<Item = &SceneObject> {
+        let show_all = self.view_mode == ViewMode::Objects;
+        let selected_id = self.selected_object_id.as_deref();
+        self.document
+            .iter()
+            .flat_map(|document| document.objects.iter())
+            .filter(move |object| show_all || selected_id == Some(object.id.as_str()))
+    }
+
     pub(super) fn paint_grid(&self, painter: &egui::Painter, rect: egui::Rect) {
+        let projection = self.camera_projection(rect);
         let minor = egui::Stroke::new(
             1.0,
             egui::Color32::from_rgba_unmultiplied(178, 186, 178, 32),
@@ -311,35 +323,46 @@ impl SmsEditorApp {
         for i in -10..=10 {
             let v = i as f32 * 500.0;
             let stroke = if i % 5 == 0 { major } else { minor };
-            self.paint_world_segment(painter, rect, [v, 0.0, -5000.0], [v, 0.0, 5000.0], stroke);
-            self.paint_world_segment(painter, rect, [-5000.0, 0.0, v], [5000.0, 0.0, v], stroke);
+            Self::paint_world_segment(
+                painter,
+                &projection,
+                [v, 0.0, -5000.0],
+                [v, 0.0, 5000.0],
+                stroke,
+            );
+            Self::paint_world_segment(
+                painter,
+                &projection,
+                [-5000.0, 0.0, v],
+                [5000.0, 0.0, v],
+                stroke,
+            );
         }
 
-        self.paint_world_segment(
+        Self::paint_world_segment(
             painter,
-            rect,
+            &projection,
             [-5200.0, 0.0, 0.0],
             [5200.0, 0.0, 0.0],
             egui::Stroke::new(2.0, egui::Color32::from_rgb(206, 82, 82)),
         );
-        self.paint_world_segment(
+        Self::paint_world_segment(
             painter,
-            rect,
+            &projection,
             [0.0, 0.0, -5200.0],
             [0.0, 0.0, 5200.0],
             egui::Stroke::new(2.0, egui::Color32::from_rgb(82, 168, 110)),
         );
     }
 
-    pub(super) fn paint_world_segment(
-        &self,
+    fn paint_world_segment(
         painter: &egui::Painter,
-        rect: egui::Rect,
+        projection: &super::camera::CameraProjection,
         start: [f32; 3],
         end: [f32; 3],
         stroke: egui::Stroke,
     ) {
-        if let Some(segment) = self.project_world_segment_to_screen(rect, start, end) {
+        if let Some(segment) = projection.project_world_segment_to_screen(start, end) {
             painter.line_segment(segment, stroke);
         }
     }
@@ -388,11 +411,12 @@ impl SmsEditorApp {
         if has_triangles {
             if self.model_preview.as_ref().is_some_and(|preview| {
                 !preview.texture_srt_animations.is_empty()
+                    || !preview.texture_pattern_animations.is_empty()
                     || !preview.animated_models.is_empty()
                     || !preview.rotating_models.is_empty()
                     || !preview.actor_particles.is_empty()
             }) {
-                ctx.request_repaint_after(std::time::Duration::from_millis(16));
+                ctx.request_repaint();
             }
             if let (Some(gpu_viewport), Some(frame)) =
                 (self.gpu_viewport.as_ref(), self.gpu_viewport_frame(rect))
@@ -464,7 +488,7 @@ impl SmsEditorApp {
                 particle_frame = particle_end_frames;
                 self.level_transform_playing = false;
             } else {
-                ctx.request_repaint_after(std::time::Duration::from_millis(16));
+                ctx.request_repaint();
             }
         }
 
@@ -574,21 +598,28 @@ impl SmsEditorApp {
                 ..
             } = preview;
             for source in animated_models {
-                let Ok(posed_triangles) = source.file.animated_triangles_with_joint_animation(
-                    source.loader_flags,
-                    &source.animation,
-                    elapsed_seconds,
-                ) else {
+                let pose_result = source.prepared_triangles.as_ref().map_or_else(
+                    || {
+                        source
+                            .file
+                            .animated_triangles_and_joint_matrices_with_joint_animation(
+                                source.loader_flags,
+                                &source.animation,
+                                elapsed_seconds,
+                            )
+                    },
+                    |prepared| {
+                        source.file.animate_prepared_triangles_with_joint_animation(
+                            prepared,
+                            source.loader_flags,
+                            &source.animation,
+                            elapsed_seconds,
+                        )
+                    },
+                );
+                let Ok((posed_triangles, joint_matrices)) = pose_result else {
                     continue;
                 };
-                let joint_matrices = source
-                    .file
-                    .joint_matrices_with_joint_animation(
-                        source.loader_flags,
-                        &source.animation,
-                        elapsed_seconds,
-                    )
-                    .unwrap_or_default();
                 for instance in &source.instances {
                     for (point, position) in points[instance.point_range.clone()].iter_mut().zip(
                         posed_triangles
@@ -633,11 +664,27 @@ impl SmsEditorApp {
                         let posed_triangles =
                             accessory.joint_animation.as_ref().and_then(|animation| {
                                 accessory
-                                    .file
-                                    .animated_triangles_with_joint_animation(
-                                        accessory.loader_flags,
-                                        animation.as_ref(),
-                                        elapsed_seconds,
+                                    .prepared_triangles
+                                    .as_ref()
+                                    .map_or_else(
+                                        || {
+                                            accessory.file.animated_triangles_with_joint_animation(
+                                                accessory.loader_flags,
+                                                animation.as_ref(),
+                                                elapsed_seconds,
+                                            )
+                                        },
+                                        |prepared| {
+                                            accessory
+                                                .file
+                                                .animate_prepared_triangles_with_joint_animation(
+                                                    prepared,
+                                                    accessory.loader_flags,
+                                                    animation.as_ref(),
+                                                    elapsed_seconds,
+                                                )
+                                                .map(|(triangles, _)| triangles)
+                                        },
                                     )
                                     .ok()
                             });
@@ -823,6 +870,7 @@ impl SmsEditorApp {
         rect: egui::Rect,
         preview: &ModelPreview,
     ) {
+        let projection = self.camera_projection(rect);
         let stroke =
             egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(91, 190, 173, 95));
         for pair in preview.points.windows(2) {
@@ -831,7 +879,7 @@ impl SmsEditorApp {
             }
 
             if let Some([a, b]) =
-                self.project_world_segment_to_screen(rect, pair[0].position, pair[1].position)
+                projection.project_world_segment_to_screen(pair[0].position, pair[1].position)
             {
                 if rect.expand(80.0).contains(a)
                     && rect.expand(80.0).contains(b)
@@ -843,7 +891,7 @@ impl SmsEditorApp {
         }
 
         for point in &preview.points {
-            if let Some((screen, _)) = self.project_world_to_screen(rect, point.position) {
+            if let Some((screen, _)) = projection.project_world_to_screen(point.position) {
                 if rect.expand(4.0).contains(screen) {
                     painter.circle_filled(
                         screen,
@@ -981,6 +1029,7 @@ impl SmsEditorApp {
         rect: egui::Rect,
         preview: &ModelPreview,
     ) {
+        let projection = self.camera_projection(rect);
         let min = preview.bounds_min;
         let max = preview.bounds_max;
         let corners = [
@@ -1012,7 +1061,7 @@ impl SmsEditorApp {
             egui::Color32::from_rgba_unmultiplied(255, 214, 102, 115),
         );
         for (a, b) in edges {
-            self.paint_world_segment(painter, rect, corners[a], corners[b], stroke);
+            Self::paint_world_segment(painter, &projection, corners[a], corners[b], stroke);
         }
     }
 
@@ -1063,10 +1112,9 @@ impl SmsEditorApp {
         );
 
         let document_summary = self
-            .document
+            .render_scene
             .as_ref()
-            .map(|document| {
-                let scene = RenderScene::from_document(document);
+            .map(|scene| {
                 format!(
                     "{}  models:{}  col:{}  obj:{}",
                     scene.stage_id,

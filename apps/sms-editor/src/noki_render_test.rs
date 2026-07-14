@@ -6,6 +6,98 @@ const BASE_ROOT_ENV: &str = "SMS_NOKI_TEST_BASE_ROOT";
 const OUTPUT_ENV: &str = "SMS_NOKI_TEST_OUTPUT";
 
 #[test]
+#[ignore = "requires an extracted retail base root and is a manual performance probe"]
+fn profiles_dolpic0_preview_and_animation_updates() {
+    let base_root = env::var_os(BASE_ROOT_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| panic!("set {BASE_ROOT_ENV} to the extracted game's data directory"));
+    let decomp_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let registry = SchemaGenerator::new(decomp_root)
+        .generate()
+        .expect("generate decomp-derived object metadata");
+    let document = StageDocument::open(&base_root, "dolpic0")
+        .expect("open dolpic0")
+        .with_registry(registry);
+
+    let build_started = Instant::now();
+    let preview = SmsEditorApp::build_model_preview(
+        &document,
+        PreviewVisibility {
+            environment: true,
+            goop: true,
+            effects: false,
+        },
+    )
+    .expect("build Dolpic preview");
+    let build_elapsed = build_started.elapsed();
+    let triangle_count = preview.triangles.len();
+    let animated_model_count = preview.animated_models.len();
+    let rotating_model_count = preview.rotating_models.len();
+    let actor_particle_count = preview.actor_particles.len();
+
+    let gpu_started = Instant::now();
+    let gpu_viewport = gpu_viewport::GpuViewportScene::from_preview(
+        &preview,
+        eframe::wgpu::TextureFormat::Bgra8UnormSrgb,
+    );
+    let gpu_elapsed = gpu_started.elapsed();
+    let mut app = SmsEditorApp {
+        document: Some(document),
+        model_preview: Some(preview),
+        gpu_viewport: Some(gpu_viewport),
+        ..SmsEditorApp::default()
+    };
+
+    eprintln!(
+        "dolpic0 preview: build={build_elapsed:?}, gpu_prepare={gpu_elapsed:?}, triangles={triangle_count}, animated_models={animated_model_count}, rotating_models={rotating_model_count}, actor_particles={actor_particle_count}"
+    );
+    for seconds in [1_u64, 10, 60, 300] {
+        app.animation_started_at = Instant::now() - std::time::Duration::from_secs(seconds);
+        app.last_skeletal_animation_tick = u64::MAX;
+        let started = Instant::now();
+        app.update_skeletal_animations();
+        eprintln!(
+            "dolpic0 animation sample at {seconds}s: {:?}",
+            started.elapsed()
+        );
+    }
+
+    let base_preview = app
+        .model_preview
+        .take()
+        .expect("Dolpic preview remains loaded");
+    let measure_cpu = |label: &str, preview: ModelPreview| {
+        let mut app = SmsEditorApp {
+            model_preview: Some(preview),
+            animation_started_at: Instant::now() - std::time::Duration::from_secs(60),
+            last_skeletal_animation_tick: u64::MAX,
+            ..SmsEditorApp::default()
+        };
+        let started = Instant::now();
+        app.update_skeletal_animations();
+        eprintln!("dolpic0 {label} CPU sample: {:?}", started.elapsed());
+        std::hint::black_box(app.model_preview.take().expect("profile preview"));
+    };
+
+    measure_cpu("full", base_preview.clone());
+    let mut skeletal = base_preview.clone();
+    skeletal.rotating_models.clear();
+    skeletal.actor_particles.clear();
+    skeletal.texture_pattern_animations.clear();
+    measure_cpu("skeletal-only", skeletal);
+    let mut rotating = base_preview.clone();
+    rotating.animated_models.clear();
+    rotating.actor_particles.clear();
+    rotating.texture_pattern_animations.clear();
+    measure_cpu("rotating-only", rotating);
+    let mut particles = base_preview.clone();
+    particles.animated_models.clear();
+    particles.rotating_models.clear();
+    particles.texture_pattern_animations.clear();
+    measure_cpu("particles-only", particles);
+}
+
+#[test]
 #[ignore = "requires an extracted retail base root"]
 fn renders_maremb_body_and_accessories_to_screenshot() {
     let base_root = env::var_os(BASE_ROOT_ENV)

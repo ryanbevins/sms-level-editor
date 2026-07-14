@@ -13,10 +13,10 @@ use sms_formats::{
     decode_bti_texture, discover_scene_archives, mount_scene_archive, parse_jdrama_object_records,
     read_stage_asset_bytes, J3dAlphaCompare, J3dBillboard, J3dBlendMode, J3dFile,
     J3dGeometryPreview, J3dJointAnimation, J3dJointTransformOverride, J3dMaterial, J3dMatrix34,
-    J3dPreviewCombineMode, J3dTexturePatternAnimation, J3dTextureSrtAnimation, J3dTriangle,
-    J3dZMode, JpaEffect, SceneArchiveInfo, StageAsset, StageAssetKind,
-    SMS_ANIMATION_FRAMES_PER_SECOND, SMS_DEFAULT_OBJECT_MODEL_LOAD_FLAGS, SMS_MAP_MODEL_LOAD_FLAGS,
-    SMS_POLLUTION_MODEL_LOAD_FLAGS,
+    J3dPreparedAnimatedTriangles, J3dPreviewCombineMode, J3dTexturePatternAnimation,
+    J3dTextureSrtAnimation, J3dTriangle, J3dZMode, JpaEffect, SceneArchiveInfo, StageAsset,
+    StageAssetKind, SMS_ANIMATION_FRAMES_PER_SECOND, SMS_DEFAULT_OBJECT_MODEL_LOAD_FLAGS,
+    SMS_MAP_MODEL_LOAD_FLAGS, SMS_POLLUTION_MODEL_LOAD_FLAGS,
 };
 use sms_render::{RenderScene, RendererConfig, ViewportRenderer};
 use sms_scene::{
@@ -143,6 +143,7 @@ struct SmsEditorApp {
     dolphin_user_dir: String,
     registry: Option<ObjectRegistry>,
     document: Option<StageDocument>,
+    render_scene: Option<RenderScene>,
     scene_archives: Vec<SceneArchiveInfo>,
     model_preview: Option<ModelPreview>,
     gpu_viewport: Option<gpu_viewport::GpuViewportScene>,
@@ -178,6 +179,7 @@ struct SmsEditorApp {
     camera_speed: f32,
     next_object_serial: u32,
     saved_objects: Vec<SceneObject>,
+    document_dirty: bool,
     undo_stack: Vec<Vec<SceneObject>>,
     redo_stack: Vec<Vec<SceneObject>>,
     undo_transaction: Option<Vec<SceneObject>>,
@@ -209,6 +211,7 @@ impl Default for SmsEditorApp {
             dolphin_user_dir: String::new(),
             registry: None,
             document: None,
+            render_scene: None,
             scene_archives: Vec::new(),
             model_preview: None,
             gpu_viewport: None,
@@ -244,6 +247,7 @@ impl Default for SmsEditorApp {
             camera_speed: 1.0,
             next_object_serial: 1,
             saved_objects: Vec::new(),
+            document_dirty: false,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             undo_transaction: None,
@@ -339,6 +343,9 @@ impl eframe::App for SmsEditorApp {
             .show(root_ui, |ui| self.console(ui));
 
         egui::CentralPanel::default().show(root_ui, |ui| self.viewport(ui));
+        if self.undo_transaction.is_some() && !root_ui.input(|input| input.pointer.primary_down()) {
+            self.commit_undo_transaction("Updated transform");
+        }
         self.unsaved_changes_dialog(root_ui.ctx());
     }
 }
@@ -601,8 +608,10 @@ impl SmsEditorApp {
         }
         self.issues = document.validate();
         self.saved_objects = document.objects.clone();
+        self.document_dirty = false;
         self.stage_id = document.stage_id.clone();
         self.document = Some(document);
+        self.render_scene = Some(scene);
         self.model_preview = preview;
         self.animation_started_at = Instant::now();
         self.last_skeletal_animation_tick = u64::MAX;
@@ -907,6 +916,10 @@ impl SmsEditorApp {
                     continue;
                 };
                 let joint_animation = starting_joint_animation(document, object, &model_path);
+                let prepared_triangles = joint_animation
+                    .as_ref()
+                    .and_then(|_| file.prepare_animated_triangles().ok())
+                    .map(Arc::new);
                 let preview_result = joint_animation.as_ref().map_or_else(
                     || file.geometry_preview_with_loader_flags(loader_flags),
                     |animation| {
@@ -928,6 +941,7 @@ impl SmsEditorApp {
                     CachedObjectModelPreview {
                         file,
                         joint_animation,
+                        prepared_triangles,
                         loader_flags,
                         preview,
                         texture_base,
@@ -1131,6 +1145,10 @@ impl SmsEditorApp {
                     let loader_flags = 0x1021_0000;
                     let joint_animation =
                         accessory_joint_animation(document, &asset_path).map(Arc::new);
+                    let prepared_triangles = joint_animation
+                        .as_ref()
+                        .and_then(|_| file.prepare_animated_triangles().ok())
+                        .map(Arc::new);
                     let preview_result = joint_animation.as_ref().map_or_else(
                         || file.geometry_preview_with_loader_flags(loader_flags),
                         |animation| {
@@ -1159,6 +1177,7 @@ impl SmsEditorApp {
                         CachedAccessoryModelPreview {
                             file,
                             joint_animation,
+                            prepared_triangles,
                             loader_flags,
                             preview,
                             local_triangles,
@@ -1200,6 +1219,7 @@ impl SmsEditorApp {
                     joint_index,
                     file: accessory.file.clone(),
                     joint_animation: accessory.joint_animation.clone(),
+                    prepared_triangles: accessory.prepared_triangles.clone(),
                     loader_flags: accessory.loader_flags,
                     local_triangles: accessory.local_triangles.clone(),
                     triangle_range: accessory_triangle_start..triangles.len(),
@@ -1267,6 +1287,7 @@ impl SmsEditorApp {
                     .map(|animation| AnimatedModelPreview {
                         file: cached.file,
                         animation,
+                        prepared_triangles: cached.prepared_triangles,
                         loader_flags: cached.loader_flags,
                         instances: cached.instances,
                     })
@@ -1935,6 +1956,62 @@ fn recompute_model_preview_bounds(preview: &mut ModelPreview) {
             preview.camera_bounds_min = bounds_min;
             preview.camera_bounds_max = bounds_max;
         }
+    }
+}
+
+fn expand_model_preview_bounds(
+    preview: &mut ModelPreview,
+    model_index: usize,
+    triangle_ranges: &[std::ops::Range<usize>],
+) {
+    let mut bounds_min = [f32::INFINITY; 3];
+    let mut bounds_max = [f32::NEG_INFINITY; 3];
+    let mut found = false;
+    for range in triangle_ranges {
+        for triangle in preview.triangles[range.clone()].iter().filter(|triangle| {
+            !matches!(
+                triangle.render_layer,
+                PreviewRenderLayer::Sky
+                    | PreviewRenderLayer::MirrorScene
+                    | PreviewRenderLayer::Heatwave
+            )
+        }) {
+            for vertex in triangle.vertices {
+                if !vertex.iter().all(|value| value.is_finite()) {
+                    continue;
+                }
+                found = true;
+                for axis in 0..3 {
+                    bounds_min[axis] = bounds_min[axis].min(vertex[axis]);
+                    bounds_max[axis] = bounds_max[axis].max(vertex[axis]);
+                }
+            }
+        }
+    }
+    if !found {
+        for point in preview
+            .points
+            .iter()
+            .filter(|point| point.model_index == model_index)
+        {
+            if !point.position.iter().all(|value| value.is_finite()) {
+                continue;
+            }
+            found = true;
+            for axis in 0..3 {
+                bounds_min[axis] = bounds_min[axis].min(point.position[axis]);
+                bounds_max[axis] = bounds_max[axis].max(point.position[axis]);
+            }
+        }
+    }
+    if !found {
+        return;
+    }
+
+    for axis in 0..3 {
+        let padding = ((bounds_max[axis] - bounds_min[axis]) * 0.06).max(120.0);
+        preview.bounds_min[axis] = preview.bounds_min[axis].min(bounds_min[axis] - padding);
+        preview.bounds_max[axis] = preview.bounds_max[axis].max(bounds_max[axis] + padding);
     }
 }
 

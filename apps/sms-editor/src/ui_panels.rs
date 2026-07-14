@@ -451,24 +451,6 @@ impl SmsEditorApp {
 
     pub(super) fn outliner_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("Hierarchy");
-        let objects: Vec<(String, String, Option<String>)> = self
-            .document
-            .as_ref()
-            .map(|document| {
-                document
-                    .objects
-                    .iter()
-                    .map(|object| {
-                        (
-                            object.id.clone(),
-                            object.factory_name.clone(),
-                            object.class_name.clone(),
-                        )
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(
@@ -491,21 +473,32 @@ impl SmsEditorApp {
         });
         ui.separator();
 
+        let selected_id = self.selected_object_id.as_deref();
+        let mut clicked_id = None;
         egui::ScrollArea::vertical().show(ui, |ui| {
-            for (id, factory, class_name) in objects {
-                let selected = self.selected_object_id.as_deref() == Some(&id);
-                if ui.selectable_label(selected, factory).clicked() {
-                    self.selected_object_id = Some(id.clone());
-                    self.right_tab = RightTab::Inspector;
+            let Some(document) = &self.document else {
+                return;
+            };
+            for object in &document.objects {
+                let selected = selected_id == Some(object.id.as_str());
+                if ui
+                    .selectable_label(selected, &object.factory_name)
+                    .clicked()
+                {
+                    clicked_id = Some(object.id.clone());
                 }
                 ui.small(format!(
                     "{}  {}",
-                    id,
-                    class_name.unwrap_or_else(|| "Unknown".to_string())
+                    object.id,
+                    object.class_name.as_deref().unwrap_or("Unknown")
                 ));
                 ui.separator();
             }
         });
+        if let Some(id) = clicked_id {
+            self.selected_object_id = Some(id);
+            self.right_tab = RightTab::Inspector;
+        }
     }
 
     pub(super) fn inspector_panel(&mut self, ui: &mut egui::Ui) {
@@ -585,12 +578,12 @@ impl SmsEditorApp {
     pub(super) fn assets_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("Assets");
         if let Some(document) = &self.document {
-            let scene = RenderScene::from_document(document);
+            let scene = self.render_scene.as_ref();
             ui.label(format!(
                 "{} scanned assets  {} models  {} collision",
                 document.assets.len(),
-                scene.model_paths.len(),
-                scene.collision_paths.len()
+                scene.map_or(0, |scene| scene.model_paths.len()),
+                scene.map_or(0, |scene| scene.collision_paths.len())
             ));
             if let Some(preview) = &self.model_preview {
                 ui.label(format!(

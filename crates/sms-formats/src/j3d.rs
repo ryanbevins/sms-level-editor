@@ -1,10 +1,30 @@
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 use crate::binary::{
     be_f32, be_i16, be_u16, be_u32, checked_slice, read_jut_name_table, require_magic,
 };
 use crate::j3d_anim::J3dJointAnimation;
 use crate::{FormatError, PreserveBytes, Result};
+
+mod arc_bytes {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::sync::Arc;
+
+    pub fn serialize<S>(bytes: &Arc<[u8]>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        bytes.as_ref().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Arc<[u8]>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Vec::<u8>::deserialize(deserializer).map(Arc::from)
+    }
+}
 
 mod texture;
 use texture::*;
@@ -114,7 +134,8 @@ pub struct J3dSection {
 pub struct J3dFile {
     header: J3dHeader,
     sections: Vec<J3dSection>,
-    bytes: Vec<u8>,
+    #[serde(with = "arc_bytes")]
+    bytes: Arc<[u8]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -587,6 +608,131 @@ struct PrimitiveVertex {
     tex_coords: [Option<[f32; 2]>; TEX_COORD_COUNT],
 }
 
+#[derive(Debug, Clone)]
+pub struct J3dPreparedAnimatedTriangles {
+    source: PreparedModelSource,
+    packets: Vec<PreparedAnimatedPacket>,
+    source_triangle_count: usize,
+    max_packet_vertex_count: usize,
+}
+
+impl J3dPreparedAnimatedTriangles {
+    pub fn source_triangle_count(&self) -> usize {
+        self.source_triangle_count
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.source_triangle_count == 0
+    }
+
+    fn pose(&self, draw_matrices: &[Option<Mtx34>]) -> Vec<J3dTriangle> {
+        let mut triangles = Vec::with_capacity(self.source_triangle_count);
+        let mut vertices = Vec::with_capacity(self.max_packet_vertex_count);
+        for packet in &self.packets {
+            vertices.clear();
+            vertices.extend(
+                packet
+                    .vertices
+                    .iter()
+                    .copied()
+                    .map(|vertex| vertex.pose(draw_matrices)),
+            );
+            for &[a, b, c] in &packet.triangle_indices {
+                let triangle_count = triangles.len();
+                push_triangle(
+                    &mut triangles,
+                    vertices[a],
+                    vertices[b],
+                    vertices[c],
+                    None,
+                    J3dMaterialRenderState::default(),
+                    None,
+                );
+                if triangles.len() == triangle_count {
+                    continue;
+                }
+
+                let triangle = triangles
+                    .last_mut()
+                    .expect("push_triangle appended one triangle");
+                triangle.shape_index = packet.shape_index;
+                triangle.packet_index = packet.packet_index;
+                if let Some(billboard) = packet.billboard {
+                    let draw_matrix = draw_matrices
+                        .get(billboard.draw_matrix_index as usize)
+                        .copied()
+                        .flatten();
+                    if let Some(draw_matrix) = draw_matrix {
+                        triangle.billboard = billboard_for_triangle(
+                            triangle.vertices,
+                            triangle.normals,
+                            draw_matrix,
+                            billboard.shape_matrix_type,
+                        );
+                    }
+                }
+            }
+        }
+        triangles
+    }
+}
+
+#[derive(Clone)]
+struct PreparedModelSource(Arc<[u8]>);
+
+impl std::fmt::Debug for PreparedModelSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedModelSource")
+            .field("bytes_len", &self.0.len())
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PreparedAnimatedPacket {
+    vertices: Vec<PreparedPrimitiveVertex>,
+    triangle_indices: Vec<[usize; 3]>,
+    shape_index: usize,
+    packet_index: usize,
+    billboard: Option<PreparedBillboard>,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedDisplayList {
+    vertices: Vec<PreparedPrimitiveVertex>,
+    triangle_indices: Vec<[usize; 3]>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PreparedBillboard {
+    draw_matrix_index: u16,
+    shape_matrix_type: u8,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PreparedPrimitiveVertex {
+    vertex: PrimitiveVertex,
+    draw_matrix_index: Option<u16>,
+}
+
+impl PreparedPrimitiveVertex {
+    fn pose(self, draw_matrices: &[Option<Mtx34>]) -> PrimitiveVertex {
+        PrimitiveVertex {
+            position: transform_position_for_draw_matrix(
+                self.vertex.position,
+                self.draw_matrix_index,
+                draw_matrices,
+            ),
+            normal: self.vertex.normal.map(|normal| {
+                transform_normal_for_draw_matrix(normal, self.draw_matrix_index, draw_matrices)
+            }),
+            colors: self.vertex.colors,
+            tex_coords: self.vertex.tex_coords,
+        }
+    }
+}
+
 impl J3dFile {
     pub fn parse(bytes: impl AsRef<[u8]>) -> Result<Self> {
         let bytes = bytes.as_ref();
@@ -650,7 +796,7 @@ impl J3dFile {
                 section_count,
             },
             sections,
-            bytes: bytes.to_vec(),
+            bytes: Arc::from(bytes),
         })
     }
 
@@ -731,6 +877,39 @@ impl J3dFile {
         animation: &J3dJointAnimation,
         elapsed_seconds: f32,
     ) -> Result<Vec<J3dTriangle>> {
+        self.animated_triangles_and_joint_matrices_with_joint_animation(
+            loader_flags,
+            animation,
+            elapsed_seconds,
+        )
+        .map(|(triangles, _)| triangles)
+    }
+
+    /// Samples one animation frame and returns both its posed triangles and the
+    /// joint matrices used to build the corresponding draw matrices.
+    ///
+    /// Callers that also pose joint-attached geometry can use this method to
+    /// avoid evaluating the same joint animation a second time.
+    pub fn animated_triangles_and_joint_matrices_with_joint_animation(
+        &self,
+        loader_flags: u32,
+        animation: &J3dJointAnimation,
+        elapsed_seconds: f32,
+    ) -> Result<(Vec<J3dTriangle>, Vec<J3dMatrix34>)> {
+        let frame = animation.playback_frame(elapsed_seconds);
+        let joint_matrices =
+            self.preview_joint_matrices(loader_flags, Some((animation, frame)), &[])?;
+        let draw_matrices = self.preview_draw_matrices_from_joint_matrices(&joint_matrices)?;
+        let triangles = self.triangles_with_draw_matrices(&draw_matrices)?;
+        Ok((triangles, joint_matrices))
+    }
+
+    /// Decodes the immutable vertex attributes and primitive topology needed
+    /// for repeated joint-animation samples.
+    ///
+    /// The returned data is tied to this parsed model instance and can be
+    /// reused for every animation frame without reparsing SHP1 display lists.
+    pub fn prepare_animated_triangles(&self) -> Result<J3dPreparedAnimatedTriangles> {
         let vertex_preview = self.vertex_preview()?;
         let vtx1 = self
             .section("VTX1")
@@ -750,27 +929,60 @@ impl J3dFile {
                 format: FORMAT,
                 message: "missing SHP1 section".to_string(),
             })?;
-        let frame = animation.playback_frame(elapsed_seconds);
-        let draw_matrices =
-            self.preview_draw_matrices(loader_flags, Some((animation, frame)), &[])?;
-        self.read_shape_triangles(
+        let packets = self.read_prepared_shape_packets(
             shp1.offset as usize,
             &vertex_preview.positions,
             &attr_formats,
             position_format,
             vertex_arrays,
-            &[],
-            &[],
-            &[],
-            &[],
-            &draw_matrices,
-        )
+        )?;
+        let source_triangle_count = packets
+            .iter()
+            .map(|packet| packet.triangle_indices.len())
+            .sum();
+        let max_packet_vertex_count = packets
+            .iter()
+            .map(|packet| packet.vertices.len())
+            .max()
+            .unwrap_or(0);
+        Ok(J3dPreparedAnimatedTriangles {
+            source: PreparedModelSource(Arc::clone(&self.bytes)),
+            packets,
+            source_triangle_count,
+            max_packet_vertex_count,
+        })
     }
 
-    pub fn triangles_with_joint_overrides(
+    /// Samples one animation frame using topology prepared by
+    /// [`Self::prepare_animated_triangles`].
+    pub fn animate_prepared_triangles_with_joint_animation(
         &self,
+        prepared: &J3dPreparedAnimatedTriangles,
         loader_flags: u32,
-        overrides: &[J3dJointTransformOverride],
+        animation: &J3dJointAnimation,
+        elapsed_seconds: f32,
+    ) -> Result<(Vec<J3dTriangle>, Vec<J3dMatrix34>)> {
+        if !self.prepared_animation_source_matches(prepared) {
+            return Err(FormatError::Unsupported {
+                format: FORMAT,
+                message: "prepared animated triangles belong to a different parsed model"
+                    .to_string(),
+            });
+        }
+        let frame = animation.playback_frame(elapsed_seconds);
+        let joint_matrices =
+            self.preview_joint_matrices(loader_flags, Some((animation, frame)), &[])?;
+        let draw_matrices = self.preview_draw_matrices_from_joint_matrices(&joint_matrices)?;
+        Ok((prepared.pose(&draw_matrices), joint_matrices))
+    }
+
+    fn prepared_animation_source_matches(&self, prepared: &J3dPreparedAnimatedTriangles) -> bool {
+        Arc::ptr_eq(&prepared.source.0, &self.bytes)
+    }
+
+    fn triangles_with_draw_matrices(
+        &self,
+        draw_matrices: &[Option<Mtx34>],
     ) -> Result<Vec<J3dTriangle>> {
         let vertex_preview = self.vertex_preview()?;
         let vtx1 = self
@@ -791,7 +1003,6 @@ impl J3dFile {
                 format: FORMAT,
                 message: "missing SHP1 section".to_string(),
             })?;
-        let draw_matrices = self.preview_draw_matrices(loader_flags, None, overrides)?;
         self.read_shape_triangles(
             shp1.offset as usize,
             &vertex_preview.positions,
@@ -802,8 +1013,17 @@ impl J3dFile {
             &[],
             &[],
             &[],
-            &draw_matrices,
+            draw_matrices,
         )
+    }
+
+    pub fn triangles_with_joint_overrides(
+        &self,
+        loader_flags: u32,
+        overrides: &[J3dJointTransformOverride],
+    ) -> Result<Vec<J3dTriangle>> {
+        let draw_matrices = self.preview_draw_matrices(loader_flags, None, overrides)?;
+        self.triangles_with_draw_matrices(&draw_matrices)
     }
 
     pub fn joint_names(&self) -> Result<Vec<String>> {
@@ -1186,6 +1406,92 @@ impl J3dFile {
         Ok(triangles)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn read_prepared_shape_packets(
+        &self,
+        shape_offset: usize,
+        positions: &[[f32; 3]],
+        attr_formats: &[AttributeFormat],
+        position_format: PositionFormat,
+        vertex_arrays: VertexArrays,
+    ) -> Result<Vec<PreparedAnimatedPacket>> {
+        let shape_count = be_u16(&self.bytes, shape_offset + 0x08, FORMAT)? as usize;
+        let shape_init_offset = relative_offset(&self.bytes, shape_offset, 0x0C)?;
+        let index_table_offset = relative_offset(&self.bytes, shape_offset, 0x10)?;
+        let vtx_desc_offset = relative_offset(&self.bytes, shape_offset, 0x18)?;
+        let mtx_table_offset = relative_offset(&self.bytes, shape_offset, 0x1C).ok();
+        let display_list_offset = relative_offset(&self.bytes, shape_offset, 0x20)?;
+        let mtx_init_offset = relative_offset(&self.bytes, shape_offset, 0x24)?;
+        let draw_init_offset = relative_offset(&self.bytes, shape_offset, 0x28)?;
+
+        let mut packets = Vec::new();
+        let mut packet_index = 0usize;
+        for shape_no in 0..shape_count {
+            let index = be_u16(&self.bytes, index_table_offset + shape_no * 2, FORMAT)? as usize;
+            let init_offset = shape_init_offset + index * 0x28;
+            checked_slice(FORMAT, &self.bytes, init_offset, 0x28)?;
+            let shape_mtx_type = checked_slice(FORMAT, &self.bytes, init_offset, 1)?[0];
+            let mtx_group_count = be_u16(&self.bytes, init_offset + 0x02, FORMAT)? as usize;
+            let vtx_desc_index = be_u16(&self.bytes, init_offset + 0x04, FORMAT)? as usize;
+            let mtx_init_index = be_u16(&self.bytes, init_offset + 0x06, FORMAT)? as usize;
+            let draw_init_index = be_u16(&self.bytes, init_offset + 0x08, FORMAT)? as usize;
+            let vtx_descs = self.read_vertex_descs(vtx_desc_offset + vtx_desc_index)?;
+            let mut matrix_palette = Vec::new();
+
+            for group in 0..mtx_group_count {
+                let raw_group_matrices = self.shape_group_draw_matrices(
+                    shape_mtx_type,
+                    mtx_init_offset + (mtx_init_index + group) * 0x08,
+                    mtx_table_offset,
+                )?;
+                let group_matrices =
+                    resolve_shape_matrix_palette(&raw_group_matrices, &mut matrix_palette);
+                let draw_offset = draw_init_offset + (draw_init_index + group) * 0x08;
+                checked_slice(FORMAT, &self.bytes, draw_offset, 0x08)?;
+                let display_list_size = be_u32(&self.bytes, draw_offset, FORMAT)? as usize;
+                let display_list_index = be_u32(&self.bytes, draw_offset + 0x04, FORMAT)? as usize;
+                let display_list = checked_slice(
+                    FORMAT,
+                    &self.bytes,
+                    display_list_offset + display_list_index,
+                    display_list_size,
+                )?;
+                let prepared = decode_prepared_display_list(
+                    display_list,
+                    &self.bytes,
+                    positions,
+                    &vtx_descs,
+                    attr_formats,
+                    position_format,
+                    vertex_arrays,
+                    &group_matrices,
+                )?;
+                let billboard = if matches!(shape_mtx_type, 0x01 | 0x02) {
+                    group_matrices
+                        .first()
+                        .copied()
+                        .filter(|index| *index != 0xFFFF)
+                        .map(|draw_matrix_index| PreparedBillboard {
+                            draw_matrix_index,
+                            shape_matrix_type: shape_mtx_type,
+                        })
+                } else {
+                    None
+                };
+                packets.push(PreparedAnimatedPacket {
+                    vertices: prepared.vertices,
+                    triangle_indices: prepared.triangle_indices,
+                    shape_index: shape_no,
+                    packet_index,
+                    billboard,
+                });
+                packet_index += 1;
+            }
+        }
+
+        Ok(packets)
+    }
+
     fn shape_group_draw_matrices(
         &self,
         shape_mtx_type: u8,
@@ -1225,11 +1531,18 @@ impl J3dFile {
         overrides: &[J3dJointTransformOverride],
     ) -> Result<Vec<Option<Mtx34>>> {
         let joint_matrices = self.preview_joint_matrices(loader_flags, animation, overrides)?;
+        self.preview_draw_matrices_from_joint_matrices(&joint_matrices)
+    }
+
+    fn preview_draw_matrices_from_joint_matrices(
+        &self,
+        joint_matrices: &[Mtx34],
+    ) -> Result<Vec<Option<Mtx34>>> {
         let envelope_matrices = self
-            .preview_envelope_matrices(&joint_matrices)
+            .preview_envelope_matrices(joint_matrices)
             .unwrap_or_default();
         let Some(drw1) = self.section("DRW1") else {
-            return Ok(joint_matrices.into_iter().map(Some).collect());
+            return Ok(joint_matrices.iter().copied().map(Some).collect());
         };
         let base = drw1.offset as usize;
         let matrix_count = be_u16(&self.bytes, base + 0x08, FORMAT)? as usize;
@@ -3807,56 +4120,40 @@ fn resolve_shape_matrix_palette(raw: &[u16], palette: &mut Vec<u16>) -> Vec<u16>
     palette[..raw.len()].to_vec()
 }
 
-fn transform_position_for_shape_matrix(
-    position: [f32; 3],
-    matrix_slot: Option<u16>,
-    group_matrices: &[u16],
-    draw_matrices: &[Option<Mtx34>],
-) -> [f32; 3] {
+fn shape_draw_matrix_index(matrix_slot: Option<u16>, group_matrices: &[u16]) -> Option<u16> {
     let raw_slot = matrix_slot.unwrap_or(0) as usize;
     let slot = if raw_slot.is_multiple_of(3) {
         raw_slot / 3
     } else {
         raw_slot
     };
-    let draw_index = group_matrices
+    group_matrices
         .get(slot)
         .copied()
         .or_else(|| group_matrices.first().copied())
-        .unwrap_or(0xFFFF);
-    if draw_index == 0xFFFF {
-        return position;
-    }
-    draw_matrices
-        .get(draw_index as usize)
+        .filter(|draw_index| *draw_index != 0xFFFF)
+}
+
+fn transform_position_for_draw_matrix(
+    position: [f32; 3],
+    draw_index: Option<u16>,
+    draw_matrices: &[Option<Mtx34>],
+) -> [f32; 3] {
+    draw_index
+        .and_then(|draw_index| draw_matrices.get(draw_index as usize))
         .copied()
         .flatten()
         .map(|matrix| transform_mtx34_point(matrix, position))
         .unwrap_or(position)
 }
 
-fn transform_normal_for_shape_matrix(
+fn transform_normal_for_draw_matrix(
     normal: [f32; 3],
-    matrix_slot: Option<u16>,
-    group_matrices: &[u16],
+    draw_index: Option<u16>,
     draw_matrices: &[Option<Mtx34>],
 ) -> [f32; 3] {
-    let raw_slot = matrix_slot.unwrap_or(0) as usize;
-    let slot = if raw_slot.is_multiple_of(3) {
-        raw_slot / 3
-    } else {
-        raw_slot
-    };
-    let draw_index = group_matrices
-        .get(slot)
-        .copied()
-        .or_else(|| group_matrices.first().copied())
-        .unwrap_or(0xFFFF);
-    if draw_index == 0xFFFF {
-        return normalize_vec3(normal).unwrap_or(normal);
-    }
-    draw_matrices
-        .get(draw_index as usize)
+    draw_index
+        .and_then(|draw_index| draw_matrices.get(draw_index as usize))
         .copied()
         .flatten()
         .and_then(|matrix| transform_mtx34_normal(matrix, normal))
@@ -4175,6 +4472,94 @@ fn decode_display_list(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn decode_prepared_display_list(
+    bytes: &[u8],
+    source_bytes: &[u8],
+    positions: &[[f32; 3]],
+    descs: &[VertexDesc],
+    attr_formats: &[AttributeFormat],
+    position_format: PositionFormat,
+    vertex_arrays: VertexArrays,
+    group_matrices: &[u16],
+) -> Result<PreparedDisplayList> {
+    let mut offset = 0usize;
+    let mut vertices = Vec::new();
+    let mut triangle_indices = Vec::new();
+
+    while offset < bytes.len() {
+        let command = bytes[offset];
+        offset += 1;
+        if command == 0 {
+            break;
+        }
+        if offset + 2 > bytes.len() {
+            return Err(FormatError::InvalidOffset {
+                format: FORMAT,
+                offset,
+                len: bytes.len(),
+            });
+        }
+
+        let vertex_count = u16::from_be_bytes([bytes[offset], bytes[offset + 1]]) as usize;
+        offset += 2;
+        let mut primitive = Vec::with_capacity(vertex_count);
+        for _ in 0..vertex_count {
+            primitive.push(read_prepared_primitive_vertex(
+                bytes,
+                source_bytes,
+                &mut offset,
+                positions,
+                descs,
+                attr_formats,
+                position_format,
+                vertex_arrays,
+                group_matrices,
+            )?);
+        }
+
+        let base = vertices.len();
+        match command {
+            GX_DRAW_TRIANGLES => {
+                for start in (0..primitive.len()).step_by(3) {
+                    if start + 2 < primitive.len() {
+                        triangle_indices.push([base + start, base + start + 1, base + start + 2]);
+                    }
+                }
+            }
+            GX_DRAW_TRIANGLE_STRIP => {
+                for i in 2..primitive.len() {
+                    if i % 2 == 0 {
+                        triangle_indices.push([base + i - 2, base + i - 1, base + i]);
+                    } else {
+                        triangle_indices.push([base + i - 1, base + i - 2, base + i]);
+                    }
+                }
+            }
+            GX_DRAW_TRIANGLE_FAN => {
+                for i in 2..primitive.len() {
+                    triangle_indices.push([base, base + i - 1, base + i]);
+                }
+            }
+            GX_DRAW_QUADS => {
+                for start in (0..primitive.len()).step_by(4) {
+                    if start + 3 < primitive.len() {
+                        triangle_indices.push([base + start, base + start + 1, base + start + 2]);
+                        triangle_indices.push([base + start, base + start + 2, base + start + 3]);
+                    }
+                }
+            }
+            _ => continue,
+        }
+        vertices.append(&mut primitive);
+    }
+
+    Ok(PreparedDisplayList {
+        vertices,
+        triangle_indices,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn read_primitive_vertex(
     bytes: &[u8],
     source_bytes: &[u8],
@@ -4187,6 +4572,32 @@ fn read_primitive_vertex(
     group_matrices: &[u16],
     draw_matrices: &[Option<Mtx34>],
 ) -> Result<PrimitiveVertex> {
+    read_prepared_primitive_vertex(
+        bytes,
+        source_bytes,
+        offset,
+        positions,
+        descs,
+        attr_formats,
+        position_format,
+        vertex_arrays,
+        group_matrices,
+    )
+    .map(|vertex| vertex.pose(draw_matrices))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_prepared_primitive_vertex(
+    bytes: &[u8],
+    source_bytes: &[u8],
+    offset: &mut usize,
+    positions: &[[f32; 3]],
+    descs: &[VertexDesc],
+    attr_formats: &[AttributeFormat],
+    position_format: PositionFormat,
+    vertex_arrays: VertexArrays,
+    group_matrices: &[u16],
+) -> Result<PreparedPrimitiveVertex> {
     let mut position = None;
     let mut matrix_slot = None;
     let mut normal = None;
@@ -4283,16 +4694,14 @@ fn read_primitive_vertex(
         format: FORMAT,
         message: "primitive vertex did not include a valid position".to_string(),
     })?;
-    let position =
-        transform_position_for_shape_matrix(position, matrix_slot, group_matrices, draw_matrices);
-    let normal = normal.map(|normal| {
-        transform_normal_for_shape_matrix(normal, matrix_slot, group_matrices, draw_matrices)
-    });
-    Ok(PrimitiveVertex {
-        position,
-        normal,
-        colors,
-        tex_coords,
+    Ok(PreparedPrimitiveVertex {
+        vertex: PrimitiveVertex {
+            position,
+            normal,
+            colors,
+            tex_coords,
+        },
+        draw_matrix_index: shape_draw_matrix_index(matrix_slot, group_matrices),
     })
 }
 

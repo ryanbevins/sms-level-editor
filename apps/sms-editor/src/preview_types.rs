@@ -185,6 +185,7 @@ pub(super) struct PreviewTexture {
 pub(super) struct CachedObjectModelPreview {
     pub(super) file: J3dFile,
     pub(super) joint_animation: Option<J3dJointAnimation>,
+    pub(super) prepared_triangles: Option<Arc<J3dPreparedAnimatedTriangles>>,
     pub(super) loader_flags: u32,
     pub(super) preview: J3dGeometryPreview,
     pub(super) texture_base: usize,
@@ -197,6 +198,7 @@ pub(super) struct CachedObjectModelPreview {
 pub(super) struct CachedAccessoryModelPreview {
     pub(super) file: Arc<J3dFile>,
     pub(super) joint_animation: Option<Arc<J3dJointAnimation>>,
+    pub(super) prepared_triangles: Option<Arc<J3dPreparedAnimatedTriangles>>,
     pub(super) loader_flags: u32,
     pub(super) preview: J3dGeometryPreview,
     pub(super) local_triangles: Arc<Vec<J3dTriangle>>,
@@ -208,6 +210,7 @@ pub(super) struct CachedAccessoryModelPreview {
 pub(super) struct AnimatedModelPreview {
     pub(super) file: J3dFile,
     pub(super) animation: J3dJointAnimation,
+    pub(super) prepared_triangles: Option<Arc<J3dPreparedAnimatedTriangles>>,
     pub(super) loader_flags: u32,
     pub(super) instances: Vec<AnimatedModelInstance>,
 }
@@ -260,6 +263,7 @@ pub(super) struct AnimatedAccessoryInstance {
     pub(super) joint_index: Option<usize>,
     pub(super) file: Arc<J3dFile>,
     pub(super) joint_animation: Option<Arc<J3dJointAnimation>>,
+    pub(super) prepared_triangles: Option<Arc<J3dPreparedAnimatedTriangles>>,
     pub(super) loader_flags: u32,
     pub(super) local_triangles: Arc<Vec<J3dTriangle>>,
     pub(super) triangle_range: std::ops::Range<usize>,

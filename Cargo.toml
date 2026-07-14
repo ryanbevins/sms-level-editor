@@ -35,3 +35,9 @@ sms-formats = { path = "crates/sms-formats" }
 sms-render = { path = "crates/sms-render" }
 sms-scene = { path = "crates/sms-scene" }
 sms-schema = { path = "crates/sms-schema" }
+
+[profile.release]
+# Optimize the distributable for runtime speed while retaining the baseline
+# x86-64 target needed by older PCs.
+codegen-units = 1
+lto = "fat"

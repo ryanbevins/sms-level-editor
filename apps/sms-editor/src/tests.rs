@@ -76,6 +76,37 @@ fn camera_app() -> SmsEditorApp {
 }
 
 #[test]
+fn viewport_markers_show_only_selection_outside_objects_mode() {
+    let app_objects = vec![
+        SceneObject::new("obj-a", "Coin"),
+        SceneObject::new("obj-b", "Shine"),
+    ];
+    let mut app = SmsEditorApp {
+        document: Some(test_document(app_objects)),
+        selected_object_id: Some("obj-b".to_string()),
+        view_mode: ViewMode::Lit,
+        ..SmsEditorApp::default()
+    };
+
+    let marker_ids = |app: &SmsEditorApp| {
+        app.viewport_marker_objects()
+            .map(|object| object.id.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(marker_ids(&app), ["obj-b".to_string()]);
+
+    app.view_mode = ViewMode::Collision;
+    assert_eq!(marker_ids(&app), ["obj-b".to_string()]);
+
+    app.view_mode = ViewMode::Objects;
+    assert_eq!(marker_ids(&app), ["obj-a".to_string(), "obj-b".to_string()]);
+
+    app.view_mode = ViewMode::Lit;
+    app.selected_object_id = None;
+    assert!(marker_ids(&app).is_empty());
+}
+
+#[test]
 fn nozzle_box_tev_color_matches_runtime_item_type() {
     let mut rocket = SceneObject::new("rocket-box", "NozzleBox");
     rocket.raw_params.insert(
@@ -1432,8 +1463,13 @@ fn updating_object_transform_moves_cached_preview_mesh() {
         ..SmsEditorApp::default()
     };
 
-    assert!(app.update_object_preview_transform("obj-1", old_transform, new_transform));
+    assert!(app
+        .update_object_preview_transform("obj-1", old_transform, new_transform)
+        .is_some());
     let preview = app.model_preview.as_ref().unwrap();
+    let ranges = document_commands::preview_triangle_ranges_for_model(preview, "obj-1");
+    assert_eq!(ranges.len(), 1);
+    assert_eq!(ranges[0], 0..1);
     assert_vec3_close(preview.points[0].position, [51.0, 2.0, -22.0]);
     assert_vec3_close(preview.triangles[0].vertices[0], [51.0, 0.0, -25.0]);
     assert_vec3_close(preview.triangles[0].vertices[1], [50.0, 2.0, -25.0]);
@@ -1450,10 +1486,15 @@ fn dirty_state_tracks_saved_object_content() {
     };
     assert!(!app.is_dirty());
 
-    app.document.as_mut().unwrap().objects[0]
-        .transform
-        .translation[0] = 25.0;
+    app.mutate_document("Moved object", |document| {
+        document.objects[0].transform.translation[0] = 25.0;
+    });
     assert!(app.is_dirty());
+
+    app.mutate_document("Restored object", |document| {
+        document.objects[0].transform.translation[0] = 0.0;
+    });
+    assert!(!app.is_dirty());
 }
 
 #[test]
@@ -1472,9 +1513,14 @@ fn transform_transaction_creates_one_undo_entry() {
     app.update_selected_transform(transform);
     transform.translation[0] = 20.0;
     app.update_selected_transform(transform);
+    assert!(
+        app.document.as_ref().unwrap().changed_files.is_empty(),
+        "transaction deltas must not serialize the full editor overlay"
+    );
     app.commit_undo_transaction("Moved object");
 
     assert_eq!(app.undo_stack.len(), 1);
+    assert_eq!(app.document.as_ref().unwrap().changed_files.len(), 1);
     app.undo();
     assert_eq!(app.selected_object().unwrap().transform.translation[0], 0.0);
 }
