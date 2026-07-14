@@ -693,10 +693,11 @@ fn infer_preview_model_path(
         }
     }
 
-    // TMapObjBase::load and TShimmer::load read their resource identity from
-    // the first placement stream string. Prefer that authored basename over
-    // generic factories such as `Palm`, `Shimmer`, and `ResetFruit`.
-    if object.factory_name.eq_ignore_ascii_case("Palm")
+    // TMapObjBase::load and the resource-selecting actors below read their
+    // resource identity from the first placement stream string. Prefer that
+    // authored basename over generic factory names.
+    if object.factory_name.eq_ignore_ascii_case("MapObjBase")
+        || object.factory_name.eq_ignore_ascii_case("Palm")
         || object.factory_name.eq_ignore_ascii_case("Shimmer")
         || object.factory_name.eq_ignore_ascii_case("ResetFruit")
     {
@@ -1075,6 +1076,23 @@ mod tests {
         assert_eq!(
             infer_preview_model_path(&object, &models).as_deref(),
             Some("stage.szs!/montema/moma_model.bmd")
+        );
+    }
+
+    #[test]
+    fn map_obj_base_uses_the_resource_basename_stored_in_its_placement_stream() {
+        let models = vec![(
+            "stage.szs!/mapobj/stagefixture.bmd".to_string(),
+            "stagefixture".to_string(),
+        )];
+        let mut object = SceneObject::new("generic map object", "MapObjBase");
+        object
+            .raw_params
+            .insert("stream_string_0".to_string(), "StageFixture".to_string());
+
+        assert_eq!(
+            infer_preview_model_path(&object, &models).as_deref(),
+            Some("stage.szs!/mapobj/stagefixture.bmd")
         );
     }
 
