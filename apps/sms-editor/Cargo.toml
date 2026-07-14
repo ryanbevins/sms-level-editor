@@ -17,4 +17,4 @@ sms-schema.workspace = true
 
 [dev-dependencies]
 naga.workspace = true
-pollster = "0.4"
+pollster = "1.0"
