@@ -193,7 +193,8 @@ impl SmsEditorApp {
             self.reset_camera();
         }
         ui.add(egui::Slider::new(&mut self.viewport_zoom, 0.35..=2.5).text("Zoom"));
-        ui.add(egui::Slider::new(&mut self.camera_speed, 0.1..=8.0).text("Speed"));
+        ui.add(egui::Slider::new(&mut self.camera_speed, 0.01..=8.0).text("Speed"))
+            .on_hover_text("Hold right mouse and use the mouse wheel to adjust fly speed");
         if self
             .model_preview
             .as_ref()

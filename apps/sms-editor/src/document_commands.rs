@@ -551,6 +551,7 @@ impl SmsEditorApp {
     }
 
     pub(super) fn frame_selected(&mut self) {
+        self.stop_camera_fly();
         if let Some(object) = self.selected_object() {
             self.renderer.camera_mut().focus = object.transform.translation;
             self.viewport_pan = egui::Vec2::ZERO;
@@ -558,6 +559,7 @@ impl SmsEditorApp {
     }
 
     pub(super) fn reset_camera(&mut self) {
+        self.stop_camera_fly();
         self.viewport_pan = egui::Vec2::ZERO;
         self.viewport_zoom = 1.0;
         if let Some(preview) = &self.model_preview {
@@ -577,6 +579,7 @@ impl SmsEditorApp {
     }
 
     pub(super) fn apply_startup_camera_focus(&mut self) {
+        self.stop_camera_fly();
         if let Some(focus) = self.startup_camera_focus {
             let camera = self.renderer.camera_mut();
             camera.focus = focus;

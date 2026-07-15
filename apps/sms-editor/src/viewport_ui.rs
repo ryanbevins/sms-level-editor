@@ -1,5 +1,12 @@
 use super::*;
 
+const CAMERA_SPEED_MIN: f32 = 0.01;
+const CAMERA_SPEED_MAX: f32 = 8.0;
+const CAMERA_SPEED_SCROLL_SCALE: f32 = 240.0;
+const CAMERA_FLY_ACCELERATION_INTERP_SPEED: f32 = 8.0;
+const CAMERA_FLY_DECELERATION_INTERP_SPEED: f32 = 12.0;
+const CAMERA_FLY_STOP_SPEED: f32 = 0.5;
+
 pub(super) fn outline_segments_from_coverage(
     coverage: &[bool],
     size: [usize; 2],
@@ -155,18 +162,25 @@ impl SmsEditorApp {
         rect: egui::Rect,
         response: &egui::Response,
     ) {
+        let secondary_down = ui.input(|input| input.pointer.secondary_down());
+        let fly_navigation_active = secondary_down
+            && (response.hovered() || response.dragged_by(egui::PointerButton::Secondary));
+
         if response.hovered() {
             let scroll = ui.input(|input| input.smooth_scroll_delta().y);
             if scroll.abs() > f32::EPSILON {
-                let amount = self.renderer.camera().distance * scroll * 0.0015;
-                self.dolly_camera(amount);
+                if fly_navigation_active {
+                    self.camera_speed = camera_speed_after_scroll(self.camera_speed, scroll);
+                } else {
+                    let amount = self.renderer.camera().distance * scroll * 0.0015;
+                    self.dolly_camera(amount);
+                }
                 self.mark_viewport_interaction(ui);
             }
         }
 
         let pointer_delta = ui.input(|input| input.pointer.delta());
         let modifiers = ui.input(|input| input.modifiers);
-        let secondary_down = ui.input(|input| input.pointer.secondary_down());
         let moving_object =
             !modifiers.alt && self.tool == EditorTool::Move && self.selected_object_id.is_some();
         if moving_object && response.drag_started_by(egui::PointerButton::Primary) {
@@ -178,10 +192,7 @@ impl SmsEditorApp {
             self.mark_viewport_interaction(ui);
         }
 
-        if secondary_down
-            && (response.hovered() || response.dragged_by(egui::PointerButton::Secondary))
-            && self.handle_viewport_keyboard_fly(ui)
-        {
+        if self.handle_viewport_keyboard_fly(ui, fly_navigation_active) {
             self.mark_viewport_interaction(ui);
         }
 
@@ -316,9 +327,13 @@ impl SmsEditorApp {
             .map(|(depth, object_id)| (depth, object_id.to_string()))
     }
 
-    pub(super) fn handle_viewport_keyboard_fly(&mut self, ui: &egui::Ui) -> bool {
-        let (dt, forward_key, back_key, left_key, right_key, up_key, down_key, shift, ctrl) = ui
-            .input(|input| {
+    pub(super) fn handle_viewport_keyboard_fly(
+        &mut self,
+        ui: &egui::Ui,
+        navigation_active: bool,
+    ) -> bool {
+        let (dt, forward_key, back_key, left_key, right_key, up_key, down_key, shift) =
+            ui.input(|input| {
                 (
                     input.stable_dt.clamp(1.0 / 240.0, 1.0 / 15.0),
                     input.key_down(egui::Key::W),
@@ -328,47 +343,68 @@ impl SmsEditorApp {
                     input.key_down(egui::Key::E),
                     input.key_down(egui::Key::Q),
                     input.modifiers.shift,
-                    input.modifiers.ctrl,
                 )
             });
         let frame = self.camera_frame();
         let mut move_axis = [0.0, 0.0, 0.0];
-        if forward_key {
+        if navigation_active && forward_key {
             move_axis = vec3_add(move_axis, frame.forward);
         }
-        if back_key {
+        if navigation_active && back_key {
             move_axis = vec3_sub(move_axis, frame.forward);
         }
-        if right_key {
+        if navigation_active && right_key {
             move_axis = vec3_add(move_axis, frame.right);
         }
-        if left_key {
+        if navigation_active && left_key {
             move_axis = vec3_sub(move_axis, frame.right);
         }
-        if up_key {
+        if navigation_active && up_key {
             move_axis = vec3_add(move_axis, [0.0, 1.0, 0.0]);
         }
-        if down_key {
+        if navigation_active && down_key {
             move_axis = vec3_sub(move_axis, [0.0, 1.0, 0.0]);
-        }
-
-        if vec3_dot(move_axis, move_axis) <= 0.0001 {
-            return false;
         }
 
         let mut speed = self.viewport_fly_speed();
         if shift {
             speed *= 4.0;
         }
-        if ctrl {
-            speed *= 0.25;
+        let has_input = vec3_dot(move_axis, move_axis) > 0.0001;
+        let target_velocity = if has_input {
+            vec3_scale(vec3_normalize(move_axis), speed)
+        } else {
+            [0.0; 3]
+        };
+        let interp_speed = if has_input {
+            CAMERA_FLY_ACCELERATION_INTERP_SPEED
+        } else {
+            CAMERA_FLY_DECELERATION_INTERP_SPEED
+        };
+        self.camera_fly_velocity = interpolate_camera_velocity(
+            self.camera_fly_velocity,
+            target_velocity,
+            dt,
+            interp_speed,
+        );
+        if !has_input
+            && vec3_dot(self.camera_fly_velocity, self.camera_fly_velocity)
+                <= CAMERA_FLY_STOP_SPEED * CAMERA_FLY_STOP_SPEED
+        {
+            self.camera_fly_velocity = [0.0; 3];
+            return false;
         }
-        self.translate_camera(vec3_scale(vec3_normalize(move_axis), speed * dt));
+
+        self.translate_camera(vec3_scale(self.camera_fly_velocity, dt));
         true
     }
 
     pub(super) fn viewport_fly_speed(&self) -> f32 {
         (self.renderer.camera().distance * 0.8).clamp(300.0, 80_000.0) * self.camera_speed
+    }
+
+    pub(super) fn stop_camera_fly(&mut self) {
+        self.camera_fly_velocity = [0.0; 3];
     }
 
     pub(super) fn rotate_camera_in_place(&mut self, delta: egui::Vec2) {
@@ -1506,6 +1542,13 @@ impl SmsEditorApp {
             egui::FontId::monospace(12.0),
             egui::Color32::from_rgb(190, 202, 204),
         );
+        painter.text(
+            overlay.min + egui::vec2(14.0, 90.0),
+            egui::Align2::LEFT_TOP,
+            format!("RMB + WASD/QE  wheel speed {:.2}x", self.camera_speed),
+            egui::FontId::monospace(11.0),
+            egui::Color32::from_rgb(160, 176, 179),
+        );
 
         let compass_center = egui::pos2(rect.right() - 70.0, rect.top() + 74.0);
         painter.circle_filled(
@@ -1559,4 +1602,29 @@ impl SmsEditorApp {
             );
         }
     }
+}
+
+pub(super) fn camera_speed_after_scroll(current: f32, scroll_delta: f32) -> f32 {
+    if !current.is_finite() || !scroll_delta.is_finite() {
+        return current.clamp(CAMERA_SPEED_MIN, CAMERA_SPEED_MAX);
+    }
+    (current * 2.0_f32.powf(scroll_delta / CAMERA_SPEED_SCROLL_SCALE))
+        .clamp(CAMERA_SPEED_MIN, CAMERA_SPEED_MAX)
+}
+
+pub(super) fn interpolate_camera_velocity(
+    current: [f32; 3],
+    target: [f32; 3],
+    dt: f32,
+    interp_speed: f32,
+) -> [f32; 3] {
+    if !dt.is_finite() || !interp_speed.is_finite() || dt <= 0.0 || interp_speed <= 0.0 {
+        return current;
+    }
+    let alpha = 1.0 - (-interp_speed * dt).exp();
+    [
+        current[0] + (target[0] - current[0]) * alpha,
+        current[1] + (target[1] - current[1]) * alpha,
+        current[2] + (target[2] - current[2]) * alpha,
+    ]
 }

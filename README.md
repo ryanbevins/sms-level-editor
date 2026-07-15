@@ -60,8 +60,8 @@ still be considered incomplete and experimental.
 - Preview supported BCK skeletal, BTK texture-SRT, BTP texture-pattern, and JPA
   particle animation data
 - Preview supported asset-driven level transformations and effects
-- Navigate with fly, orbit, pan, focus, dolly, and adjustable camera-speed
-  controls
+- Navigate with UE5-style eased fly movement, orbit, pan, focus, dolly, and
+  right-mouse + wheel camera-speed controls
 - Toggle lit, collision, and object views along with grid, collision, object
   bounds, water, goop, and effect visibility
 

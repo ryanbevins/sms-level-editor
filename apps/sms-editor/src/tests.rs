@@ -76,6 +76,35 @@ fn camera_app() -> SmsEditorApp {
 }
 
 #[test]
+fn fly_camera_velocity_interpolates_in_and_out() {
+    let accelerated =
+        viewport_ui::interpolate_camera_velocity([0.0; 3], [1000.0, 0.0, 0.0], 1.0 / 60.0, 8.0);
+    assert!(accelerated[0] > 0.0);
+    assert!(accelerated[0] < 1000.0);
+
+    let accelerated_again =
+        viewport_ui::interpolate_camera_velocity(accelerated, [1000.0, 0.0, 0.0], 1.0 / 60.0, 8.0);
+    assert!(accelerated_again[0] > accelerated[0]);
+    assert!(accelerated_again[0] < 1000.0);
+
+    let decelerated =
+        viewport_ui::interpolate_camera_velocity(accelerated_again, [0.0; 3], 1.0 / 60.0, 12.0);
+    assert!(decelerated[0] > 0.0);
+    assert!(decelerated[0] < accelerated_again[0]);
+}
+
+#[test]
+fn fly_camera_scroll_adjusts_and_clamps_speed() {
+    assert!(viewport_ui::camera_speed_after_scroll(1.0, 120.0) > 1.0);
+    assert!(viewport_ui::camera_speed_after_scroll(1.0, -120.0) < 1.0);
+    assert_eq!(viewport_ui::camera_speed_after_scroll(8.0, 10_000.0), 8.0);
+    assert_eq!(
+        viewport_ui::camera_speed_after_scroll(0.01, -10_000.0),
+        0.01
+    );
+}
+
+#[test]
 fn viewport_markers_show_only_selection_outside_objects_mode() {
     let app_objects = vec![
         SceneObject::new("obj-a", "Coin"),
