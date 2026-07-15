@@ -18,6 +18,7 @@ use super::{
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
 const GX_COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+const WAVE_MASK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 const TEXTURE_SLOT_COUNT: usize = 8;
 const TEV_STAGE_COUNT: usize = 16;
 const TEX_MATRIX_ROW_COUNT: usize = TEXTURE_SLOT_COUNT * 3;
@@ -772,6 +773,10 @@ fn render_layer_uses_efb_copy(layer: PreviewRenderLayer) -> bool {
             | PreviewRenderLayer::IndirectWater
             | PreviewRenderLayer::ParticleDistortion
     )
+}
+
+fn wave_mask_source_layer(layer: PreviewRenderLayer) -> bool {
+    layer == PreviewRenderLayer::Water
 }
 
 #[derive(Clone)]
@@ -1720,6 +1725,7 @@ fn mirror_viewport_frame(mut frame: GpuViewportFrame, plane_y: Option<f32>) -> G
 struct GpuViewportResources {
     pipeline_layout: wgpu::PipelineLayout,
     material_layout: wgpu::BindGroupLayout,
+    wave_mask_pipeline: wgpu::RenderPipeline,
     composite_layout: wgpu::BindGroupLayout,
     composite_pipeline: wgpu::RenderPipeline,
     composite_sampler: wgpu::Sampler,
@@ -1734,6 +1740,8 @@ struct GpuViewportResources {
     material_bind_groups: Vec<wgpu::BindGroup>,
     efb_copy_materials: BTreeSet<usize>,
     mirror_surface_materials: BTreeSet<usize>,
+    wave_mask_materials: BTreeSet<usize>,
+    has_wave_mask_sources: bool,
     animated_materials: BTreeSet<usize>,
     batches: Vec<GpuBatchResources>,
     draw_order: Vec<GpuDrawCommand>,
@@ -1794,6 +1802,7 @@ impl GpuViewportResources {
             bind_group_layouts: &[Some(&camera_layout), Some(&material_layout)],
             immediate_size: 0,
         });
+        let wave_mask_pipeline = create_wave_mask_pipeline(device, &pipeline_layout);
         let composite_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("sms viewport composite layout"),
             entries: &[
@@ -1867,6 +1876,7 @@ impl GpuViewportResources {
         Self {
             pipeline_layout,
             material_layout,
+            wave_mask_pipeline,
             composite_layout,
             composite_pipeline,
             composite_sampler,
@@ -1881,6 +1891,8 @@ impl GpuViewportResources {
             material_bind_groups: Vec::new(),
             efb_copy_materials: BTreeSet::new(),
             mirror_surface_materials: BTreeSet::new(),
+            wave_mask_materials: BTreeSet::new(),
+            has_wave_mask_sources: false,
             animated_materials: BTreeSet::new(),
             batches: Vec::new(),
             draw_order: Vec::new(),
@@ -1923,6 +1935,17 @@ impl GpuViewportResources {
             .filter(|batch| batch.render_layer == PreviewRenderLayer::MirrorSurface)
             .map(|batch| batch.material_index)
             .collect();
+        self.wave_mask_materials = scene
+            .batches
+            .iter()
+            .filter(|batch| batch.render_layer == PreviewRenderLayer::WaveFoam)
+            .map(|batch| batch.material_index)
+            .collect();
+        self.has_wave_mask_sources = !self.wave_mask_materials.is_empty()
+            && scene
+                .batches
+                .iter()
+                .any(|batch| wave_mask_source_layer(batch.render_layer));
         self.animated_materials = scene
             .materials
             .iter()
@@ -2017,7 +2040,9 @@ impl GpuViewportResources {
     fn rebuild_target_material_bind_groups(&mut self, device: &wgpu::Device, scene: &GpuSceneData) {
         let target_materials = self
             .efb_copy_materials
-            .union(&self.mirror_surface_materials)
+            .iter()
+            .chain(&self.mirror_surface_materials)
+            .chain(&self.wave_mask_materials)
             .copied()
             .collect::<Vec<_>>();
         for index in target_materials {
@@ -2048,6 +2073,7 @@ impl GpuViewportResources {
         }];
         let uses_efb_copy = self.efb_copy_materials.contains(&index);
         let mirror_surface = self.mirror_surface_materials.contains(&index);
+        let wave_mask = self.has_wave_mask_sources && self.wave_mask_materials.contains(&index);
         for slot in 0..TEXTURE_SLOT_COUNT {
             let texture_index = material.texture_indices[slot].min(self.textures.len() - 1);
             let texture = &self.textures[texture_index];
@@ -2060,6 +2086,11 @@ impl GpuViewportResources {
                 self.viewport_target
                     .as_ref()
                     .map(|target| &target.efb_copy_view)
+                    .unwrap_or(&texture.view)
+            } else if wave_mask && slot == 1 {
+                self.viewport_target
+                    .as_ref()
+                    .map(|target| &target.wave_mask_view)
                     .unwrap_or(&texture.view)
             } else {
                 &texture.view
@@ -2249,6 +2280,48 @@ impl GpuViewportResources {
             }
         }
 
+        if self.has_wave_mask_sources {
+            let mut mask_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("sms GX visible-water wave mask"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target.wave_mask_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &target.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            mask_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            mask_pass.set_pipeline(&self.wave_mask_pipeline);
+            for command in &self.draw_order {
+                let Some(batch) = self.batches.get(command.batch_index) else {
+                    continue;
+                };
+                if !wave_mask_source_layer(batch.render_layer) {
+                    continue;
+                }
+                let Some(material) = self.material_bind_groups.get(batch.material_index) else {
+                    continue;
+                };
+                mask_pass.set_bind_group(1, material, &[]);
+                mask_pass.set_vertex_buffer(0, batch.vertex_buffer.slice(..));
+                mask_pass.draw(0..batch.vertex_count, 0..1);
+            }
+        }
+
         if !has_post_snapshot {
             return;
         }
@@ -2341,6 +2414,8 @@ struct GpuViewportTarget {
     color_view: wgpu::TextureView,
     efb_copy: wgpu::Texture,
     efb_copy_view: wgpu::TextureView,
+    _wave_mask: wgpu::Texture,
+    wave_mask_view: wgpu::TextureView,
     _mirror: wgpu::Texture,
     mirror_view: wgpu::TextureView,
     _mirror_depth: wgpu::Texture,
@@ -2386,6 +2461,17 @@ impl GpuViewportTarget {
             view_formats: &[],
         });
         let efb_copy_view = efb_copy.create_view(&wgpu::TextureViewDescriptor::default());
+        let wave_mask = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("sms GX visible-water wave mask"),
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: WAVE_MASK_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let wave_mask_view = wave_mask.create_view(&wgpu::TextureViewDescriptor::default());
         // Sunshine uses a fixed 256x256 RGB5A3 mirror buffer. The editor keeps
         // the same mirror camera and projection but renders at the viewport's
         // physical pixel size so the preview remains sharp on modern displays.
@@ -2443,6 +2529,8 @@ impl GpuViewportTarget {
             color_view,
             efb_copy,
             efb_copy_view,
+            _wave_mask: wave_mask,
+            wave_mask_view,
             _mirror: mirror,
             mirror_view,
             _mirror_depth: mirror_depth,
@@ -2675,6 +2763,55 @@ fn composite_depth_stencil_state() -> wgpu::DepthStencilState {
         stencil: Default::default(),
         bias: Default::default(),
     }
+}
+
+fn create_wave_mask_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("sms viewport visible-water mask shader"),
+        source: wgpu::ShaderSource::Wgsl(J3D_SHADER.into()),
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("sms viewport visible-water mask pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[GpuVertex::layout()],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_wave_mask"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: WAVE_MASK_FORMAT,
+                blend: None,
+                write_mask: wgpu::ColorWrites::RED,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Cw,
+            cull_mode: None,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::LessEqual),
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
 }
 
 fn create_pipeline(

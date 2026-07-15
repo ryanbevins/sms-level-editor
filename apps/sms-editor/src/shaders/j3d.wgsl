@@ -950,6 +950,17 @@ fn apply_fog(color: vec4<f32>, depth: f32) -> vec4<f32> {
 
 @fragment
 fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
+    if (input.coordinate_space == 7u) {
+        // TMapObjWave relies on the rendered sea and terrain depth to confine
+        // its moving grid to visible ocean. The editor's camera-centered proxy
+        // can otherwise lift individual crests through shallow beach geometry,
+        // so sample the visible-water coverage pass before evaluating TEV.
+        let mask_size = vec2<f32>(textureDimensions(texture1));
+        let mask_uv = input.position.xy / mask_size;
+        if (textureSampleLevel(texture1, sampler1, mask_uv, 0.0).r < 0.5) {
+            discard;
+        }
+    }
     if (input.coordinate_space == 4u) {
         let mask = sample_texture(input.coordinate_space, 0u, input.uv0, input.uv0);
         let target_size = vec2<f32>(textureDimensions(texture1));
@@ -1058,4 +1069,9 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
         discard;
     }
     return clamp(apply_fog(output, input.view_depth), vec4<f32>(0.0), vec4<f32>(1.0));
+}
+
+@fragment
+fn fs_wave_mask(_input: VertexOut) -> @location(0) vec4<f32> {
+    return vec4<f32>(1.0);
 }

@@ -743,6 +743,16 @@ fn runtime_wave_uses_camera_centered_displacement_and_retail_scroll_rates() {
     assert!(J3D_SHADER.contains("0.6 * seconds"));
     assert!(J3D_SHADER.contains("0.9 * seconds"));
     assert!(J3D_SHADER.contains("seconds * 0.045"));
+    assert!(J3D_SHADER.contains("textureSampleLevel(texture1, sampler1, mask_uv, 0.0)"));
+    assert!(J3D_SHADER.contains("fn fs_wave_mask"));
+}
+
+#[test]
+fn runtime_wave_mask_uses_authored_water_geometry() {
+    assert!(wave_mask_source_layer(PreviewRenderLayer::Water));
+    assert!(!wave_mask_source_layer(PreviewRenderLayer::Main));
+    assert!(!wave_mask_source_layer(PreviewRenderLayer::IndirectWater));
+    assert!(!wave_mask_source_layer(PreviewRenderLayer::WaveFoam));
 }
 
 #[test]
