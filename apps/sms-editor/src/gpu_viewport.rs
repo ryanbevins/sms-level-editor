@@ -284,7 +284,8 @@ impl CallbackTrait for GpuViewportCallback {
         let materials_changed =
             resources.write_materials(device, queue, &shared.scene, &shared.dirty_materials);
         shared.dirty_materials.clear();
-        let frame_state = GpuOffscreenFrameState::new(shared.frame, shared.scene.mirror_plane_y);
+        let frame_state =
+            GpuOffscreenFrameState::new(shared.frame, shared.scene.mirror_plane_y, target_size);
         let invalidation = GpuOffscreenInvalidation {
             target: target_changed,
             scene: scene_rebuilt,
@@ -494,10 +495,15 @@ impl GpuSceneData {
         }
 
         for batch in &batches {
-            if batch.pipeline_key.pass == GpuBatchPass::Heatwave {
+            if render_layer_uses_efb_copy(batch.render_layer) {
                 if let Some(material) = materials.get_mut(batch.material_index) {
                     material.uniform.texture_sizes[1] =
                         texture_size_uniform(SMS_SCREEN_TEXTURE_SIZE);
+                }
+            }
+            if batch.render_layer == PreviewRenderLayer::WaveFoam {
+                if let Some(material) = materials.get_mut(batch.material_index) {
+                    material.runtime_wave = true;
                 }
             }
         }
@@ -741,6 +747,8 @@ fn render_layer_id(layer: PreviewRenderLayer) -> u8 {
         PreviewRenderLayer::Heatwave => 7,
         PreviewRenderLayer::Particle => 8,
         PreviewRenderLayer::ParticleDistortion => 9,
+        PreviewRenderLayer::IndirectWater => 10,
+        PreviewRenderLayer::WaveFoam => 11,
     }
 }
 
@@ -751,8 +759,19 @@ fn coordinate_space_for_render_layer(layer: PreviewRenderLayer) -> u32 {
         PreviewRenderLayer::Particle => 3,
         PreviewRenderLayer::ParticleDistortion => 4,
         PreviewRenderLayer::MirrorSurface => 5,
+        PreviewRenderLayer::IndirectWater => 6,
+        PreviewRenderLayer::WaveFoam => 7,
         _ => 0,
     }
+}
+
+fn render_layer_uses_efb_copy(layer: PreviewRenderLayer) -> bool {
+    matches!(
+        layer,
+        PreviewRenderLayer::Heatwave
+            | PreviewRenderLayer::IndirectWater
+            | PreviewRenderLayer::ParticleDistortion
+    )
 }
 
 #[derive(Clone)]
@@ -764,6 +783,8 @@ struct GpuTextureData {
     mag_filter: wgpu::FilterMode,
     min_filter: wgpu::FilterMode,
     mipmap_filter: wgpu::MipmapFilterMode,
+    lod_min_clamp: f32,
+    lod_max_clamp: f32,
 }
 
 #[derive(Clone)]
@@ -785,11 +806,17 @@ impl GpuTextureData {
             mag_filter: wgpu::FilterMode::Nearest,
             min_filter: wgpu::FilterMode::Nearest,
             mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            lod_min_clamp: 0.0,
+            lod_max_clamp: 0.0,
         }
     }
 
     fn from_preview_texture(texture: &PreviewTexture) -> Self {
-        let max_levels = texture.mipmap_count.max(1) as usize;
+        let max_levels = if texture.mipmap_enabled {
+            texture.mipmap_count.max(1) as usize
+        } else {
+            1
+        };
         let mut mips = texture
             .mips
             .iter()
@@ -799,6 +826,16 @@ impl GpuTextureData {
         if mips.is_empty() {
             mips.push(gpu_mip_from_color_image(&texture.image));
         }
+        let mip_filter_enabled = texture.mipmap_enabled
+            && texture.mipmap_count > 1
+            && matches!(texture.min_filter, 2..=5);
+        let last_mip = mips.len().saturating_sub(1) as f32;
+        let (lod_min_clamp, lod_max_clamp) = if mip_filter_enabled {
+            let min = texture.min_lod.clamp(0.0, last_mip);
+            (min, texture.max_lod.clamp(min, last_mip))
+        } else {
+            (0.0, 0.0)
+        };
         Self {
             mips,
             format: gpu_texture_format_for_j3d(texture.format),
@@ -806,7 +843,9 @@ impl GpuTextureData {
             address_mode_v: sampler_address_mode(texture.wrap_t),
             mag_filter: sampler_mag_filter(texture.mag_filter),
             min_filter: sampler_min_filter(texture.min_filter),
-            mipmap_filter: sampler_mipmap_filter(texture.min_filter, texture.mipmap_count),
+            mipmap_filter: sampler_mipmap_filter(texture.min_filter, mip_filter_enabled),
+            lod_min_clamp,
+            lod_max_clamp,
         }
     }
 }
@@ -852,12 +891,12 @@ fn sampler_min_filter(filter: u8) -> wgpu::FilterMode {
     }
 }
 
-fn sampler_mipmap_filter(filter: u8, mipmap_count: u8) -> wgpu::MipmapFilterMode {
-    if mipmap_count <= 1 {
+fn sampler_mipmap_filter(filter: u8, mipmap_enabled: bool) -> wgpu::MipmapFilterMode {
+    if !mipmap_enabled {
         return wgpu::MipmapFilterMode::Nearest;
     }
     match filter {
-        2..=5 => wgpu::MipmapFilterMode::Linear,
+        4 | 5 => wgpu::MipmapFilterMode::Linear,
         _ => wgpu::MipmapFilterMode::Nearest,
     }
 }
@@ -869,6 +908,7 @@ struct GpuMaterialData {
     state: GpuMaterialState,
     tex_matrices: [Option<J3dTexMatrix>; TEXTURE_SLOT_COUNT],
     animations: Vec<GpuMaterialAnimation>,
+    runtime_wave: bool,
 }
 
 #[derive(Clone)]
@@ -908,6 +948,7 @@ impl GpuMaterialData {
                     texture.image.size[0] as f32,
                     texture.image.size[1] as f32,
                 ]);
+                uniform.texture_lod_parameters[slot] = texture_lod_uniform(texture);
             }
         }
         Self {
@@ -916,6 +957,7 @@ impl GpuMaterialData {
             state: GpuMaterialState::from_j3d(material),
             tex_matrices: material.tex_matrices,
             animations,
+            runtime_wave: false,
         }
     }
 
@@ -981,11 +1023,15 @@ impl GpuMaterialData {
             },
             tex_matrices: [None; TEXTURE_SLOT_COUNT],
             animations: Vec::new(),
+            runtime_wave: false,
         }
     }
 
     fn uniform_at_time(&self, elapsed_seconds: f32) -> GpuMaterialUniform {
         let mut uniform = self.uniform;
+        if self.runtime_wave {
+            uniform.runtime_parameters[0] = elapsed_seconds;
+        }
         for animated in &self.animations {
             let Some(binding) = animated.animation.bindings.get(animated.binding_index) else {
                 continue;
@@ -1030,9 +1076,16 @@ impl GpuMaterialState {
     fn pipeline_key(self, render_layer: PreviewRenderLayer) -> GpuPipelineKey {
         let pass = if matches!(
             render_layer,
-            PreviewRenderLayer::Heatwave | PreviewRenderLayer::ParticleDistortion
+            PreviewRenderLayer::Heatwave | PreviewRenderLayer::IndirectWater
         ) {
             GpuBatchPass::Heatwave
+        } else if render_layer == PreviewRenderLayer::WaveFoam {
+            GpuBatchPass::WaveFoam
+        } else if matches!(
+            render_layer,
+            PreviewRenderLayer::Particle | PreviewRenderLayer::ParticleDistortion
+        ) {
+            GpuBatchPass::Particle
         } else if render_layer == PreviewRenderLayer::Sky {
             GpuBatchPass::Sky
         } else if self
@@ -1116,6 +1169,7 @@ struct GpuMaterialUniform {
     alpha_compare: [u32; 4],
     alpha_refs: [f32; 4],
     texture_sizes: [[f32; 4]; TEXTURE_SLOT_COUNT],
+    texture_lod_parameters: [[f32; 4]; TEXTURE_SLOT_COUNT],
     material_colors: [[f32; 4]; 2],
     ambient_colors: [[f32; 4]; 2],
     tev_colors: [[f32; 4]; 4],
@@ -1140,6 +1194,7 @@ struct GpuMaterialUniform {
     fog_meta: [u32; 4],
     fog_params: [f32; 4],
     fog_color: [f32; 4],
+    runtime_parameters: [f32; 4],
 }
 
 impl GpuMaterialUniform {
@@ -1346,6 +1401,29 @@ fn texture_size_uniform(size: [f32; 2]) -> [f32; 4] {
     [width, height, 1.0 / width, 1.0 / height]
 }
 
+fn texture_lod_uniform(texture: &PreviewTexture) -> [f32; 4] {
+    let flags = u32::from(texture.mipmap_enabled)
+        | (u32::from(texture.do_edge_lod) << 1)
+        | (u32::from(texture.bias_clamp) << 2)
+        | (u32::from(texture.max_anisotropy) << 8);
+    [
+        gx_lod_bias(texture.lod_bias),
+        texture.min_lod,
+        texture.max_lod,
+        flags as f32,
+    ]
+}
+
+fn gx_lod_bias(lod_bias: f32) -> f32 {
+    if !lod_bias.is_finite() {
+        return 0.0;
+    }
+    // GXInitTexObjLOD clamps the float and stores it in a signed 8-bit BP
+    // field with five fractional bits. The float-to-integer conversion
+    // truncates toward zero.
+    (lod_bias.clamp(-4.0, 3.99) * 32.0).trunc() / 32.0
+}
+
 fn tex_matrix_slot(matrix: u8) -> Option<usize> {
     if matrix < 30 || matrix == 60 {
         return None;
@@ -1434,6 +1512,15 @@ enum GpuBatchPass {
     AlphaTest,
     Translucent,
     Heatwave,
+    WaveFoam,
+    Particle,
+}
+
+fn gpu_batch_pass_is_post_snapshot(pass: GpuBatchPass) -> bool {
+    matches!(
+        pass,
+        GpuBatchPass::Heatwave | GpuBatchPass::WaveFoam | GpuBatchPass::Particle
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1533,6 +1620,7 @@ struct GpuCameraUniform {
     light_color: [f32; 4],
     ambient_color: [f32; 4],
     lighting_meta: [f32; 4],
+    render_target_size: [f32; 4],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1542,10 +1630,17 @@ struct GpuOffscreenFrameState {
 }
 
 impl GpuOffscreenFrameState {
-    fn new(frame: GpuViewportFrame, mirror_plane_y: Option<f32>) -> Self {
+    fn new(
+        frame: GpuViewportFrame,
+        mirror_plane_y: Option<f32>,
+        render_target_size: [u32; 2],
+    ) -> Self {
         Self {
-            camera: GpuCameraUniform::from(frame),
-            mirror_camera: GpuCameraUniform::from(mirror_viewport_frame(frame, mirror_plane_y)),
+            camera: GpuCameraUniform::from_frame(frame, render_target_size),
+            mirror_camera: GpuCameraUniform::from_frame(
+                mirror_viewport_frame(frame, mirror_plane_y),
+                render_target_size,
+            ),
         }
     }
 }
@@ -1572,10 +1667,12 @@ fn offscreen_render_required(
         || invalidation.time_animation
 }
 
-impl From<GpuViewportFrame> for GpuCameraUniform {
-    fn from(frame: GpuViewportFrame) -> Self {
+impl GpuCameraUniform {
+    fn from_frame(frame: GpuViewportFrame, render_target_size: [u32; 2]) -> Self {
         let half_width = (frame.viewport_size[0] * 0.5).max(1.0);
         let half_height = (frame.viewport_size[1] * 0.5).max(1.0);
+        let render_width = render_target_size[0].max(1) as f32;
+        let render_height = render_target_size[1].max(1) as f32;
         Self {
             camera_position: vec4(frame.camera_position, 0.0),
             right: vec4(frame.right, 0.0),
@@ -1592,6 +1689,12 @@ impl From<GpuViewportFrame> for GpuCameraUniform {
             light_color: frame.light_color,
             ambient_color: frame.ambient_color.unwrap_or([1.0; 4]),
             lighting_meta: [f32::from(frame.ambient_color.is_some()), 0.0, 0.0, 0.0],
+            render_target_size: [
+                render_width,
+                render_height,
+                1.0 / render_width,
+                1.0 / render_height,
+            ],
         }
     }
 }
@@ -1629,7 +1732,7 @@ struct GpuViewportResources {
     textures: Vec<GpuTextureResource>,
     material_buffers: Vec<wgpu::Buffer>,
     material_bind_groups: Vec<wgpu::BindGroup>,
-    heatwave_materials: BTreeSet<usize>,
+    efb_copy_materials: BTreeSet<usize>,
     mirror_surface_materials: BTreeSet<usize>,
     animated_materials: BTreeSet<usize>,
     batches: Vec<GpuBatchResources>,
@@ -1645,7 +1748,7 @@ impl GpuViewportResources {
             label: Some("sms viewport camera layout"),
             entries: &[0, 1].map(|binding| wgpu::BindGroupLayoutEntry {
                 binding,
-                visibility: wgpu::ShaderStages::VERTEX,
+                visibility: camera_binding_visibility(binding),
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
@@ -1776,7 +1879,7 @@ impl GpuViewportResources {
             textures: Vec::new(),
             material_buffers: Vec::new(),
             material_bind_groups: Vec::new(),
-            heatwave_materials: BTreeSet::new(),
+            efb_copy_materials: BTreeSet::new(),
             mirror_surface_materials: BTreeSet::new(),
             animated_materials: BTreeSet::new(),
             batches: Vec::new(),
@@ -1808,10 +1911,10 @@ impl GpuViewportResources {
             .collect();
         self.material_buffers.clear();
         self.material_bind_groups.clear();
-        self.heatwave_materials = scene
+        self.efb_copy_materials = scene
             .batches
             .iter()
-            .filter(|batch| batch.pipeline_key.pass == GpuBatchPass::Heatwave)
+            .filter(|batch| render_layer_uses_efb_copy(batch.render_layer))
             .map(|batch| batch.material_index)
             .collect();
         self.mirror_surface_materials = scene
@@ -1824,7 +1927,9 @@ impl GpuViewportResources {
             .materials
             .iter()
             .enumerate()
-            .filter_map(|(index, material)| (!material.animations.is_empty()).then_some(index))
+            .filter_map(|(index, material)| {
+                (!material.animations.is_empty() || material.runtime_wave).then_some(index)
+            })
             .collect();
         for (index, material) in scene.materials.iter().enumerate() {
             let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1900,7 +2005,7 @@ impl GpuViewportResources {
             queue.write_buffer(buffer, 0, bytemuck::bytes_of(&material.uniform));
             let bind_group = self.create_material_bind_group(device, index, material, buffer);
             self.material_bind_groups[index] = bind_group;
-            if material.animations.is_empty() {
+            if material.animations.is_empty() && !material.runtime_wave {
                 self.animated_materials.remove(&index);
             } else {
                 self.animated_materials.insert(index);
@@ -1911,7 +2016,7 @@ impl GpuViewportResources {
 
     fn rebuild_target_material_bind_groups(&mut self, device: &wgpu::Device, scene: &GpuSceneData) {
         let target_materials = self
-            .heatwave_materials
+            .efb_copy_materials
             .union(&self.mirror_surface_materials)
             .copied()
             .collect::<Vec<_>>();
@@ -1941,7 +2046,7 @@ impl GpuViewportResources {
             binding: 0,
             resource: buffer.as_entire_binding(),
         }];
-        let heatwave = self.heatwave_materials.contains(&index);
+        let uses_efb_copy = self.efb_copy_materials.contains(&index);
         let mirror_surface = self.mirror_surface_materials.contains(&index);
         for slot in 0..TEXTURE_SLOT_COUNT {
             let texture_index = material.texture_indices[slot].min(self.textures.len() - 1);
@@ -1951,7 +2056,7 @@ impl GpuViewportResources {
                     .as_ref()
                     .map(|target| &target.mirror_view)
                     .unwrap_or(&texture.view)
-            } else if heatwave && slot == 1 {
+            } else if uses_efb_copy && slot == 1 {
                 self.viewport_target
                     .as_ref()
                     .map(|target| &target.efb_copy_view)
@@ -2001,15 +2106,22 @@ impl GpuViewportResources {
 
     fn write_frame(&mut self, queue: &wgpu::Queue, frame: GpuViewportFrame, scene: &GpuSceneData) {
         let mirror_frame = mirror_viewport_frame(frame, scene.mirror_plane_y);
+        let render_target_size = self
+            .viewport_target
+            .as_ref()
+            .map_or([1, 1], |target| target.size);
         queue.write_buffer(
             &self.camera_buffer,
             0,
-            bytemuck::bytes_of(&GpuCameraUniform::from(frame)),
+            bytemuck::bytes_of(&GpuCameraUniform::from_frame(frame, render_target_size)),
         );
         queue.write_buffer(
             &self.mirror_camera_buffer,
             0,
-            bytemuck::bytes_of(&GpuCameraUniform::from(mirror_frame)),
+            bytemuck::bytes_of(&GpuCameraUniform::from_frame(
+                mirror_frame,
+                render_target_size,
+            )),
         );
         for index in self.animated_materials.iter().copied() {
             let Some(material) = scene.materials.get(index) else {
@@ -2075,11 +2187,16 @@ impl GpuViewportResources {
                 mirror_pass.draw(0..batch.vertex_count, 0..1);
             }
         }
-        let has_heatwave = self
+        let has_post_snapshot = self
             .draw_order
             .iter()
             .filter_map(|command| self.batches.get(command.batch_index))
-            .any(|batch| batch.pipeline_key.pass == GpuBatchPass::Heatwave);
+            .any(|batch| gpu_batch_pass_is_post_snapshot(batch.pipeline_key.pass));
+        let needs_efb_copy = self
+            .draw_order
+            .iter()
+            .filter_map(|command| self.batches.get(command.batch_index))
+            .any(|batch| render_layer_uses_efb_copy(batch.render_layer));
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("sms GX viewport scene render"),
@@ -2097,7 +2214,7 @@ impl GpuViewportResources {
                     view: &target.depth_view,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.0),
-                        store: if has_heatwave {
+                        store: if has_post_snapshot {
                             wgpu::StoreOp::Store
                         } else {
                             wgpu::StoreOp::Discard
@@ -2114,7 +2231,7 @@ impl GpuViewportResources {
                 let Some(batch) = self.batches.get(command.batch_index) else {
                     continue;
                 };
-                if batch.pipeline_key.pass == GpuBatchPass::Heatwave
+                if gpu_batch_pass_is_post_snapshot(batch.pipeline_key.pass)
                     || batch.render_layer == PreviewRenderLayer::MirrorScene
                 {
                     continue;
@@ -2132,28 +2249,30 @@ impl GpuViewportResources {
             }
         }
 
-        if !has_heatwave {
+        if !has_post_snapshot {
             return;
         }
 
-        encoder.copy_texture_to_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &target.color,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyTextureInfo {
-                texture: &target.efb_copy,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            target.extent(),
-        );
+        if needs_efb_copy {
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &target.color,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &target.efb_copy,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                target.extent(),
+            );
+        }
 
         let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("sms GX shimmer render"),
+            label: Some("sms GX post-snapshot render"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: &target.color_view,
                 resolve_target: None,
@@ -2180,7 +2299,7 @@ impl GpuViewportResources {
             let Some(batch) = self.batches.get(command.batch_index) else {
                 continue;
             };
-            if batch.pipeline_key.pass != GpuBatchPass::Heatwave {
+            if !gpu_batch_pass_is_post_snapshot(batch.pipeline_key.pass) {
                 continue;
             }
             let Some(pipeline) = self.pipelines.get(&batch.pipeline_key) else {
@@ -2203,6 +2322,16 @@ impl GpuViewportResources {
         render_pass.set_pipeline(&self.composite_pipeline);
         render_pass.set_bind_group(0, &target.composite_bind_group, &[]);
         render_pass.draw(0..3, 0..1);
+    }
+}
+
+fn camera_binding_visibility(binding: u32) -> wgpu::ShaderStages {
+    if binding == 0 {
+        // Fragment sampling uses the physical target size to reproduce
+        // Sunshine's fixed-EFB mip selection.
+        wgpu::ShaderStages::VERTEX_FRAGMENT
+    } else {
+        wgpu::ShaderStages::VERTEX
     }
 }
 
@@ -2386,8 +2515,8 @@ impl GpuTextureResource {
             mag_filter: data.mag_filter,
             min_filter: data.min_filter,
             mipmap_filter: data.mipmap_filter,
-            lod_min_clamp: 0.0,
-            lod_max_clamp: data.mips.len().saturating_sub(1) as f32,
+            lod_min_clamp: data.lod_min_clamp,
+            lod_max_clamp: data.lod_max_clamp,
             ..Default::default()
         });
         Self {
@@ -2457,12 +2586,16 @@ fn sorted_gpu_draw_order_from_info(
     let mut translucent = Vec::<(usize, usize, usize)>::new();
     let mut sky = Vec::<(usize, usize, usize)>::new();
     let mut heatwave = Vec::<(usize, usize, usize)>::new();
+    let mut wave_foam = Vec::<(usize, usize, usize)>::new();
+    let mut particles = Vec::<(usize, usize, usize)>::new();
     for batch in batches {
         let entry = (batch.material_index, batch.packet_index, batch.batch_index);
         match batch.pass {
             GpuBatchPass::Sky => sky.push(entry),
             GpuBatchPass::Translucent => translucent.push(entry),
             GpuBatchPass::Heatwave => heatwave.push(entry),
+            GpuBatchPass::WaveFoam => wave_foam.push(entry),
+            GpuBatchPass::Particle => particles.push(entry),
             GpuBatchPass::Opaque | GpuBatchPass::AlphaTest => solid.push(entry),
         }
     }
@@ -2470,10 +2603,14 @@ fn sorted_gpu_draw_order_from_info(
     solid.sort_unstable();
     translucent.sort_unstable();
     heatwave.sort_unstable();
+    wave_foam.sort_unstable();
+    particles.sort_unstable();
     sky.into_iter()
         .chain(solid)
         .chain(translucent)
         .chain(heatwave)
+        .chain(wave_foam)
+        .chain(particles)
         .map(|(_, _, batch_index)| GpuDrawCommand { batch_index })
         .collect()
 }

@@ -926,7 +926,10 @@ impl SmsEditorApp {
         for triangle in preview.triangles.iter().filter(|triangle| {
             !matches!(
                 triangle.render_layer,
-                PreviewRenderLayer::Sky | PreviewRenderLayer::MirrorScene
+                PreviewRenderLayer::Sky
+                    | PreviewRenderLayer::MirrorScene
+                    | PreviewRenderLayer::WaveFoam
+                    | PreviewRenderLayer::IndirectWater
             ) && !preview_triangle_is_translucent(preview, triangle)
         }) {
             if let Some(projected) = self.project_preview_triangle(rect, size, triangle) {
@@ -942,7 +945,10 @@ impl SmsEditorApp {
             .filter(|triangle| {
                 !matches!(
                     triangle.render_layer,
-                    PreviewRenderLayer::Sky | PreviewRenderLayer::MirrorScene
+                    PreviewRenderLayer::Sky
+                        | PreviewRenderLayer::MirrorScene
+                        | PreviewRenderLayer::WaveFoam
+                        | PreviewRenderLayer::IndirectWater
                 ) && preview_triangle_is_translucent(preview, triangle)
             })
             .filter_map(|triangle| self.project_preview_triangle(rect, size, triangle))

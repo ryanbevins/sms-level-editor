@@ -10,6 +10,8 @@ use sms_formats::{
     J3dTevOrder, J3dTexGen, SMS_MAP_MODEL_LOAD_FLAGS,
 };
 
+const TEST_RENDER_TARGET_SIZE: [u32; 2] = [640, 448];
+
 #[test]
 fn material_uniform_is_uniform_buffer_aligned() {
     assert_eq!(std::mem::size_of::<GpuMaterialUniform>() % 16, 0);
@@ -25,6 +27,13 @@ fn j3d_shader_parses_and_validates() {
     )
     .validate(&module)
     .expect("J3D WGSL validates");
+}
+
+#[test]
+fn camera_uniform_is_visible_to_fragment_lod_sampling() {
+    assert!(camera_binding_visibility(0).contains(wgpu::ShaderStages::VERTEX));
+    assert!(camera_binding_visibility(0).contains(wgpu::ShaderStages::FRAGMENT));
+    assert_eq!(camera_binding_visibility(1), wgpu::ShaderStages::VERTEX);
 }
 
 #[test]
@@ -54,7 +63,8 @@ fn sky_pass_cannot_occlude_distant_level_geometry() {
 
 #[test]
 fn offscreen_cache_reuses_an_unchanged_static_frame() {
-    let state = GpuOffscreenFrameState::new(GpuViewportFrame::default(), None);
+    let state =
+        GpuOffscreenFrameState::new(GpuViewportFrame::default(), None, TEST_RENDER_TARGET_SIZE);
 
     assert!(offscreen_render_required(
         None,
@@ -71,13 +81,13 @@ fn offscreen_cache_reuses_an_unchanged_static_frame() {
 #[test]
 fn offscreen_cache_tracks_camera_lighting_and_mirror_projection_state() {
     let frame = GpuViewportFrame::default();
-    let state = GpuOffscreenFrameState::new(frame, None);
+    let state = GpuOffscreenFrameState::new(frame, None, TEST_RENDER_TARGET_SIZE);
 
     let mut moved_camera = frame;
     moved_camera.camera_position[0] = 25.0;
     assert!(offscreen_render_required(
         Some(state),
-        GpuOffscreenFrameState::new(moved_camera, None),
+        GpuOffscreenFrameState::new(moved_camera, None, TEST_RENDER_TARGET_SIZE),
         GpuOffscreenInvalidation::default()
     ));
 
@@ -85,20 +95,21 @@ fn offscreen_cache_tracks_camera_lighting_and_mirror_projection_state() {
     changed_light.light_color[1] = 0.25;
     assert!(offscreen_render_required(
         Some(state),
-        GpuOffscreenFrameState::new(changed_light, None),
+        GpuOffscreenFrameState::new(changed_light, None, TEST_RENDER_TARGET_SIZE),
         GpuOffscreenInvalidation::default()
     ));
 
     assert!(offscreen_render_required(
         Some(state),
-        GpuOffscreenFrameState::new(frame, Some(48.0)),
+        GpuOffscreenFrameState::new(frame, Some(48.0), TEST_RENDER_TARGET_SIZE),
         GpuOffscreenInvalidation::default()
     ));
 }
 
 #[test]
 fn offscreen_cache_invalidates_for_scene_resource_and_animation_changes() {
-    let state = GpuOffscreenFrameState::new(GpuViewportFrame::default(), None);
+    let state =
+        GpuOffscreenFrameState::new(GpuViewportFrame::default(), None, TEST_RENDER_TARGET_SIZE);
     let invalidations = [
         GpuOffscreenInvalidation {
             target: true,
@@ -130,10 +141,10 @@ fn offscreen_cache_invalidates_for_scene_resource_and_animation_changes() {
 #[test]
 fn offscreen_cache_ignores_time_for_static_materials() {
     let frame = GpuViewportFrame::default();
-    let state = GpuOffscreenFrameState::new(frame, None);
+    let state = GpuOffscreenFrameState::new(frame, None, TEST_RENDER_TARGET_SIZE);
     let mut later = frame;
     later.animation_seconds = 120.0;
-    let later_state = GpuOffscreenFrameState::new(later, None);
+    let later_state = GpuOffscreenFrameState::new(later, None, TEST_RENDER_TARGET_SIZE);
 
     assert_eq!(state, later_state);
     assert!(!offscreen_render_required(
@@ -571,6 +582,14 @@ fn render_layers_select_their_runtime_coordinate_space() {
         0
     );
     assert_eq!(
+        coordinate_space_for_render_layer(PreviewRenderLayer::WaveFoam),
+        7
+    );
+    assert_eq!(
+        coordinate_space_for_render_layer(PreviewRenderLayer::IndirectWater),
+        6
+    );
+    assert_eq!(
         coordinate_space_for_render_layer(PreviewRenderLayer::MirrorSurface),
         5
     );
@@ -630,6 +649,49 @@ fn heatwave_materials_render_after_the_efb_snapshot_boundary() {
 }
 
 #[test]
+fn sea_indirect_materials_render_after_the_efb_snapshot_boundary() {
+    assert_eq!(
+        GpuMaterialState::from_j3d(&test_material(4))
+            .pipeline_key(PreviewRenderLayer::IndirectWater)
+            .pass,
+        GpuBatchPass::Heatwave
+    );
+}
+
+#[test]
+fn wave_and_particles_follow_the_indirect_water_phase() {
+    let material = GpuMaterialState::from_j3d(&test_material(4));
+
+    assert_eq!(
+        material.pipeline_key(PreviewRenderLayer::WaveFoam).pass,
+        GpuBatchPass::WaveFoam
+    );
+    assert_eq!(
+        material.pipeline_key(PreviewRenderLayer::Particle).pass,
+        GpuBatchPass::Particle
+    );
+    assert_eq!(
+        material
+            .pipeline_key(PreviewRenderLayer::ParticleDistortion)
+            .pass,
+        GpuBatchPass::Particle
+    );
+}
+
+#[test]
+fn only_authored_screen_effect_layers_use_the_efb_copy() {
+    assert!(render_layer_uses_efb_copy(PreviewRenderLayer::Heatwave));
+    assert!(render_layer_uses_efb_copy(
+        PreviewRenderLayer::IndirectWater
+    ));
+    assert!(render_layer_uses_efb_copy(
+        PreviewRenderLayer::ParticleDistortion
+    ));
+    assert!(!render_layer_uses_efb_copy(PreviewRenderLayer::WaveFoam));
+    assert!(!render_layer_uses_efb_copy(PreviewRenderLayer::Particle));
+}
+
+#[test]
 fn heatwave_offsets_use_sunshines_half_resolution_screen_texture() {
     let mut preview = geometry_update_preview();
     preview.triangles[0].render_layer = PreviewRenderLayer::Heatwave;
@@ -644,6 +706,144 @@ fn heatwave_offsets_use_sunshines_half_resolution_screen_texture() {
         scene.materials[batch.material_index].uniform.texture_sizes[1],
         [320.0, 224.0, 1.0 / 320.0, 1.0 / 224.0]
     );
+}
+
+#[test]
+fn sea_indirect_offsets_use_sunshines_half_resolution_screen_texture() {
+    let mut preview = geometry_update_preview();
+    preview.triangles[0].render_layer = PreviewRenderLayer::IndirectWater;
+    let scene = GpuSceneData::from_preview(&preview);
+    let batch = scene
+        .batches
+        .iter()
+        .find(|batch| batch.render_layer == PreviewRenderLayer::IndirectWater)
+        .expect("SeaIndirect batch");
+
+    assert_eq!(batch.pipeline_key.pass, GpuBatchPass::Heatwave);
+    assert_eq!(
+        scene.materials[batch.material_index].uniform.texture_sizes[1],
+        [320.0, 224.0, 1.0 / 320.0, 1.0 / 224.0]
+    );
+}
+
+#[test]
+fn sea_indirect_uses_the_live_screen_projection() {
+    assert!(J3D_SHADER
+        .contains("(input.coordinate_space == 2u || input.coordinate_space == 6u) && index == 1u"));
+    assert!(
+        J3D_SHADER.contains("return input.position.xy / vec2<f32>(textureDimensions(texture1));")
+    );
+}
+
+#[test]
+fn runtime_wave_uses_camera_centered_displacement_and_retail_scroll_rates() {
+    assert!(J3D_SHADER.contains("input.coordinate_space == 7u"));
+    assert!(J3D_SHADER.contains("world_position.x += camera.camera_position.x"));
+    assert!(J3D_SHADER.contains("world_position.z += camera.camera_position.z"));
+    assert!(J3D_SHADER.contains("0.6 * seconds"));
+    assert!(J3D_SHADER.contains("0.9 * seconds"));
+    assert!(J3D_SHADER.contains("seconds * 0.045"));
+}
+
+#[test]
+fn runtime_wave_batch_updates_its_animation_clock() {
+    assert_eq!(
+        GpuMaterialState::from_j3d(&test_material(4))
+            .pipeline_key(PreviewRenderLayer::WaveFoam)
+            .pass,
+        GpuBatchPass::WaveFoam
+    );
+
+    let mut preview = geometry_update_preview();
+    preview.triangles[0].render_layer = PreviewRenderLayer::WaveFoam;
+    let scene = GpuSceneData::from_preview(&preview);
+    let batch = scene
+        .batches
+        .iter()
+        .find(|batch| batch.render_layer == PreviewRenderLayer::WaveFoam)
+        .expect("runtime wave batch");
+    let material = &scene.materials[batch.material_index];
+
+    assert!(material.runtime_wave);
+    assert_eq!(material.uniform_at_time(2.5).runtime_parameters[0], 2.5);
+}
+
+fn lod_preview_texture() -> PreviewTexture {
+    let mip = |size| egui::ColorImage::filled([size, size], egui::Color32::WHITE);
+    PreviewTexture {
+        image: mip(8),
+        mips: vec![mip(8), mip(4), mip(2)],
+        format: 0,
+        wrap_s: 1,
+        wrap_t: 1,
+        min_filter: 5,
+        mag_filter: 1,
+        mipmap_enabled: true,
+        do_edge_lod: false,
+        bias_clamp: false,
+        max_anisotropy: 0,
+        min_lod: 1.0,
+        max_lod: 4.0,
+        lod_bias: 2.0,
+        mipmap_count: 3,
+        has_alpha: true,
+        has_translucent_alpha: true,
+    }
+}
+
+#[test]
+fn gpu_sampler_preserves_authored_lod_range_and_gx_mip_filter() {
+    let texture = lod_preview_texture();
+    let data = GpuTextureData::from_preview_texture(&texture);
+
+    assert_eq!(data.mips.len(), 3);
+    assert_eq!(data.lod_min_clamp, 1.0);
+    assert_eq!(data.lod_max_clamp, 2.0);
+    assert_eq!(data.mipmap_filter, wgpu::MipmapFilterMode::Linear);
+    assert_eq!(
+        sampler_mipmap_filter(3, true),
+        wgpu::MipmapFilterMode::Nearest
+    );
+    assert_eq!(
+        sampler_mipmap_filter(4, true),
+        wgpu::MipmapFilterMode::Linear
+    );
+}
+
+#[test]
+fn disabled_mipmaps_upload_and_sample_only_the_base_level() {
+    let mut texture = lod_preview_texture();
+    texture.mipmap_enabled = false;
+    let data = GpuTextureData::from_preview_texture(&texture);
+
+    assert_eq!(data.mips.len(), 1);
+    assert_eq!(data.lod_min_clamp, 0.0);
+    assert_eq!(data.lod_max_clamp, 0.0);
+}
+
+#[test]
+fn material_uniform_carries_texture_lod_bias_and_header_flags() {
+    let mut texture = lod_preview_texture();
+    texture.do_edge_lod = true;
+    texture.bias_clamp = true;
+    texture.max_anisotropy = 2;
+
+    assert_eq!(texture_lod_uniform(&texture), [2.0, 1.0, 4.0, 519.0]);
+    assert_eq!(gx_lod_bias(0.8), 0.78125);
+    assert_eq!(gx_lod_bias(2.14), 2.125);
+    assert_eq!(gx_lod_bias(-0.5), -0.5);
+}
+
+#[test]
+fn gx_lod_derivatives_use_the_physical_target_and_authored_bias() {
+    let uniform = GpuCameraUniform::from_frame(GpuViewportFrame::default(), [1280, 896]);
+
+    assert_eq!(uniform.render_target_size[0..2], [1280.0, 896.0]);
+    assert!(J3D_SHADER.contains("camera.render_target_size.x / 640.0"));
+    assert!(J3D_SHADER.contains("camera.render_target_size.y / 448.0"));
+    assert!(J3D_SHADER.contains("exp2(material.texture_lod_parameters[slot].x)"));
+    assert!(J3D_SHADER.contains("sample_texture_level_zero"));
+    assert!(J3D_SHADER.contains("let lod_uv = select(uv, original_uv, use_original_lod);"));
 }
 
 #[test]
@@ -755,6 +955,24 @@ fn packet_sort_matches_j3d_material_buffers_without_camera_resorting() {
             material_index: 3,
             packet_index: 3,
         },
+        GpuDrawBatchInfo {
+            batch_index: 6,
+            pass: GpuBatchPass::Particle,
+            material_index: 1,
+            packet_index: 1,
+        },
+        GpuDrawBatchInfo {
+            batch_index: 5,
+            pass: GpuBatchPass::WaveFoam,
+            material_index: 1,
+            packet_index: 1,
+        },
+        GpuDrawBatchInfo {
+            batch_index: 4,
+            pass: GpuBatchPass::Heatwave,
+            material_index: 1,
+            packet_index: 1,
+        },
     ];
     let order = sorted_gpu_draw_order_from_info(batches);
     assert_eq!(
@@ -764,6 +982,9 @@ fn packet_sort_matches_j3d_material_buffers_without_camera_resorting() {
             GpuDrawCommand { batch_index: 0 },
             GpuDrawCommand { batch_index: 3 },
             GpuDrawCommand { batch_index: 2 },
+            GpuDrawCommand { batch_index: 4 },
+            GpuDrawCommand { batch_index: 5 },
+            GpuDrawCommand { batch_index: 6 },
         ]
     );
 }

@@ -493,6 +493,37 @@ fn intensity_alpha_textures_store_alpha_before_intensity() {
 }
 
 #[test]
+fn timg_preview_preserves_authored_gx_lod_state() {
+    let mut bytes = vec![0u8; 0x20 + 3 * 32];
+    bytes[0] = GX_TF_I4;
+    bytes[2..4].copy_from_slice(&8u16.to_be_bytes());
+    bytes[4..6].copy_from_slice(&8u16.to_be_bytes());
+    bytes[0x10] = 1;
+    bytes[0x11] = 1;
+    bytes[0x12] = 1;
+    bytes[0x13] = 2;
+    bytes[0x14] = 5;
+    bytes[0x15] = 1;
+    bytes[0x16] = (-8i8) as u8;
+    bytes[0x17] = 16;
+    bytes[0x18] = 3;
+    bytes[0x1A..0x1C].copy_from_slice(&(-50i16).to_be_bytes());
+    bytes[0x1C..0x20].copy_from_slice(&0x20u32.to_be_bytes());
+
+    let texture = decode_bti_texture(bytes).expect("synthetic TIMG");
+
+    assert!(texture.mipmap_enabled);
+    assert!(texture.do_edge_lod);
+    assert!(texture.bias_clamp);
+    assert_eq!(texture.max_anisotropy, 2);
+    assert_eq!(texture.min_lod, -1.0);
+    assert_eq!(texture.max_lod, 2.0);
+    assert_eq!(texture.lod_bias, -0.5);
+    assert_eq!(texture.mipmap_count, 3);
+    assert_eq!(texture.mips.len(), 3);
+}
+
+#[test]
 fn softimage_matrix_path_keeps_scale_out_of_child_rotation() {
     let transforms = [
         JointPreviewTransform {

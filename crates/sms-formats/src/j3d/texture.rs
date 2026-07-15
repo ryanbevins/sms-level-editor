@@ -8,9 +8,16 @@ pub(super) fn decode_timg(bytes: &[u8], header_offset: usize) -> Result<J3dTextu
     let height = be_u16(bytes, header_offset + 0x04, FORMAT)?;
     let wrap_s = checked_slice(FORMAT, bytes, header_offset + 0x06, 1)?[0];
     let wrap_t = checked_slice(FORMAT, bytes, header_offset + 0x07, 1)?[0];
+    let mipmap_enabled = checked_slice(FORMAT, bytes, header_offset + 0x10, 1)?[0] != 0;
+    let do_edge_lod = checked_slice(FORMAT, bytes, header_offset + 0x11, 1)?[0] != 0;
+    let bias_clamp = checked_slice(FORMAT, bytes, header_offset + 0x12, 1)?[0] != 0;
+    let max_anisotropy = checked_slice(FORMAT, bytes, header_offset + 0x13, 1)?[0];
     let min_filter = checked_slice(FORMAT, bytes, header_offset + 0x14, 1)?[0];
     let mag_filter = checked_slice(FORMAT, bytes, header_offset + 0x15, 1)?[0];
+    let min_lod = checked_slice(FORMAT, bytes, header_offset + 0x16, 1)?[0] as i8 as f32 / 8.0;
+    let max_lod = checked_slice(FORMAT, bytes, header_offset + 0x17, 1)?[0] as i8 as f32 / 8.0;
     let mipmap_count = checked_slice(FORMAT, bytes, header_offset + 0x18, 1)?[0];
+    let lod_bias = be_i16(bytes, header_offset + 0x1A, FORMAT)? as f32 / 100.0;
     if width == 0 || height == 0 {
         return Err(FormatError::Unsupported {
             format: FORMAT,
@@ -74,6 +81,13 @@ pub(super) fn decode_timg(bytes: &[u8], header_offset: usize) -> Result<J3dTextu
         wrap_t,
         min_filter,
         mag_filter,
+        mipmap_enabled,
+        do_edge_lod,
+        bias_clamp,
+        max_anisotropy,
+        min_lod,
+        max_lod,
+        lod_bias,
         mipmap_count,
         rgba,
         mips,

@@ -408,9 +408,31 @@ pub struct J3dTexturePreview {
     pub wrap_t: u8,
     pub min_filter: u8,
     pub mag_filter: u8,
+    #[serde(default = "default_texture_mipmap_enabled")]
+    pub mipmap_enabled: bool,
+    #[serde(default)]
+    pub do_edge_lod: bool,
+    #[serde(default)]
+    pub bias_clamp: bool,
+    #[serde(default)]
+    pub max_anisotropy: u8,
+    #[serde(default)]
+    pub min_lod: f32,
+    #[serde(default = "default_texture_max_lod")]
+    pub max_lod: f32,
+    #[serde(default)]
+    pub lod_bias: f32,
     pub mipmap_count: u8,
     pub rgba: Vec<u8>,
     pub mips: Vec<J3dTextureMipPreview>,
+}
+
+fn default_texture_mipmap_enabled() -> bool {
+    true
+}
+
+fn default_texture_max_lod() -> f32 {
+    10.0
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2170,6 +2192,13 @@ impl J3dFile {
                     wrap_t: 0,
                     min_filter: 1,
                     mag_filter: 1,
+                    mipmap_enabled: false,
+                    do_edge_lod: false,
+                    bias_clamp: false,
+                    max_anisotropy: 0,
+                    min_lod: 0.0,
+                    max_lod: 0.0,
+                    lod_bias: 0.0,
                     mipmap_count: 1,
                     rgba: vec![255, 255, 255, 255],
                     mips: vec![J3dTextureMipPreview {

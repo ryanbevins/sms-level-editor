@@ -284,6 +284,13 @@ pub(super) fn replace_pollution_mask_texture_aliases(
         texture.rgba.clear();
         texture.rgba.extend_from_slice(rgba);
         texture.mips.clear();
+        texture.mipmap_enabled = false;
+        texture.do_edge_lod = false;
+        texture.bias_clamp = false;
+        texture.max_anisotropy = 0;
+        texture.min_lod = 0.0;
+        texture.max_lod = 0.0;
+        texture.lod_bias = 0.0;
         texture.mipmap_count = 1;
     }
 }
@@ -372,6 +379,13 @@ pub(super) fn push_j3d_preview_textures(
                 wrap_t: texture.wrap_t,
                 min_filter: texture.min_filter,
                 mag_filter: texture.mag_filter,
+                mipmap_enabled: texture.mipmap_enabled,
+                do_edge_lod: texture.do_edge_lod,
+                bias_clamp: texture.bias_clamp,
+                max_anisotropy: texture.max_anisotropy,
+                min_lod: texture.min_lod,
+                max_lod: texture.max_lod,
+                lod_bias: texture.lod_bias,
                 mipmap_count: texture.mipmap_count,
                 has_alpha,
                 has_translucent_alpha,
@@ -386,6 +400,13 @@ pub(super) fn push_j3d_preview_textures(
                 wrap_t: texture.wrap_t,
                 min_filter: texture.min_filter,
                 mag_filter: texture.mag_filter,
+                mipmap_enabled: texture.mipmap_enabled,
+                do_edge_lod: texture.do_edge_lod,
+                bias_clamp: texture.bias_clamp,
+                max_anisotropy: texture.max_anisotropy,
+                min_lod: texture.min_lod,
+                max_lod: texture.max_lod,
+                lod_bias: texture.lod_bias,
                 mipmap_count: texture.mipmap_count,
                 has_alpha: false,
                 has_translucent_alpha: false,

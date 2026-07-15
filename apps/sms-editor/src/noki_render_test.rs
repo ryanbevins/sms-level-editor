@@ -64,6 +64,149 @@ fn mamma0_ocean_water_survives_enemy_preview_catalog() {
 
 #[test]
 #[ignore = "requires an extracted retail base root"]
+fn dolpic0_includes_animated_sea_indirect_screen_copy() {
+    let base_root = env::var_os(BASE_ROOT_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| panic!("set {BASE_ROOT_ENV} to the extracted game's data directory"));
+    let decomp_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let registry = SchemaGenerator::new(decomp_root)
+        .generate()
+        .expect("generate decomp-derived object metadata");
+    let document = StageDocument::open(&base_root, "dolpic0")
+        .expect("open dolpic0")
+        .with_registry(registry);
+    let sea_indirect_asset = document
+        .assets
+        .iter()
+        .find(|asset| {
+            asset
+                .path
+                .to_string_lossy()
+                .replace('\\', "/")
+                .to_ascii_lowercase()
+                .ends_with("/map/map/seaindirect.bmd")
+        })
+        .expect("Dolpic SeaIndirect model");
+    let sea_indirect_bytes =
+        read_stage_asset_bytes(&sea_indirect_asset.path).expect("read Dolpic SeaIndirect model");
+    let sea_indirect_file =
+        J3dFile::parse(&sea_indirect_bytes).expect("parse Dolpic SeaIndirect model");
+    assert_eq!(
+        sea_indirect_file
+            .texture_previews()
+            .expect("SeaIndirect textures")[1]
+            .name
+            .to_ascii_lowercase(),
+        "indirectdummy"
+    );
+    let sea_asset = document
+        .assets
+        .iter()
+        .find(|asset| {
+            asset
+                .path
+                .to_string_lossy()
+                .replace('\\', "/")
+                .to_ascii_lowercase()
+                .ends_with("/map/map/sea.bmd")
+        })
+        .expect("Dolpic sea model");
+    let sea_bytes = read_stage_asset_bytes(&sea_asset.path).expect("read Dolpic sea model");
+    let sea_textures = J3dFile::parse(&sea_bytes)
+        .expect("parse Dolpic sea model")
+        .texture_previews()
+        .expect("Dolpic sea textures");
+    assert!(sea_textures.iter().all(|texture| texture.mipmap_enabled));
+    assert_eq!(
+        sea_textures
+            .iter()
+            .map(|texture| texture.lod_bias)
+            .collect::<Vec<_>>(),
+        vec![2.0, 0.8, 0.0, -0.5, 0.0, 2.14, 0.4, 1.27]
+    );
+    let preview = SmsEditorApp::build_model_preview(
+        &document,
+        PreviewVisibility {
+            environment: true,
+            goop: true,
+            effects: false,
+        },
+    )
+    .expect("build Dolpic preview");
+
+    let material_indices = preview
+        .triangles
+        .iter()
+        .filter(|triangle| triangle.render_layer == PreviewRenderLayer::IndirectWater)
+        .filter_map(|triangle| triangle.material_index)
+        .collect::<BTreeSet<_>>();
+    assert!(!material_indices.is_empty(), "SeaIndirect mesh is missing");
+
+    for material_index in material_indices {
+        let material = &preview.materials[material_index];
+        assert!(material.indirect.enabled);
+        assert_eq!(material.indirect.stage_count, 1);
+        material.texture_indices[1]
+            .and_then(|texture_index| preview.textures.get(texture_index))
+            .expect("SeaIndirect screen-copy texture slot");
+        assert!(preview.material_animation_bindings[material_index]
+            .iter()
+            .any(
+                |binding| preview.texture_srt_animations[binding.animation_index]
+                    .bindings
+                    .get(binding.binding_index)
+                    .is_some_and(|binding| binding.texture_matrix_index == 0)
+            ));
+    }
+
+    let wave_triangles = preview
+        .triangles
+        .iter()
+        .filter(|triangle| triangle.render_layer == PreviewRenderLayer::WaveFoam)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        wave_triangles.len(),
+        1_300,
+        "Dolpic TMapObjWave close-range grid"
+    );
+    let wave_material_index = wave_triangles[0]
+        .material_index
+        .expect("runtime wave material");
+    let wave_material = &preview.materials[wave_material_index];
+    assert_eq!(wave_material.name, "_runtime_wave");
+    assert_eq!(wave_material.tev_stages.len(), 2);
+    assert_eq!(wave_material.blend_mode.src_factor, 4);
+    assert_eq!(wave_material.blend_mode.dst_factor, 2);
+    let wave_texture = wave_material.texture_indices[0]
+        .and_then(|texture_index| preview.textures.get(texture_index))
+        .expect("decoded Dolpic wave.bti texture");
+    assert!(wave_texture.mipmap_enabled);
+    assert_eq!(wave_texture.min_lod, 0.0);
+    assert_eq!(wave_texture.max_lod, 4.0);
+    assert_eq!(wave_texture.lod_bias, 0.0);
+    assert_eq!(wave_texture.mips.len(), 5);
+
+    gpu_viewport::render_preview_offscreen(
+        &preview,
+        gpu_viewport::GpuViewportFrame {
+            camera_position: [0.0, 10_000.0, -20_000.0],
+            right: [1.0, 0.0, 0.0],
+            up: [0.0, 1.0, 0.0],
+            forward: [0.0, 0.0, 1.0],
+            focal: 240.0,
+            viewport_size: [320.0, 224.0],
+            viewport_pan: [0.0; 2],
+            near: 8.0,
+            animation_seconds: 0.0,
+            ..Default::default()
+        },
+        [320, 224],
+    )
+    .expect("render Dolpic WGPU framebuffer");
+}
+
+#[test]
+#[ignore = "requires an extracted retail base root"]
 fn bianco_water_pollution_model_follows_map_static_placement() {
     let base_root = env::var_os(BASE_ROOT_ENV)
         .map(PathBuf::from)

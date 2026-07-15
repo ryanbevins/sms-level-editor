@@ -885,6 +885,23 @@ impl SmsEditorApp {
 
         let world_triangle_end = triangles.len();
         if visibility.environment {
+            let wave = build_procedural_wave_preview(
+                document,
+                loaded_models + 1,
+                next_packet_index,
+                &mut textures,
+                &mut materials,
+            );
+            if wave.triangle_count != 0 {
+                loaded_models += 1;
+                source_vertices += wave.source_vertices;
+                source_triangles += wave.triangle_count;
+                source_textures += 1;
+                triangles.extend(wave.triangles);
+                next_packet_index += 1;
+                material_animation_bindings.resize_with(materials.len(), Vec::new);
+            }
+
             let grass =
                 build_procedural_grass_preview(document, loaded_models + 1, next_packet_index);
             if grass.group_count != 0 {
@@ -1539,6 +1556,9 @@ use preview_grass::*;
 
 mod preview_wires;
 use preview_wires::*;
+
+mod preview_waves;
+use preview_waves::*;
 
 mod npc_accessories;
 use npc_accessories::*;
@@ -2242,6 +2262,9 @@ fn is_default_preview_model_path(
     if path_is_sky_model_path(&path) {
         return true;
     }
+    if path_is_sea_indirect_model_path(&path) {
+        return show_environment_meshes;
+    }
     if path_is_indirect_water_model_path(&path) {
         return false;
     }
@@ -2281,6 +2304,8 @@ fn preview_render_layer_for_model_path(path: &str) -> PreviewRenderLayer {
     let path = path.to_ascii_lowercase();
     if path_is_shimmer_model_path(&path) {
         PreviewRenderLayer::Heatwave
+    } else if path_is_sea_indirect_model_path(&path) {
+        PreviewRenderLayer::IndirectWater
     } else if path_is_water_reflection_model_path(&path) {
         PreviewRenderLayer::MirrorScene
     } else if path_is_mirror_surface_model_path(&path) {
@@ -2477,6 +2502,13 @@ fn mirror_surface_model_slot(stage_id: &str, path: &str) -> Option<usize> {
 fn path_is_indirect_water_model_path(path: &str) -> bool {
     let path = path.to_ascii_lowercase();
     path.contains("seaindirect") || path.contains("puddle_ind")
+}
+
+fn path_is_sea_indirect_model_path(path: &str) -> bool {
+    let path = path.replace('\\', "/").to_ascii_lowercase();
+    path.rsplit('/')
+        .next()
+        .is_some_and(|name| matches!(name, "seaindirect.bmd" | "seaindirect.bdl"))
 }
 
 fn path_is_goop_model_path(path: &str) -> bool {
@@ -2765,6 +2797,8 @@ fn apply_layer_preview_tint(
         }
         PreviewRenderLayer::Sky
         | PreviewRenderLayer::Main
+        | PreviewRenderLayer::WaveFoam
+        | PreviewRenderLayer::IndirectWater
         | PreviewRenderLayer::MirrorScene
         | PreviewRenderLayer::Shadow
         | PreviewRenderLayer::Heatwave

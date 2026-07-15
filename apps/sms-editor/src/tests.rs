@@ -232,6 +232,13 @@ fn dummy_texture_names_resolve_shared_material_tables() {
         wrap_t: 0,
         min_filter: 1,
         mag_filter: 1,
+        mipmap_enabled: false,
+        do_edge_lod: false,
+        bias_clamp: false,
+        max_anisotropy: 0,
+        min_lod: 0.0,
+        max_lod: 0.0,
+        lod_bias: 0.0,
         mipmap_count: 1,
         rgba: vec![255; 8 * 8 * 4],
         mips: Vec::new(),
@@ -282,6 +289,13 @@ fn accessory_dummy_texture_resolves_archive_shared_material_table() {
         wrap_t: 0,
         min_filter: 1,
         mag_filter: 1,
+        mipmap_enabled: false,
+        do_edge_lod: false,
+        bias_clamp: false,
+        max_anisotropy: 0,
+        min_lod: 0.0,
+        max_lod: 0.0,
+        lod_bias: 0.0,
         mipmap_count: 1,
         rgba: vec![255; 8 * 8 * 4],
         mips: Vec::new(),
@@ -308,6 +322,13 @@ fn normalized_dummy_names_resolve_differently_separated_model_names() {
         wrap_t: 0,
         min_filter: 1,
         mag_filter: 1,
+        mipmap_enabled: false,
+        do_edge_lod: false,
+        bias_clamp: false,
+        max_anisotropy: 0,
+        min_lod: 0.0,
+        max_lod: 0.0,
+        lod_bias: 0.0,
         mipmap_count: 1,
         rgba: vec![255; 4],
         mips: Vec::new(),
@@ -682,6 +703,13 @@ fn preview_for_texture_alpha(has_alpha: bool, has_translucent_alpha: bool) -> Mo
             wrap_t: 1,
             min_filter: 1,
             mag_filter: 1,
+            mipmap_enabled: false,
+            do_edge_lod: false,
+            bias_clamp: false,
+            max_anisotropy: 0,
+            min_lod: 0.0,
+            max_lod: 0.0,
+            lod_bias: 0.0,
             mipmap_count: 1,
             has_alpha,
             has_translucent_alpha,
@@ -1127,6 +1155,13 @@ fn pollution_bitmap_replaces_every_material_alias_of_the_dynamic_texture() {
             wrap_t: 0,
             min_filter: 0,
             mag_filter: 0,
+            mipmap_enabled: true,
+            do_edge_lod: false,
+            bias_clamp: false,
+            max_anisotropy: 0,
+            min_lod: 0.0,
+            max_lod: 1.0,
+            lod_bias: 0.0,
             mipmap_count: 2,
             rgba: vec![value; width as usize * height as usize * 4],
             mips: vec![],
@@ -1147,6 +1182,10 @@ fn pollution_bitmap_replaces_every_material_alias_of_the_dynamic_texture() {
     assert_eq!(textures[2].rgba, runtime_mask);
     assert_eq!(textures[0].mipmap_count, 1);
     assert_eq!(textures[2].mipmap_count, 1);
+    assert!(!textures[0].mipmap_enabled);
+    assert_eq!(textures[0].min_lod, 0.0);
+    assert_eq!(textures[0].max_lod, 0.0);
+    assert_eq!(textures[0].lod_bias, 0.0);
     assert!(textures[0].mips.is_empty());
     assert!(textures[2].mips.is_empty());
     assert_eq!(textures[1].rgba, vec![2; 2 * 2 * 4]);
@@ -1305,18 +1344,28 @@ fn map_puddles_are_level_water_layer() {
 }
 
 #[test]
-fn indirect_water_helpers_stay_hidden_by_default() {
+fn sea_indirect_is_the_default_screen_copy_water_effect() {
     let sea_path = "stage.szs!/map/map/seaindirect.bmd";
-    let puddle_path = "stage.szs!/map/mirror/puddle_ind00.bmd";
 
-    for path in [sea_path, puddle_path] {
-        assert!(!is_default_preview_model_path(path, true, true, true));
-        assert_ne!(
-            preview_render_layer_for_model_path(path),
-            PreviewRenderLayer::Water
-        );
-        assert!(!is_camera_bounds_model_path(path));
-    }
+    assert!(is_default_preview_model_path(sea_path, true, true, false));
+    assert!(!is_default_preview_model_path(sea_path, false, true, true));
+    assert_eq!(
+        preview_render_layer_for_model_path(sea_path),
+        PreviewRenderLayer::IndirectWater
+    );
+    assert!(!is_camera_bounds_model_path(sea_path));
+}
+
+#[test]
+fn dormant_puddle_indirect_helpers_stay_hidden_by_default() {
+    let path = "stage.szs!/map/mirror/puddle_ind00.bmd";
+
+    assert!(!is_default_preview_model_path(path, true, true, true));
+    assert_ne!(
+        preview_render_layer_for_model_path(path),
+        PreviewRenderLayer::Water
+    );
+    assert!(!is_camera_bounds_model_path(path));
 }
 
 #[test]
