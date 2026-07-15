@@ -40,6 +40,8 @@ pub struct ObjectRegistry {
     pub enemy_actors: Vec<EnemyActorDefinition>,
     #[serde(default)]
     pub enemy_material_colors: Vec<EnemyMaterialTevColorDefinition>,
+    #[serde(default)]
+    pub map_obj_flags: Vec<MapObjFlagDefinition>,
 }
 
 impl ObjectRegistry {
@@ -153,6 +155,29 @@ pub struct MapStaticModelDefinition {
     pub source_file: String,
     #[serde(default)]
     pub stage_bootstrap_created: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MapObjFlagDefinition {
+    pub factory_name: String,
+    pub class_name: String,
+    pub texture_path_pattern: String,
+    pub registered_texture_names: Vec<String>,
+    pub resource_name_stream_index: u8,
+    pub default_height: u32,
+    pub default_width: u32,
+    pub default_segment_size: u32,
+    pub default_flutter_speed_degrees_per_frame: u32,
+    pub area_flutter_speeds: Vec<MapObjFlagAreaSpeed>,
+    pub phase_wrap_degrees: u32,
+    pub stage_archive_table_path: String,
+    pub source_file: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MapObjFlagAreaSpeed {
+    pub area_index: u32,
+    pub degrees_per_frame: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -310,6 +335,7 @@ impl SchemaGenerator {
         self.scan_map_obj_manager(&mut registry)?;
         self.scan_params_and_assets(&mut registry)?;
         self.scan_map_static_models(&mut registry)?;
+        self.scan_map_obj_flags(&mut registry)?;
         self.scan_particle_bindings(&mut registry)?;
         self.scan_npc_init_data(&mut registry)?;
         dedup_registry(&mut registry);
@@ -605,6 +631,38 @@ impl SchemaGenerator {
             model.stage_bootstrap_created = stage_bootstrap_actors
                 .iter()
                 .any(|actor| actor.eq_ignore_ascii_case(&model.actor_name));
+        }
+        Ok(())
+    }
+
+    fn scan_map_obj_flags(&self, registry: &mut ObjectRegistry) -> Result<()> {
+        let source_path = self.repo_root.join("src/MoveBG/MapObjFlag.cpp");
+        let source = read_required(&source_path)?;
+        let factory_path = self.repo_root.join("src/System/MarNameRefGen_MapObj.cpp");
+        let factories = read_required(&factory_path)?;
+        let application_path = self.repo_root.join("src/System/Application.cpp");
+        let application = read_required(&application_path)?;
+        let source_file = normalize_source_path(&self.repo_root, &source_path);
+        if let Some(definition) =
+            extract_map_obj_flag_definition(&source, &factories, &application, &source_file)
+        {
+            if !registry.objects.iter().any(|object| {
+                object
+                    .factory_name
+                    .eq_ignore_ascii_case(&definition.factory_name)
+            }) {
+                registry.objects.push(ObjectDefinition {
+                    factory_name: definition.factory_name.clone(),
+                    class_name: definition.class_name.clone(),
+                    category: "MapObj".to_string(),
+                    source: SchemaSource::MarNameRefGen,
+                    display_name: None,
+                    preview_model: None,
+                    hidden: false,
+                    unsafe_to_edit: false,
+                });
+            }
+            registry.map_obj_flags.push(definition);
         }
         Ok(())
     }
@@ -2003,6 +2061,144 @@ fn braced_body(text: &str, open_brace: usize) -> Option<&str> {
     None
 }
 
+fn extract_map_obj_flag_definition(
+    source: &str,
+    factories: &str,
+    application: &str,
+    source_file: &str,
+) -> Option<MapObjFlagDefinition> {
+    let class_name = Regex::new(r"f32\s+([A-Za-z_][A-Za-z0-9_:]*)::mFlutterSpeed\s*=")
+        .expect("valid map-object flag class regex")
+        .captures(source)?[1]
+        .to_string();
+    let factory_re = Regex::new(&format!(
+        r#"strcmp\s*\(\s*name\s*,\s*"([^"]+)"\s*\)\s*==\s*0\s*\)\s*(?:\{{[^}}]*?)?return\s+new\s+{}\b"#,
+        regex::escape(&class_name)
+    ))
+    .expect("valid map-object flag factory regex");
+    let factory_name = factory_re.captures(factories)?[1].to_string();
+    let texture_path_pattern = Regex::new(
+        r#"snprintf\s*\([^;]*?"(/[^"]*%s[^"]*\.bti)"\s*,\s*[A-Za-z_][A-Za-z0-9_]*\s*\)"#,
+    )
+    .expect("valid map-object flag texture path regex")
+    .captures(source)?[1]
+        .to_string();
+    let registered_texture_names = Regex::new(r#"REGISTER_FLAG\s*\(\s*\d+\s*,\s*"([^"]+)"\s*\)"#)
+        .expect("valid registered map-object flag regex")
+        .captures_iter(source)
+        .map(|capture| capture[1].to_string())
+        .collect::<Vec<_>>();
+    if registered_texture_names.is_empty() {
+        return None;
+    }
+
+    let resource_name_stream_index = extract_flag_resource_stream_index(source, &class_name)?;
+    let (default_flutter_speed_degrees_per_frame, area_flutter_speeds) =
+        extract_flag_flutter_speeds(source, &class_name)?;
+    let phase_wrap_degrees = extract_flag_phase_wrap(source, &class_name)?;
+    Some(MapObjFlagDefinition {
+        factory_name,
+        class_name,
+        texture_path_pattern,
+        registered_texture_names,
+        resource_name_stream_index,
+        default_height: extract_u32_member_assignment(source, "mFlagHeight")?,
+        default_width: extract_u32_member_assignment(source, "mFlagWidth")?,
+        default_segment_size: extract_u32_member_assignment(source, "mSegmentSize")?,
+        default_flutter_speed_degrees_per_frame,
+        area_flutter_speeds,
+        phase_wrap_degrees,
+        stage_archive_table_path: extract_stage_archive_table_path(application)?,
+        source_file: source_file.to_string(),
+    })
+}
+
+fn extract_flag_flutter_speeds(
+    source: &str,
+    class_name: &str,
+) -> Option<(u32, Vec<MapObjFlagAreaSpeed>)> {
+    let assignment = format!(r"{}::mFlutterSpeed\s*=\s*", regex::escape(class_name));
+    let switch_re =
+        Regex::new(r"switch\s*\([^)]*\)\s*\{").expect("valid flag flutter switch regex");
+    let switch_body = switch_re.find_iter(source).find_map(|switch_match| {
+        let body = braced_body(source, switch_match.end() - 1)?;
+        body.contains("mFlutterSpeed").then_some(body)
+    })?;
+    let case_re = Regex::new(&format!(
+        r"(?s)case\s+([0-9]+)\s*:.*?{}([0-9]+)(?:\.0+)?f?\s*;",
+        assignment
+    ))
+    .expect("valid flag flutter case regex");
+    let area_flutter_speeds = case_re
+        .captures_iter(switch_body)
+        .map(|capture| {
+            Some(MapObjFlagAreaSpeed {
+                area_index: capture[1].parse().ok()?,
+                degrees_per_frame: capture[2].parse().ok()?,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    if area_flutter_speeds.is_empty() {
+        return None;
+    }
+    let default_re = Regex::new(&format!(
+        r"(?s)default\s*:.*?{}([0-9]+)(?:\.0+)?f?\s*;",
+        assignment
+    ))
+    .expect("valid default flag flutter speed regex");
+    let default_speed = default_re.captures(switch_body)?[1].parse().ok()?;
+    Some((default_speed, area_flutter_speeds))
+}
+
+fn extract_flag_phase_wrap(source: &str, class_name: &str) -> Option<u32> {
+    let perform_re = Regex::new(r"void\s+[A-Za-z_][A-Za-z0-9_:]*::perform\s*\([^)]*\)\s*\{")
+        .expect("valid flag manager perform regex");
+    let speed = format!("{}::mFlutterSpeed", class_name);
+    let body = perform_re.find_iter(source).find_map(|perform_match| {
+        let body = braced_body(source, perform_match.end() - 1)?;
+        (body.contains("mPhase") && body.contains(&speed)).then_some(body)
+    })?;
+    let wrap_re =
+        Regex::new(r"mPhase\s*>\s*([0-9]+)(?:\.0+)?f?").expect("valid flag phase wrap regex");
+    wrap_re.captures(body)?[1].parse().ok()
+}
+
+fn extract_stage_archive_table_path(application: &str) -> Option<String> {
+    Regex::new(r#"bufStageArcBin\s*=\s*JKRDvdRipper::loadToMainRAM\s*\(\s*"([^"]+)""#)
+        .expect("valid stage archive table path regex")
+        .captures(application)
+        .map(|capture| capture[1].to_string())
+}
+
+fn extract_flag_resource_stream_index(source: &str, class_name: &str) -> Option<u8> {
+    let load_re = Regex::new(&format!(
+        r"void\s+{}::load\s*\([^)]*\)\s*\{{",
+        regex::escape(class_name)
+    ))
+    .expect("valid map-object flag load regex");
+    let load = load_re.find(source)?;
+    let body = braced_body(source, load.end() - 1)?;
+    let resource_buffer = Regex::new(r"\binit\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)")
+        .expect("valid map-object flag init regex")
+        .captures(body)?[1]
+        .to_string();
+    let read_re = Regex::new(r"\bstream\.readString\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*,")
+        .expect("valid placement stream string read regex");
+    let index = read_re
+        .captures_iter(body)
+        .position(|capture| capture[1] == resource_buffer)?;
+    index.try_into().ok()
+}
+
+fn extract_u32_member_assignment(source: &str, member_name: &str) -> Option<u32> {
+    let assignment_re = Regex::new(&format!(
+        r"\b{}\s*=\s*([0-9]+)(?:\.0+)?f?\s*;",
+        regex::escape(member_name)
+    ))
+    .expect("valid numeric member assignment regex");
+    assignment_re.captures(source)?[1].parse().ok()
+}
+
 fn extract_string_factory_returns(
     text: &str,
     category: &str,
@@ -2121,6 +2317,15 @@ fn dedup_registry(registry: &mut ObjectRegistry) {
     });
     registry.map_static_models.dedup();
 
+    registry.map_obj_flags.sort_by(|a, b| {
+        a.factory_name
+            .cmp(&b.factory_name)
+            .then_with(|| a.source_file.cmp(&b.source_file))
+    });
+    registry
+        .map_obj_flags
+        .dedup_by(|a, b| a.factory_name.eq_ignore_ascii_case(&b.factory_name));
+
     registry.particle_resources.sort_by(|a, b| {
         a.effect_id
             .cmp(&b.effect_id)
@@ -2191,6 +2396,92 @@ fn normalize_source_path(root: &Path, path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extracts_procedural_flag_resources_and_geometry_from_decomp() {
+        let source = r#"
+            f32 TMapObjFlag::mFlutterSpeed = 4.0f;
+            #define REGISTER_FLAG(N, NAME) \
+                snprintf(buf, 64, "/scene/mapObj/%s.bti", name);
+            void TMapObjFlagManager::registerObj(TMapObjFlag*, const char*) {
+                REGISTER_FLAG(0, "flagSun")
+                REGISTER_FLAG(1, "flagWhite")
+            }
+            void TMapObjFlag::load(JSUMemoryInputStream& stream) {
+                JDrama::TActor::load(stream);
+                char buf[64];
+                stream.readString(buf, 64);
+                init(buf);
+            }
+            TMapObjFlag::TMapObjFlag(const char*) {
+                mFlagHeight = 125.0f;
+                mFlagWidth = 130.0f;
+                mSegmentSize = 20.0f;
+            }
+            void TMapObjFlagManager::load(JSUMemoryInputStream&) {
+                switch (gpMarDirector->mMap) {
+                case 2:
+                    TMapObjFlag::mFlutterSpeed = 16.0f;
+                    break;
+                case 4:
+                    TMapObjFlag::mFlutterSpeed = 12.0f;
+                    break;
+                default:
+                    TMapObjFlag::mFlutterSpeed = 8.0f;
+                    break;
+                }
+            }
+            void TMapObjFlagManager::perform(u32, JDrama::TGraphics*) {
+                flag->mPhase += TMapObjFlag::mFlutterSpeed;
+                if (flag->mPhase > 360.0f)
+                    flag->mPhase -= 360.0f;
+            }
+        "#;
+        let factories = r#"
+            if (strcmp(name, "MapObjFlag") == 0)
+                return new TMapObjFlag("flag");
+        "#;
+        let application = r#"
+            bufStageArcBin = JKRDvdRipper::loadToMainRAM(
+                "/data/stageArc.bin", nullptr, EXPAND_SWITCH_DEFAULT, 0, mHeap);
+        "#;
+
+        let definition = extract_map_obj_flag_definition(
+            source,
+            factories,
+            application,
+            "src/MoveBG/MapObjFlag.cpp",
+        )
+        .expect("extract flag definition");
+
+        assert_eq!(definition.factory_name, "MapObjFlag");
+        assert_eq!(definition.class_name, "TMapObjFlag");
+        assert_eq!(definition.texture_path_pattern, "/scene/mapObj/%s.bti");
+        assert_eq!(
+            definition.registered_texture_names,
+            ["flagSun".to_string(), "flagWhite".to_string()]
+        );
+        assert_eq!(definition.resource_name_stream_index, 0);
+        assert_eq!(definition.default_height, 125);
+        assert_eq!(definition.default_width, 130);
+        assert_eq!(definition.default_segment_size, 20);
+        assert_eq!(definition.default_flutter_speed_degrees_per_frame, 8);
+        assert_eq!(
+            definition.area_flutter_speeds,
+            [
+                MapObjFlagAreaSpeed {
+                    area_index: 2,
+                    degrees_per_frame: 16,
+                },
+                MapObjFlagAreaSpeed {
+                    area_index: 4,
+                    degrees_per_frame: 12,
+                },
+            ]
+        );
+        assert_eq!(definition.phase_wrap_degrees, 360);
+        assert_eq!(definition.stage_archive_table_path, "/data/stageArc.bin");
+    }
 
     #[test]
     fn extracts_simple_factory_return() {

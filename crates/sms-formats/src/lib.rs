@@ -31,9 +31,9 @@ pub use j3d_anim::{
     J3dTextureSrt, J3dTextureSrtAnimation, J3dTextureSrtBinding, SMS_ANIMATION_FRAMES_PER_SECOND,
 };
 pub use jdrama::{
-    parse_jdrama_object_records, JDramaAmbient, JDramaCubeGeneralInfo, JDramaLight,
-    JDramaMapEventBuilding, JDramaMapEventSinkParams, JDramaNpcParams, JDramaObjectRecord,
-    JDramaTransform,
+    parse_jdrama_object_records, parse_jdrama_scenario_archive_entries, JDramaAmbient,
+    JDramaCubeGeneralInfo, JDramaLight, JDramaMapEventBuilding, JDramaMapEventSinkParams,
+    JDramaNpcParams, JDramaObjectRecord, JDramaScenarioArchiveEntry, JDramaTransform,
 };
 pub use jpa::{
     JpaBaseShape, JpaChildShape, JpaColorAnimation, JpaColorKey, JpaEffect, JpaEmitter,

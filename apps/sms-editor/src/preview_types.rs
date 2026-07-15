@@ -20,6 +20,7 @@ pub(super) struct ModelPreview {
     pub(super) source_textures: usize,
     pub(super) object_model_indices: BTreeMap<String, usize>,
     pub(super) animated_models: Vec<AnimatedModelPreview>,
+    pub(super) animated_flags: Vec<AnimatedFlagPreview>,
     pub(super) rotating_models: Vec<RuntimeRotatingModelPreview>,
     pub(super) level_transform_models: Vec<LevelTransformModelPreview>,
     pub(super) level_transform_particles: Vec<LevelTransformParticlePreview>,
@@ -215,6 +216,23 @@ pub(super) struct AnimatedModelPreview {
     pub(super) prepared_triangles: Option<Arc<J3dPreparedAnimatedTriangles>>,
     pub(super) loader_flags: u32,
     pub(super) instances: Vec<AnimatedModelInstance>,
+}
+
+#[derive(Clone)]
+pub(super) struct AnimatedFlagPreview {
+    pub(super) transform: Transform,
+    pub(super) rows: usize,
+    pub(super) cols: usize,
+    pub(super) step_height: f32,
+    pub(super) step_width: f32,
+    pub(super) flag_height: f32,
+    pub(super) flag_width: f32,
+    pub(super) segment_size: f32,
+    pub(super) initial_phase_degrees: f32,
+    pub(super) flutter_speed_degrees_per_frame: f32,
+    pub(super) phase_wrap_degrees: f32,
+    pub(super) point_range: std::ops::Range<usize>,
+    pub(super) triangle_range: std::ops::Range<usize>,
 }
 
 #[derive(Clone)]

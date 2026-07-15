@@ -39,6 +39,13 @@ pub struct JDramaObjectRecord {
     pub ambient: Option<JDramaAmbient>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JDramaScenarioArchiveEntry {
+    pub area_index: u32,
+    pub scenario_index: u32,
+    pub archive_name: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct JDramaCubeGeneralInfo {
     pub center: [f32; 3],
@@ -108,6 +115,111 @@ pub fn parse_jdrama_object_records(bytes: &[u8]) -> Result<Vec<JDramaObjectRecor
     let mut visited = BTreeSet::new();
     parse_record_at(bytes, 0, bytes.len(), &mut visited, &mut records)?;
     Ok(records)
+}
+
+/// Parses the nested NameRef pointer/value arrays loaded by TApplication as
+/// the runtime area/scenario archive table.
+pub fn parse_jdrama_scenario_archive_entries(
+    bytes: &[u8],
+) -> Result<Vec<JDramaScenarioArchiveEntry>> {
+    let (_, root_payload, root_end) = name_ref_record_layout(bytes, 0, bytes.len())?;
+    let root_children = name_ref_array_children(bytes, root_payload, root_end)?;
+    for outer_offset in root_children {
+        let Ok((_, outer_payload, outer_end)) =
+            name_ref_record_layout(bytes, outer_offset, root_end)
+        else {
+            continue;
+        };
+        let Ok(area_records) = name_ref_array_children(bytes, outer_payload, outer_end) else {
+            continue;
+        };
+        let mut entries = Vec::new();
+        let mut valid = true;
+        for (area_index, area_offset) in area_records.into_iter().enumerate() {
+            let Ok((_, area_payload, area_end)) =
+                name_ref_record_layout(bytes, area_offset, outer_end)
+            else {
+                valid = false;
+                break;
+            };
+            let Ok(scenario_records) = name_ref_array_children(bytes, area_payload, area_end)
+            else {
+                valid = false;
+                break;
+            };
+            for (scenario_index, scenario_offset) in scenario_records.into_iter().enumerate() {
+                let Ok((_, scenario_payload, scenario_end)) =
+                    name_ref_record_layout(bytes, scenario_offset, area_end)
+                else {
+                    valid = false;
+                    break;
+                };
+                let Ok((archive_name, archive_end)) =
+                    read_len_string(bytes, scenario_payload, scenario_end)
+                else {
+                    valid = false;
+                    break;
+                };
+                if archive_name.is_empty() || archive_end != scenario_end {
+                    valid = false;
+                    break;
+                }
+                entries.push(JDramaScenarioArchiveEntry {
+                    area_index: area_index as u32,
+                    scenario_index: scenario_index as u32,
+                    archive_name,
+                });
+            }
+            if !valid {
+                break;
+            }
+        }
+        if valid && !entries.is_empty() {
+            return Ok(entries);
+        }
+    }
+    Err(FormatError::Unsupported {
+        format: FORMAT,
+        message: "no nested scenario archive table was found".to_string(),
+    })
+}
+
+fn name_ref_record_layout(
+    bytes: &[u8],
+    offset: usize,
+    limit: usize,
+) -> Result<(usize, usize, usize)> {
+    let size =
+        plausible_record_size(bytes, offset, limit).ok_or_else(|| invalid_offset(offset, limit))?;
+    let end = offset + size;
+    let (_, after_type) = read_len_string(bytes, offset + 6, end)?;
+    let (_, payload) = read_name_ref(bytes, after_type, end)?;
+    Ok((size, payload, end))
+}
+
+fn name_ref_array_children(bytes: &[u8], payload: usize, end: usize) -> Result<Vec<usize>> {
+    let count = be_u32(bytes, payload, FORMAT)? as usize;
+    if count > MAX_SCAN_RECORDS {
+        return Err(FormatError::Unsupported {
+            format: FORMAT,
+            message: format!("NameRef array has implausible child count {count}"),
+        });
+    }
+    let mut cursor = payload
+        .checked_add(4)
+        .ok_or_else(|| invalid_offset(payload, end))?;
+    let mut children = Vec::with_capacity(count);
+    for _ in 0..count {
+        let size =
+            plausible_record_size(bytes, cursor, end).ok_or_else(|| invalid_offset(cursor, end))?;
+        children.push(cursor);
+        cursor = cursor
+            .checked_add(size)
+            .ok_or_else(|| invalid_offset(cursor, end))?;
+    }
+    (cursor == end)
+        .then_some(children)
+        .ok_or_else(|| invalid_offset(cursor, end))
 }
 
 fn parse_record_at(
@@ -648,6 +760,58 @@ fn invalid_offset(offset: usize, len: usize) -> FormatError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn name_ref_record(type_name: &str, name: &str, payload: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+        put_len_string(&mut bytes, type_name.as_bytes());
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+        put_len_string(&mut bytes, name.as_bytes());
+        bytes.extend_from_slice(payload);
+        let size = bytes.len() as u32;
+        bytes[..4].copy_from_slice(&size.to_be_bytes());
+        bytes
+    }
+
+    fn name_ref_array(type_name: &str, name: &str, children: &[Vec<u8>]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(children.len() as u32).to_be_bytes());
+        for child in children {
+            payload.extend_from_slice(child);
+        }
+        name_ref_record(type_name, name, &payload)
+    }
+
+    #[test]
+    fn parses_nested_runtime_area_and_scenario_archive_indices() {
+        let leaf = |name: &str, archive: &str| {
+            let mut payload = Vec::new();
+            put_len_string(&mut payload, archive.as_bytes());
+            name_ref_record("Leaf", name, &payload)
+        };
+        let areas = vec![
+            name_ref_array(
+                "ValueArray",
+                "area 0",
+                &[
+                    leaf("scenario 0", "first0.arc"),
+                    leaf("scenario 1", "first1.arc"),
+                ],
+            ),
+            name_ref_array("ValueArray", "area 1", &[leaf("scenario 0", "second0.arc")]),
+        ];
+        let outer = name_ref_array("PointerArray", "runtime stages", &areas);
+        let root = name_ref_array("Root", "root", &[outer]);
+
+        let entries = parse_jdrama_scenario_archive_entries(&root).expect("parse stage table");
+
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].area_index, 0);
+        assert_eq!(entries[1].scenario_index, 1);
+        assert_eq!(entries[2].area_index, 1);
+        assert_eq!(entries[2].archive_name, "second0.arc");
+    }
 
     #[test]
     fn scans_ascii_stream_strings_after_binary_fields() {

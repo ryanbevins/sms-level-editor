@@ -737,6 +737,7 @@ impl SmsEditorApp {
                 !preview.texture_srt_animations.is_empty()
                     || !preview.texture_pattern_animations.is_empty()
                     || !preview.animated_models.is_empty()
+                    || !preview.animated_flags.is_empty()
                     || !preview.rotating_models.is_empty()
                     || !preview.actor_particles.is_empty()
             }) {
@@ -901,6 +902,7 @@ impl SmsEditorApp {
             return;
         };
         if preview.animated_models.is_empty()
+            && preview.animated_flags.is_empty()
             && preview.rotating_models.is_empty()
             && preview.actor_particles.is_empty()
             && preview.texture_pattern_animations.is_empty()
@@ -913,6 +915,7 @@ impl SmsEditorApp {
         {
             let ModelPreview {
                 animated_models,
+                animated_flags,
                 rotating_models,
                 actor_particles,
                 texture_pattern_animations,
@@ -1093,6 +1096,9 @@ impl SmsEditorApp {
                     }
                 }
             }
+            for source in animated_flags {
+                animate_flag_preview(source, tick as f32, points, triangles);
+            }
             apply_actor_particles(
                 actor_particles,
                 elapsed_seconds * SMS_ANIMATION_FRAMES_PER_SECOND,
@@ -1138,6 +1144,12 @@ impl SmsEditorApp {
                         .iter()
                         .map(|instance| instance.triangle_range.clone())
                 }))
+                .chain(
+                    preview
+                        .animated_flags
+                        .iter()
+                        .map(|flag| flag.triangle_range.clone()),
+                )
                 .chain(
                     preview
                         .actor_particles

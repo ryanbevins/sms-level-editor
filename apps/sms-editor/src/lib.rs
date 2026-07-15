@@ -123,7 +123,7 @@ struct LoadedStage {
 }
 
 enum BackgroundResult {
-    Schema(Result<ObjectRegistry, String>),
+    Schema(Box<Result<ObjectRegistry, String>>),
     Scan {
         base_root: String,
         result: Result<Vec<SceneArchiveInfo>, String>,
@@ -367,7 +367,7 @@ impl SmsEditorApp {
             let result = SchemaGenerator::new(repo_root)
                 .generate()
                 .map_err(|err| err.to_string());
-            let _ = sender.send(BackgroundResult::Schema(result));
+            let _ = sender.send(BackgroundResult::Schema(Box::new(result)));
         });
         self.background_receiver = Some(receiver);
         self.background_label = Some("Generating schema".to_string());
@@ -496,7 +496,7 @@ impl SmsEditorApp {
                 self.background_receiver = None;
                 self.background_label = None;
                 match result {
-                    BackgroundResult::Schema(result) => match result {
+                    BackgroundResult::Schema(result) => match *result {
                         Ok(registry) => {
                             self.log.push(format!(
                                 "Generated {} object entries.",
@@ -688,6 +688,7 @@ impl SmsEditorApp {
         let mut texture_srt_animations = Vec::new();
         let mut texture_pattern_animations = Vec::new();
         let mut material_animation_bindings = Vec::new();
+        let mut animated_flags = Vec::new();
         let mut level_transform_models = Vec::new();
         let mut level_transform_particles = Vec::new();
         let mut actor_particles = Vec::new();
@@ -941,6 +942,40 @@ impl SmsEditorApp {
                 points.extend(wires.points);
                 triangles.extend(wires.triangles);
                 next_packet_index += wires.packet_count;
+                material_animation_bindings.resize_with(materials.len(), Vec::new);
+            }
+
+            let flags = build_procedural_flag_preview(
+                document,
+                loaded_models + 1,
+                next_packet_index,
+                &mut textures,
+                &mut materials,
+            );
+            if flags.flag_count != 0 {
+                let point_base = points.len();
+                let triangle_base = triangles.len();
+                loaded_models += flags.flag_count;
+                source_vertices += flags.source_vertices;
+                source_triangles += flags.source_triangles;
+                source_textures += flags.source_textures;
+                merge_bounds(
+                    &mut bounds_min,
+                    &mut bounds_max,
+                    flags.bounds_min,
+                    flags.bounds_max,
+                );
+                points.extend(flags.points);
+                triangles.extend(flags.triangles);
+                animated_flags.extend(flags.animated_flags.into_iter().map(|mut animation| {
+                    animation.point_range = (animation.point_range.start + point_base)
+                        ..(animation.point_range.end + point_base);
+                    animation.triangle_range = (animation.triangle_range.start + triangle_base)
+                        ..(animation.triangle_range.end + triangle_base);
+                    animation
+                }));
+                object_model_indices.extend(flags.object_model_indices);
+                next_packet_index += flags.packet_count;
                 material_animation_bindings.resize_with(materials.len(), Vec::new);
             }
         }
@@ -1387,7 +1422,11 @@ impl SmsEditorApp {
             level_transform_particle_end_frames(&level_transform_particles)
                 .max(level_transform_duration_frames);
 
-        if points.len() > POINT_BUDGET && animated_models.is_empty() && rotating_models.is_empty() {
+        if points.len() > POINT_BUDGET
+            && animated_models.is_empty()
+            && animated_flags.is_empty()
+            && rotating_models.is_empty()
+        {
             let stride = (points.len() / POINT_BUDGET).max(1);
             points = points
                 .into_iter()
@@ -1437,6 +1476,7 @@ impl SmsEditorApp {
             source_textures,
             object_model_indices,
             animated_models,
+            animated_flags,
             rotating_models,
             level_transform_models,
             level_transform_particles,
@@ -1553,6 +1593,9 @@ use preview_particles::*;
 
 mod preview_grass;
 use preview_grass::*;
+
+mod preview_flags;
+use preview_flags::*;
 
 mod preview_wires;
 use preview_wires::*;
