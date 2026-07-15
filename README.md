@@ -190,6 +190,13 @@ guaranteed to remain compatible. A future release will define the first
 supported installation and modding workflow. Until then, this repository should
 be treated strictly as a development preview.
 
+## Credits and Thanks
+
+Special thanks to the developers and contributors of the
+[Super Mario Sunshine decompilation project](https://github.com/doldecomp/sms).
+Their painstaking research and documentation make this editor's work toward
+accurate game formats, scene behavior, and rendering semantics possible.
+
 ## Legal
 
 This is an unofficial fan-made development project. It is not affiliated with
