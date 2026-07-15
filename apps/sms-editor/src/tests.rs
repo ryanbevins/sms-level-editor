@@ -107,6 +107,166 @@ fn viewport_markers_show_only_selection_outside_objects_mode() {
 }
 
 #[test]
+fn viewport_mesh_picking_selects_the_object_away_from_its_origin_marker() {
+    let mut object = SceneObject::new("obj-mesh", "Coin");
+    object.transform.translation = [600.0, 0.0, 1000.0];
+    let mut preview = preview_for_texture_alpha(false, false);
+    preview.object_model_indices.insert(object.id.clone(), 7);
+    let mut triangle = textured_blended_triangle();
+    triangle.vertices = [
+        [-200.0, -200.0, 1000.0],
+        [200.0, -200.0, 1000.0],
+        [0.0, 200.0, 1000.0],
+    ];
+    triangle.model_index = 7;
+    triangle.texture_index = None;
+    triangle.tex_coords = None;
+    preview.triangles.push(triangle);
+
+    let app = SmsEditorApp {
+        document: Some(test_document(vec![object])),
+        model_preview: Some(preview),
+        ..camera_app()
+    };
+    let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 200.0));
+
+    assert_eq!(
+        app.object_mesh_at_screen_position(rect, rect.center())
+            .as_deref(),
+        Some("obj-mesh")
+    );
+}
+
+#[test]
+fn viewport_mesh_picking_prefers_the_nearest_overlapping_object() {
+    let mut preview = preview_for_texture_alpha(false, false);
+    preview
+        .object_model_indices
+        .insert("far-object".to_string(), 1);
+    preview
+        .object_model_indices
+        .insert("near-object".to_string(), 2);
+    for (model_index, depth, extent) in [(1, 1000.0, 200.0), (2, 500.0, 100.0)] {
+        let mut triangle = textured_blended_triangle();
+        triangle.vertices = [
+            [-extent, -extent, depth],
+            [extent, -extent, depth],
+            [0.0, extent, depth],
+        ];
+        triangle.model_index = model_index;
+        triangle.texture_index = None;
+        triangle.tex_coords = None;
+        preview.triangles.push(triangle);
+    }
+
+    let app = SmsEditorApp {
+        model_preview: Some(preview),
+        ..camera_app()
+    };
+    let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 200.0));
+
+    assert_eq!(
+        app.object_mesh_at_screen_position(rect, rect.center())
+            .as_deref(),
+        Some("near-object")
+    );
+}
+
+#[test]
+fn viewport_picking_does_not_let_a_hidden_origin_behind_the_mesh_win() {
+    let mut front = SceneObject::new("front-object", "Coin");
+    front.transform.translation = [600.0, 0.0, 500.0];
+    let mut behind = SceneObject::new("behind-object", "Coin");
+    behind.transform.translation = [0.0, 0.0, 1000.0];
+    let mut preview = preview_for_texture_alpha(false, false);
+    preview.object_model_indices.insert(front.id.clone(), 1);
+    let mut triangle = textured_blended_triangle();
+    triangle.vertices = [
+        [-100.0, -100.0, 500.0],
+        [100.0, -100.0, 500.0],
+        [0.0, 100.0, 500.0],
+    ];
+    triangle.model_index = 1;
+    triangle.texture_index = None;
+    triangle.tex_coords = None;
+    preview.triangles.push(triangle);
+
+    let app = SmsEditorApp {
+        document: Some(test_document(vec![front, behind])),
+        model_preview: Some(preview),
+        ..camera_app()
+    };
+    let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 200.0));
+
+    assert_eq!(
+        app.object_at_screen_position(rect, rect.center())
+            .as_deref(),
+        Some("front-object")
+    );
+}
+
+#[test]
+fn selected_object_outline_keeps_the_silhouette_and_removes_internal_edges() {
+    let mut preview = preview_for_texture_alpha(false, false);
+    preview
+        .object_model_indices
+        .insert("selected-object".to_string(), 9);
+    for vertices in [
+        [
+            [-100.0, -100.0, 1000.0],
+            [100.0, -100.0, 1000.0],
+            [100.0, 100.0, 1000.0],
+        ],
+        [
+            [-100.0, -100.0, 1000.0],
+            [100.0, 100.0, 1000.0],
+            [-100.0, 100.0, 1000.0],
+        ],
+    ] {
+        let mut triangle = textured_blended_triangle();
+        triangle.vertices = vertices;
+        triangle.model_index = 9;
+        triangle.texture_index = None;
+        triangle.tex_coords = None;
+        preview.triangles.push(triangle);
+    }
+
+    let app = SmsEditorApp {
+        model_preview: Some(preview),
+        selected_object_id: Some("selected-object".to_string()),
+        ..camera_app()
+    };
+    let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 200.0));
+
+    let segments = app.selected_object_outline_segments(rect);
+    let paths = viewport_ui::outline_paths_from_segments(&segments);
+    assert_eq!(paths.len(), 1);
+    assert_eq!(paths[0].first(), paths[0].last());
+}
+
+#[test]
+fn selected_object_outline_merges_overlapping_polygon_coverage() {
+    let size = [8, 6];
+    let mut coverage = vec![false; size[0] * size[1]];
+    for y in 1..=4 {
+        for x in 1..=4 {
+            coverage[y * size[0] + x] = true;
+        }
+    }
+    for y in 2..=3 {
+        for x in 3..=6 {
+            coverage[y * size[0] + x] = true;
+        }
+    }
+    let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(8.0, 6.0));
+    let segments = viewport_ui::outline_segments_from_coverage(&coverage, size, [1, 6, 1, 4], rect);
+
+    assert!(!segments.iter().any(|segment| {
+        segment[0].x == 5.0 && segment[1].x == 5.0 && segment[0].y <= 3.0 && segment[1].y >= 3.0
+    }));
+}
+
+#[test]
 fn nozzle_box_tev_color_matches_runtime_item_type() {
     let mut rocket = SceneObject::new("rocket-box", "NozzleBox");
     rocket.raw_params.insert(

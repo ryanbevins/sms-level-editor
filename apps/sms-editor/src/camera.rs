@@ -53,29 +53,6 @@ impl SmsEditorApp {
         (warnings, errors)
     }
 
-    pub(super) fn object_screen_positions(
-        &self,
-        rect: egui::Rect,
-    ) -> Vec<(String, egui::Pos2, String)> {
-        let projection = self.camera_projection(rect);
-        self.document
-            .as_ref()
-            .map(|document| {
-                document
-                    .objects
-                    .iter()
-                    .filter_map(|object| {
-                        projection
-                            .project_world_to_screen(object.transform.translation)
-                            .map(|(screen, _)| {
-                                (object.id.clone(), screen, object.factory_name.clone())
-                            })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
     pub(super) fn world_to_screen(&self, rect: egui::Rect, point: [f32; 3]) -> egui::Pos2 {
         self.project_world_to_screen(rect, point)
             .map(|(screen, _)| screen)

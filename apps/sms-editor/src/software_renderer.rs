@@ -428,6 +428,29 @@ pub(super) fn edge_function_point(a: ProjectedVertex, b: ProjectedVertex, x: f32
     (x - a.x) * (b.y - a.y) - (y - a.y) * (b.x - a.x)
 }
 
+pub(super) fn projected_triangle_depth_at_point(
+    vertices: [ProjectedVertex; 3],
+    x: f32,
+    y: f32,
+) -> Option<f32> {
+    let area = edge_function(vertices[0], vertices[1], vertices[2]);
+    if !area.is_finite() || area.abs() <= f32::EPSILON {
+        return None;
+    }
+
+    let weights = [
+        edge_function_point(vertices[1], vertices[2], x, y) / area,
+        edge_function_point(vertices[2], vertices[0], x, y) / area,
+        edge_function_point(vertices[0], vertices[1], x, y) / area,
+    ];
+    if weights.iter().any(|weight| *weight < -0.0001) {
+        return None;
+    }
+
+    let depth = perspective_correct_depth(vertices, weights);
+    depth.is_finite().then_some(depth)
+}
+
 pub(super) fn perspective_correct_weights(
     vertices: [ProjectedVertex; 3],
     weights: [f32; 3],

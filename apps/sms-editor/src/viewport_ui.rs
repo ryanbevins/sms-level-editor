@@ -1,5 +1,143 @@
 use super::*;
 
+pub(super) fn outline_segments_from_coverage(
+    coverage: &[bool],
+    size: [usize; 2],
+    bounds: [usize; 4],
+    rect: egui::Rect,
+) -> Vec<[egui::Pos2; 2]> {
+    let [width, height] = size;
+    let [min_x, max_x, min_y, max_y] = bounds;
+    let screen_pos = |x: f32, y: f32| {
+        egui::pos2(
+            rect.left() + x * rect.width() / width.max(1) as f32,
+            rect.top() + y * rect.height() / height.max(1) as f32,
+        )
+    };
+    let covered = |x: isize, y: isize| {
+        x >= 0
+            && y >= 0
+            && (x as usize) < width
+            && (y as usize) < height
+            && coverage[y as usize * width + x as usize]
+    };
+    let mut segments = Vec::new();
+
+    for y in min_y as isize - 1..=max_y as isize {
+        for x in min_x as isize - 1..=max_x as isize {
+            let case = u8::from(covered(x, y))
+                | (u8::from(covered(x + 1, y)) << 1)
+                | (u8::from(covered(x + 1, y + 1)) << 2)
+                | (u8::from(covered(x, y + 1)) << 3);
+            if matches!(case, 0 | 15) {
+                continue;
+            }
+
+            let x = x as f32;
+            let y = y as f32;
+            let top = screen_pos(x + 1.0, y + 0.5);
+            let right = screen_pos(x + 1.5, y + 1.0);
+            let bottom = screen_pos(x + 1.0, y + 1.5);
+            let left = screen_pos(x + 0.5, y + 1.0);
+            let cell_segments: &[(egui::Pos2, egui::Pos2)] = match case {
+                1 | 14 => &[(left, top)],
+                2 | 13 => &[(top, right)],
+                3 | 12 => &[(left, right)],
+                4 | 11 => &[(right, bottom)],
+                5 => &[(left, top), (right, bottom)],
+                6 | 9 => &[(top, bottom)],
+                7 | 8 => &[(left, bottom)],
+                10 => &[(top, right), (bottom, left)],
+                _ => &[],
+            };
+            segments.extend(cell_segments.iter().map(|(start, end)| [*start, *end]));
+        }
+    }
+
+    segments
+}
+
+fn outline_point_key(point: egui::Pos2) -> [u32; 2] {
+    [point.x.to_bits(), point.y.to_bits()]
+}
+
+fn smooth_closed_outline_path(path: Vec<egui::Pos2>) -> Vec<egui::Pos2> {
+    if path.len() < 4 || outline_point_key(path[0]) != outline_point_key(*path.last().unwrap()) {
+        return path;
+    }
+
+    let points = &path[..path.len() - 1];
+    let mut smoothed = Vec::with_capacity(points.len() * 2 + 1);
+    for index in 0..points.len() {
+        let current = points[index];
+        let next = points[(index + 1) % points.len()];
+        let delta = next - current;
+        smoothed.push(current + delta * 0.25);
+        smoothed.push(current + delta * 0.75);
+    }
+    smoothed.push(smoothed[0]);
+    smoothed
+}
+
+pub(super) fn outline_paths_from_segments(segments: &[[egui::Pos2; 2]]) -> Vec<Vec<egui::Pos2>> {
+    let mut adjacency = BTreeMap::<[u32; 2], Vec<usize>>::new();
+    for (index, segment) in segments.iter().enumerate() {
+        adjacency
+            .entry(outline_point_key(segment[0]))
+            .or_default()
+            .push(index);
+        adjacency
+            .entry(outline_point_key(segment[1]))
+            .or_default()
+            .push(index);
+    }
+
+    let mut used = vec![false; segments.len()];
+    let mut paths = Vec::new();
+    for first_segment in 0..segments.len() {
+        if used[first_segment] {
+            continue;
+        }
+        let segment = segments[first_segment];
+        let start = if adjacency
+            .get(&outline_point_key(segment[1]))
+            .is_some_and(|neighbors| neighbors.len() == 1)
+        {
+            segment[1]
+        } else {
+            segment[0]
+        };
+        let start_key = outline_point_key(start);
+        let mut current = start;
+        let mut path = vec![start];
+
+        loop {
+            let current_key = outline_point_key(current);
+            let Some(next_segment) = adjacency
+                .get(&current_key)
+                .and_then(|neighbors| neighbors.iter().copied().find(|index| !used[*index]))
+            else {
+                break;
+            };
+            used[next_segment] = true;
+            let next = if outline_point_key(segments[next_segment][0]) == current_key {
+                segments[next_segment][1]
+            } else {
+                segments[next_segment][0]
+            };
+            path.push(next);
+            current = next;
+            if outline_point_key(current) == start_key || path.len() > segments.len() + 1 {
+                break;
+            }
+        }
+        if path.len() >= 2 {
+            paths.push(smooth_closed_outline_path(path));
+        }
+    }
+    paths
+}
+
 impl SmsEditorApp {
     pub(super) fn viewport(&mut self, ui: &mut egui::Ui) {
         let available = ui.available_size();
@@ -94,18 +232,88 @@ impl SmsEditorApp {
                     }
                 }
 
-                let nearest = self
-                    .object_screen_positions(rect)
-                    .into_iter()
-                    .filter_map(|(id, object_pos, _)| {
-                        let dist = object_pos.distance(pos);
-                        (dist < 24.0).then_some((dist, id))
-                    })
-                    .min_by(|a, b| a.0.total_cmp(&b.0))
-                    .map(|(_, id)| id);
-                self.selected_object_id = nearest;
+                self.selected_object_id = self.object_at_screen_position(rect, pos);
             }
         }
+    }
+
+    pub(super) fn object_at_screen_position(
+        &self,
+        rect: egui::Rect,
+        pos: egui::Pos2,
+    ) -> Option<String> {
+        let projection = self.camera_projection(rect);
+        let origin_hit = self.document.as_ref().and_then(|document| {
+            document
+                .objects
+                .iter()
+                .filter_map(|object| {
+                    let (screen, depth) =
+                        projection.project_world_to_screen(object.transform.translation)?;
+                    (screen.distance(pos) < 24.0).then_some((depth, object.id.clone()))
+                })
+                .min_by(|a, b| a.0.total_cmp(&b.0))
+        });
+        [
+            self.object_mesh_hit_at_screen_position(rect, pos),
+            origin_hit,
+        ]
+        .into_iter()
+        .flatten()
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, object_id)| object_id)
+    }
+
+    #[cfg(test)]
+    pub(super) fn object_mesh_at_screen_position(
+        &self,
+        rect: egui::Rect,
+        pos: egui::Pos2,
+    ) -> Option<String> {
+        self.object_mesh_hit_at_screen_position(rect, pos)
+            .map(|(_, object_id)| object_id)
+    }
+
+    fn object_mesh_hit_at_screen_position(
+        &self,
+        rect: egui::Rect,
+        pos: egui::Pos2,
+    ) -> Option<(f32, String)> {
+        if !rect.contains(pos) {
+            return None;
+        }
+
+        let preview = self.model_preview.as_ref()?;
+        if preview.object_model_indices.is_empty() {
+            return None;
+        }
+
+        let size = framebuffer_size_for_rect(rect);
+        let framebuffer_pos = [
+            (pos.x - rect.left()) * size[0] as f32 / rect.width().max(1.0),
+            (pos.y - rect.top()) * size[1] as f32 / rect.height().max(1.0),
+        ];
+        let object_ids_by_model = preview
+            .object_model_indices
+            .iter()
+            .map(|(object_id, model_index)| (*model_index, object_id.as_str()))
+            .collect::<BTreeMap<_, _>>();
+
+        preview
+            .triangles
+            .iter()
+            .filter_map(|triangle| {
+                let object_id = object_ids_by_model.get(&triangle.model_index)?;
+                let projected = self.project_preview_triangle(rect, size, triangle)?;
+                let depth = projected_triangle_depth_at_point(
+                    projected.screen,
+                    framebuffer_pos[0],
+                    framebuffer_pos[1],
+                )?;
+                Some((depth, *object_id))
+            })
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .map(|(depth, object_id)| (depth, object_id.to_string()))
     }
 
     pub(super) fn handle_viewport_keyboard_fly(&mut self, ui: &egui::Ui) -> bool {
@@ -260,6 +468,7 @@ impl SmsEditorApp {
         if self.renderer.config().show_grid {
             self.paint_grid(painter, rect);
         }
+        self.paint_selected_object_outline(painter, rect);
 
         let projection = self.camera_projection(rect);
         for object in self.viewport_marker_objects() {
@@ -307,6 +516,121 @@ impl SmsEditorApp {
             .iter()
             .flat_map(|document| document.objects.iter())
             .filter(move |object| show_all || selected_id == Some(object.id.as_str()))
+    }
+
+    pub(super) fn selected_object_outline_segments(
+        &self,
+        rect: egui::Rect,
+    ) -> Vec<[egui::Pos2; 2]> {
+        let preview = match &self.model_preview {
+            Some(preview) => preview,
+            None => return Vec::new(),
+        };
+        let model_index = match self
+            .selected_object_id
+            .as_ref()
+            .and_then(|id| preview.object_model_indices.get(id))
+            .copied()
+        {
+            Some(model_index) => model_index,
+            None => return Vec::new(),
+        };
+        let size = framebuffer_size_for_rect(rect);
+        let width = size[0];
+        let height = size[1];
+        let mut coverage = vec![false; width * height];
+        let mut coverage_bounds: Option<[usize; 4]> = None;
+
+        for triangle in preview
+            .triangles
+            .iter()
+            .filter(|triangle| triangle.model_index == model_index)
+            .filter(|triangle| {
+                !matches!(
+                    triangle.render_layer,
+                    PreviewRenderLayer::Particle | PreviewRenderLayer::ParticleDistortion
+                )
+            })
+        {
+            let Some(projected) = self.project_preview_triangle(rect, size, triangle) else {
+                continue;
+            };
+            let min_x = projected
+                .screen
+                .iter()
+                .map(|vertex| vertex.x)
+                .fold(f32::INFINITY, f32::min)
+                .floor()
+                .max(0.0) as usize;
+            let max_x = projected
+                .screen
+                .iter()
+                .map(|vertex| vertex.x)
+                .fold(f32::NEG_INFINITY, f32::max)
+                .ceil()
+                .min(width.saturating_sub(1) as f32) as usize;
+            let min_y = projected
+                .screen
+                .iter()
+                .map(|vertex| vertex.y)
+                .fold(f32::INFINITY, f32::min)
+                .floor()
+                .max(0.0) as usize;
+            let max_y = projected
+                .screen
+                .iter()
+                .map(|vertex| vertex.y)
+                .fold(f32::NEG_INFINITY, f32::max)
+                .ceil()
+                .min(height.saturating_sub(1) as f32) as usize;
+            if min_x > max_x || min_y > max_y {
+                continue;
+            }
+
+            for y in min_y..=max_y {
+                for x in min_x..=max_x {
+                    if projected_triangle_depth_at_point(
+                        projected.screen,
+                        x as f32 + 0.5,
+                        y as f32 + 0.5,
+                    )
+                    .is_some()
+                    {
+                        coverage[y * width + x] = true;
+                    }
+                }
+            }
+            coverage_bounds = Some(coverage_bounds.map_or(
+                [min_x, max_x, min_y, max_y],
+                |[old_min_x, old_max_x, old_min_y, old_max_y]| {
+                    [
+                        old_min_x.min(min_x),
+                        old_max_x.max(max_x),
+                        old_min_y.min(min_y),
+                        old_max_y.max(max_y),
+                    ]
+                },
+            ));
+        }
+
+        let Some([min_x, max_x, min_y, max_y]) = coverage_bounds else {
+            return Vec::new();
+        };
+        outline_segments_from_coverage(&coverage, size, [min_x, max_x, min_y, max_y], rect)
+    }
+
+    pub(super) fn paint_selected_object_outline(&self, painter: &egui::Painter, rect: egui::Rect) {
+        let segments = self.selected_object_outline_segments(rect);
+        let paths = outline_paths_from_segments(&segments);
+        let backing =
+            egui::Stroke::new(4.25, egui::Color32::from_rgba_unmultiplied(105, 68, 0, 185));
+        let highlight = egui::Stroke::new(2.5, egui::Color32::from_rgb(255, 198, 0));
+        for path in &paths {
+            painter.add(egui::Shape::line(path.clone(), backing));
+        }
+        for path in paths {
+            painter.add(egui::Shape::line(path, highlight));
+        }
     }
 
     pub(super) fn paint_grid(&self, painter: &egui::Painter, rect: egui::Rect) {
