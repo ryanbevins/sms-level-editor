@@ -2927,7 +2927,7 @@ impl GpuViewportTarget {
             format: GX_COLOR_FORMAT,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::TEXTURE_BINDING
-                | if features.screen_copy {
+                | if features.screen_copy || cfg!(test) {
                     wgpu::TextureUsages::COPY_SRC
                 } else {
                     wgpu::TextureUsages::empty()

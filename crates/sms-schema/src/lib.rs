@@ -4,6 +4,7 @@ mod factory_extractor;
 mod map_obj_ball_extractor;
 mod map_obj_resource_extractor;
 mod map_obj_shared_model_extractor;
+mod map_obj_stream_tev_extractor;
 mod map_obj_string_tev_extractor;
 mod source_inventory;
 
@@ -22,6 +23,7 @@ use map_obj_shared_model_extractor::{
     extract_direct_make_mactors_overrides, extract_map_obj_shared_models,
     extract_shared_model_loaders,
 };
+use map_obj_stream_tev_extractor::extract_map_obj_stream_tev_colors;
 use map_obj_string_tev_extractor::extract_nozzle_box_tev_program;
 use source_inventory::SourceInventory;
 
@@ -71,6 +73,7 @@ pub enum SchemaExtractor {
     MapObjBallTransforms,
     MapObjModelOverrides,
     MapObjStringTevPrograms,
+    MapObjStreamTevColors,
     MapObjFactoryTypes,
     MapObjFlag,
     ParticleResources,
@@ -93,6 +96,7 @@ impl std::fmt::Display for SchemaExtractor {
             Self::MapObjBallTransforms => "map-object ball transform",
             Self::MapObjModelOverrides => "map-object model override",
             Self::MapObjStringTevPrograms => "map-object string TEV program",
+            Self::MapObjStreamTevColors => "map-object stream TEV color",
             Self::MapObjFactoryTypes => "map-object factory type",
             Self::MapObjFlag => "map-object flag",
             Self::ParticleResources => "particle resource",
@@ -124,6 +128,9 @@ pub struct ObjectRegistry {
     /// Runtime string-selected material-color programs for typed map objects.
     #[serde(default)]
     pub map_obj_string_tev_programs: Vec<MapObjStringTevProgramDefinition>,
+    /// Runtime material colors read from fixed-width fields at the end of an actor stream.
+    #[serde(default)]
+    pub map_obj_stream_tev_colors: Vec<MapObjStreamTevColorDefinition>,
     /// Runtime body-radius and model-matrix corrections selected by exact actor type.
     #[serde(default)]
     pub map_obj_ball_transforms: Vec<MapObjBallTransformDefinition>,
@@ -224,6 +231,16 @@ impl ObjectRegistry {
         self.map_obj_string_tev_programs.iter().find(|definition| {
             definition.resource_name == resource_name && definition.class_name == *class_name
         })
+    }
+
+    pub fn find_map_obj_stream_tev_color(
+        &self,
+        factory_name: &str,
+    ) -> Option<&MapObjStreamTevColorDefinition> {
+        let class_name = &self.find_object(factory_name)?.class_name;
+        self.map_obj_stream_tev_colors
+            .iter()
+            .find(|definition| definition.class_name == *class_name)
     }
 
     pub fn find_map_obj_ball_transform(
@@ -409,6 +426,15 @@ pub struct MapObjStringTevProgramDefinition {
 pub struct MapObjStringTevVariantDefinition {
     pub selector_value: String,
     pub color: [i16; 4],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MapObjStreamTevColorDefinition {
+    pub class_name: String,
+    pub tev_register: u8,
+    pub trailing_rgb_u32_count: u8,
+    pub alpha: i16,
+    pub source_file: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -613,6 +639,7 @@ impl SchemaGenerator {
         self.scan_map_obj_ball_transforms(&sources, &mut registry)?;
         self.scan_map_obj_model_overrides(&sources, &mut registry)?;
         self.scan_map_obj_string_tev_programs(&sources, &mut registry)?;
+        self.scan_map_obj_stream_tev_colors(&sources, &mut registry)?;
         self.scan_params_and_assets(&sources, &mut registry)?;
         self.scan_map_static_models(&sources, &mut registry)?;
         self.scan_map_obj_flags(&sources, &mut registry)?;
@@ -978,6 +1005,31 @@ impl SchemaGenerator {
             self.repo_root.join(source_path),
             registry.map_obj_string_tev_programs.len(),
             "typed string-selected material color programs",
+        )?;
+        Ok(())
+    }
+
+    fn scan_map_obj_stream_tev_colors(
+        &self,
+        sources: &SourceInventory,
+        registry: &mut ObjectRegistry,
+    ) -> Result<()> {
+        for file in sources.files_under_any(&["src/MoveBG/"]) {
+            if file.extension() != "cpp" {
+                continue;
+            }
+            registry
+                .map_obj_stream_tev_colors
+                .extend(extract_map_obj_stream_tev_colors(
+                    file.text(),
+                    file.relative_path(),
+                ));
+        }
+        ensure_extracted(
+            SchemaExtractor::MapObjStreamTevColors,
+            self.repo_root.join("src/MoveBG"),
+            registry.map_obj_stream_tev_colors.len(),
+            "fixed-width placement-stream material colors",
         )?;
         Ok(())
     }
@@ -3077,6 +3129,19 @@ fn dedup_registry(registry: &mut ObjectRegistry) -> Result<()> {
         }
     }
     registry
+        .map_obj_stream_tev_colors
+        .sort_by(|a, b| a.class_name.cmp(&b.class_name));
+    for duplicate in registry.map_obj_stream_tev_colors.windows(2) {
+        if duplicate[0].class_name == duplicate[1].class_name {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!(
+                    "duplicate map-object stream TEV color for {}",
+                    duplicate[0].class_name
+                ),
+            });
+        }
+    }
+    registry
         .map_obj_ball_transforms
         .sort_by_key(|definition| definition.actor_type);
     for duplicate in registry.map_obj_ball_transforms.windows(2) {
@@ -3354,6 +3419,25 @@ fn validate_registry(registry: &ObjectRegistry) -> Result<()> {
                     ),
                 });
             }
+        }
+    }
+    for definition in &registry.map_obj_stream_tev_colors {
+        let matching_factory = registry
+            .objects
+            .iter()
+            .find(|object| object.class_name == definition.class_name);
+        if matching_factory.is_none_or(|object| !registry.is_map_obj_factory(&object.factory_name))
+            || definition.tev_register >= 4
+            || definition.trailing_rgb_u32_count != 3
+            || !(0..=255).contains(&definition.alpha)
+            || definition.source_file.is_empty()
+        {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!(
+                    "map-object stream TEV color for {} has an invalid binding, register, layout, alpha, or provenance",
+                    definition.class_name
+                ),
+            });
         }
     }
     for definition in &registry.map_obj_ball_transforms {
@@ -4677,6 +4761,16 @@ mod tests {
                 ("rocket_nozzle_item", [255, 0, 0, 100]),
             ])
         );
+        assert_eq!(
+            registry.map_obj_stream_tev_colors,
+            [MapObjStreamTevColorDefinition {
+                class_name: "TWaterHitPictureHideObj".to_string(),
+                tev_register: 0,
+                trailing_rgb_u32_count: 3,
+                alpha: 255,
+                source_file: "src/MoveBG/MapObjHide.cpp".to_string(),
+            }]
+        );
         for unregistered in ["telegraph_pole_l", "telegraph_pole_s", "move_ice_car"] {
             assert!(registry.find_map_obj_resource(unregistered).is_none());
         }
@@ -4799,6 +4893,7 @@ mod tests {
                 if (strcmp(name, "MapObjFlag") == 0) return new TMapObjFlag("flag");
                 if (strcmp(name, "SharedFixture") == 0) return new TMapObjBase;
                 if (strcmp(name, "NozzleBox") == 0) return new TNozzleBox("box");
+                if (strcmp(name, "FixturePaint") == 0) return new TFixturePaint("paint");
             "#,
         );
         fixture.write(
@@ -4918,6 +5013,27 @@ mod tests {
                 }
                 void TResetFruit::makeObjAppeared() {
                     (*m)[1][3] = mPosition.y + mBodyRadius;
+                }
+            "#,
+        );
+        fixture.write(
+            "include/MoveBG/FixturePaint.hpp",
+            "class TFixturePaint : public TMapObjBase {};",
+        );
+        fixture.write(
+            "src/MoveBG/FixturePaint.cpp",
+            r#"
+                void TFixturePaint::load(JSUMemoryInputStream& stream) {
+                    TMapObjBase::load(stream);
+                    u32 r, g, b;
+                    stream.read(&r, 4);
+                    stream.read(&g, 4);
+                    stream.read(&b, 4);
+                    tint0 = (u16)(u8)r;
+                    tint1 = (u16)(u8)g;
+                    tint2 = (u16)(u8)b;
+                    tint3 = 255;
+                    initPacketMatColor(getModel(), GX_TEVREG1, (GXColorS10*)&tint0);
                 }
             "#,
         );

@@ -7,6 +7,7 @@ pub(super) fn push_object_preview_materials(
     registry: Option<&ObjectRegistry>,
 ) -> usize {
     let string_tev_color = map_obj_string_tev_color(object, registry);
+    let stream_tev_color = map_obj_stream_tev_color(object, registry);
     let has_npc_colors = registry.is_some_and(|registry| {
         registry
             .npc_material_colors_for(&object.factory_name)
@@ -21,6 +22,7 @@ pub(super) fn push_object_preview_materials(
     });
     let map_obj_tev_color = map_obj_model_override_tev_color(object, registry);
     if string_tev_color.is_none()
+        && stream_tev_color.is_none()
         && !has_npc_colors
         && pollution_k_color.is_none()
         && !has_enemy_colors
@@ -34,6 +36,11 @@ pub(super) fn push_object_preview_materials(
     for mut material in source_materials {
         material.material_index = materials.len();
         if let Some(color) = string_tev_color {
+            if let Some(target) = material.tev_colors.get_mut(usize::from(color.register)) {
+                *target = color.color;
+            }
+        }
+        if let Some(color) = stream_tev_color {
             if let Some(target) = material.tev_colors.get_mut(usize::from(color.register)) {
                 *target = color.color;
             }
@@ -53,6 +60,29 @@ pub(super) fn push_object_preview_materials(
         materials.push(material);
     }
     material_base
+}
+
+pub(super) fn map_obj_stream_tev_color(
+    object: &SceneObject,
+    registry: Option<&ObjectRegistry>,
+) -> Option<sms_schema::MapObjTevColorDefinition> {
+    let definition = registry?.find_map_obj_stream_tev_color(&object.factory_name)?;
+    let component_count = usize::from(definition.trailing_rgb_u32_count);
+    if component_count != 3 {
+        return None;
+    }
+    let byte_count = component_count.checked_mul(4)?;
+    let record = object.source_record_bytes.as_deref()?;
+    let rgb = record.get(record.len().checked_sub(byte_count)?..)?;
+    let mut color = [0i16; 4];
+    for (channel, bytes) in rgb.chunks_exact(4).enumerate() {
+        color[channel] = u32::from_be_bytes(bytes.try_into().ok()?) as u8 as i16;
+    }
+    color[3] = definition.alpha;
+    Some(sms_schema::MapObjTevColorDefinition {
+        register: definition.tev_register,
+        color,
+    })
 }
 
 pub(super) fn map_obj_model_override_tev_color(

@@ -512,6 +512,49 @@ fn nozzle_box_tev_color_matches_runtime_item_type() {
 }
 
 #[test]
+fn placement_stream_rgb_reaches_the_decomp_selected_tev_register() {
+    let registry = ObjectRegistry {
+        objects: vec![sms_schema::ObjectDefinition {
+            factory_name: "FixturePaint".to_string(),
+            class_name: "TFixturePaint".to_string(),
+            category: "MapObj".to_string(),
+            source: sms_schema::SchemaSource::MarNameRefGen,
+            display_name: None,
+            preview_model: None,
+            hidden: false,
+            unsafe_to_edit: false,
+        }],
+        map_obj_stream_tev_colors: vec![sms_schema::MapObjStreamTevColorDefinition {
+            class_name: "TFixturePaint".to_string(),
+            tev_register: 2,
+            trailing_rgb_u32_count: 3,
+            alpha: 255,
+            source_file: "src/MoveBG/Fixture.cpp".to_string(),
+        }],
+        ..ObjectRegistry::default()
+    };
+    let mut object = SceneObject::new("paint", "FixturePaint");
+    object.source_record_bytes = Some(
+        [0xAA, 0xBB]
+            .into_iter()
+            .chain(0x0000_01FFu32.to_be_bytes())
+            .chain(0x0000_0078u32.to_be_bytes())
+            .chain(0x1234_5609u32.to_be_bytes())
+            .collect(),
+    );
+
+    assert_eq!(
+        map_obj_stream_tev_color(&object, Some(&registry)),
+        Some(sms_schema::MapObjTevColorDefinition {
+            register: 2,
+            color: [255, 120, 9, 255],
+        })
+    );
+    object.factory_name = "UnrelatedPaint".to_string();
+    assert_eq!(map_obj_stream_tev_color(&object, Some(&registry)), None);
+}
+
+#[test]
 #[ignore = "requires the extracted retail game"]
 fn retail_nozzle_boxes_keep_typed_items_and_tev_colors() {
     let base_root = std::env::var_os("SMS_BASE_ROOT")
