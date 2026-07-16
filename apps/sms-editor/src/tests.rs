@@ -392,6 +392,59 @@ fn selected_object_outline_keeps_the_silhouette_and_removes_internal_edges() {
 }
 
 #[test]
+fn selected_object_outline_excludes_object_shadow_geometry() {
+    let mut preview = preview_for_texture_alpha(false, false);
+    preview
+        .object_model_indices
+        .insert("selected-object".to_string(), 9);
+    for vertices in [
+        [
+            [-100.0, -100.0, 1000.0],
+            [100.0, -100.0, 1000.0],
+            [100.0, 100.0, 1000.0],
+        ],
+        [
+            [-100.0, -100.0, 1000.0],
+            [100.0, 100.0, 1000.0],
+            [-100.0, 100.0, 1000.0],
+        ],
+    ] {
+        let mut triangle = textured_blended_triangle();
+        triangle.vertices = vertices;
+        triangle.model_index = 9;
+        triangle.texture_index = None;
+        triangle.tex_coords = None;
+        preview.triangles.push(triangle);
+    }
+
+    let mut app = SmsEditorApp {
+        model_preview: Some(preview),
+        selected_object_id: Some("selected-object".to_string()),
+        ..camera_app()
+    };
+    let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 200.0));
+    let object_only_segments = app.selected_object_outline_segments(rect);
+    assert!(!object_only_segments.is_empty());
+
+    let mut shadow = textured_blended_triangle();
+    shadow.vertices = [
+        [200.0, -100.0, 1000.0],
+        [300.0, -100.0, 1000.0],
+        [250.0, 0.0, 1000.0],
+    ];
+    shadow.model_index = 9;
+    shadow.render_layer = PreviewRenderLayer::Shadow;
+    shadow.texture_index = None;
+    shadow.tex_coords = None;
+    app.model_preview.as_mut().unwrap().triangles.push(shadow);
+
+    assert_eq!(
+        app.selected_object_outline_segments(rect),
+        object_only_segments
+    );
+}
+
+#[test]
 fn selected_object_outline_merges_overlapping_polygon_coverage() {
     let size = [8, 6];
     let mut coverage = vec![false; size[0] * size[1]];
