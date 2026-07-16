@@ -960,7 +960,7 @@ pub(super) fn npc_accessory_specs(
         .raw_params
         .get("npc_parts_mask")
         .and_then(|value| value.parse::<i32>().ok())
-        .map(|value| value as u32)
+        .map(sms_formats::effective_npc_parts_mask)
     else {
         return Vec::new();
     };

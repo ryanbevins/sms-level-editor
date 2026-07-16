@@ -1120,6 +1120,12 @@ fn npc_parts_mask_uses_decomp_schema_metadata() {
     assert_eq!(parts[0].color_changes[0].material_name, "_hat");
     assert_eq!(parts[0].color_changes[0].colors1[0], [40, 50, 60, 255]);
     assert!(parts[0].uses_pollution);
+
+    // Retail NPC placements use -1 as a no-parts sentinel. The game clamps
+    // it to zero before testing the schema-derived part bits.
+    mare.raw_params
+        .insert("npc_parts_mask".to_string(), "-1".to_string().into());
+    assert!(npc_accessory_specs(&document, &mare).is_empty());
 }
 
 #[test]

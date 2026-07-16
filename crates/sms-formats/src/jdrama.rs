@@ -116,6 +116,13 @@ pub struct JDramaNpcParams {
     pub coin_flag: i32,
 }
 
+/// Applies the signed NPC parts-mask normalization used by
+/// `TBaseNPC::setIndividualDifference_` before it constructs `TNpcParts`.
+/// Retail placements use negative values as a no-parts sentinel.
+pub fn effective_npc_parts_mask(parts_mask: i32) -> u32 {
+    parts_mask.max(0) as u32
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct JDramaTransform {
     pub translation: [f32; 3],
@@ -1045,6 +1052,15 @@ mod tests {
         assert_eq!(params.parts_mask, 264);
         assert_eq!(params.action_flags, 100);
         assert!(read_npc_params(&bytes, 0, bytes.len(), "npcMonteMA").is_none());
+    }
+
+    #[test]
+    fn npc_parts_mask_clamps_negative_retail_sentinel_before_bit_tests() {
+        assert_eq!(effective_npc_parts_mask(-1), 0);
+        assert_eq!(effective_npc_parts_mask(i32::MIN), 0);
+        assert_eq!(effective_npc_parts_mask(0), 0);
+        assert_eq!(effective_npc_parts_mask(1), 1);
+        assert_eq!(effective_npc_parts_mask(i32::MAX), i32::MAX as u32);
     }
 
     #[test]

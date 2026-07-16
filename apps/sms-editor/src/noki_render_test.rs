@@ -1495,6 +1495,63 @@ fn profiles_dolpic0_preview_and_animation_updates() {
 
 #[test]
 #[ignore = "requires an extracted retail base root"]
+fn retail_dolpic_toads_respect_negative_no_parts_sentinel() {
+    let base_root = retail_base_root();
+    let decomp_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let registry = SchemaGenerator::new(decomp_root)
+        .generate()
+        .expect("generate decomp-derived NPC metadata");
+    let document = StageDocument::open(&base_root, "dolpic0")
+        .expect("open dolpic0")
+        .with_registry(registry);
+    let toads = document
+        .objects
+        .iter()
+        .filter(|object| object.factory_name == "NPCKinopio")
+        .collect::<Vec<_>>();
+
+    assert_eq!(toads.len(), 5, "dolpic0 retail Toad placement census");
+    assert_eq!(
+        toads
+            .iter()
+            .filter(|object| object.raw_param("npc_parts_mask") == Some("-1"))
+            .count(),
+        4,
+        "retail no-parts sentinel census"
+    );
+    assert!(
+        toads
+            .iter()
+            .all(|object| npc_accessory_specs(&document, object).is_empty()),
+        "negative masks must not activate the schema-derived sunglasses bit"
+    );
+
+    let preview = SmsEditorApp::build_model_preview(
+        &document,
+        PreviewVisibility {
+            environment: false,
+            goop: false,
+            effects: false,
+        },
+    )
+    .expect("build dolpic0 Toad preview");
+    for toad in toads {
+        let model_index = *preview
+            .object_model_indices
+            .get(&toad.id)
+            .expect("Toad model index");
+        let instance = preview
+            .animated_models
+            .iter()
+            .flat_map(|model| &model.instances)
+            .find(|instance| instance.model_index == model_index)
+            .expect("animated Toad instance");
+        assert!(instance.accessories.is_empty(), "{} sunglasses", toad.id);
+    }
+}
+
+#[test]
+#[ignore = "requires an extracted retail base root"]
 fn renders_maremb_body_and_accessories_to_screenshot() {
     let base_root = retail_base_root();
     let output = env::var_os(OUTPUT_ENV)
