@@ -20,6 +20,7 @@ pub(super) struct ModelPreview {
     pub(super) source_triangles: usize,
     pub(super) source_textures: usize,
     pub(super) object_model_indices: BTreeMap<String, usize>,
+    pub(super) mirror_actor_positions: BTreeMap<usize, [f32; 3]>,
     pub(super) mirror_cubes: Vec<PreviewMirrorCube>,
     pub(super) mirror_model_slots: BTreeMap<usize, usize>,
     pub(super) animated_models: Vec<AnimatedModelPreview>,

@@ -146,7 +146,7 @@ pub(super) fn render_preview_offscreen(
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("Noki rendering test encoder"),
     });
-    resources.render_scene(&mut encoder, active_mirror_slot);
+    resources.render_scene(&mut encoder, active_mirror_slot, mirror_plane_y);
     let target = resources
         .viewport_target
         .as_ref()
@@ -309,7 +309,7 @@ impl CallbackTrait for GpuViewportCallback {
         };
         if offscreen_render_required(resources.offscreen_frame_state, frame_state, invalidation) {
             resources.write_frame(queue, shared.frame, &shared.scene, mirror_plane_y);
-            resources.render_scene(egui_encoder, active_mirror_slot);
+            resources.render_scene(egui_encoder, active_mirror_slot, mirror_plane_y);
             resources.offscreen_frame_state = Some(frame_state);
         }
         Vec::new()
@@ -347,10 +347,7 @@ struct GpuTriangleLocation {
 
 impl GpuSceneData {
     fn active_mirror_slot(&self, position: [f32; 3]) -> Option<usize> {
-        self.mirror_cubes
-            .iter()
-            .find(|cube| cube.contains(position))
-            .map(|cube| cube.model_slot)
+        active_mirror_slot_for_cubes(&self.mirror_cubes, position)
     }
 
     fn target_features(&self) -> ViewportTargetFeatures {
@@ -389,13 +386,18 @@ impl GpuSceneData {
             .map(|material| GpuMaterialData::from_j3d(material, preview))
             .collect::<Vec<_>>();
         let mut fallback_materials = BTreeMap::<(usize, usize, u8, u8, u32), usize>::new();
-        let mirror_actor_models = preview
-            .object_model_indices
-            .values()
-            .copied()
-            .collect::<BTreeSet<_>>();
-        let mut batch_map =
-            BTreeMap::<(usize, usize, u8, bool, Option<usize>, GpuPipelineKey), usize>::new();
+        let mut batch_map = BTreeMap::<
+            (
+                usize,
+                usize,
+                u8,
+                bool,
+                Option<usize>,
+                Option<usize>,
+                GpuPipelineKey,
+            ),
+            usize,
+        >::new();
         let mut batches = Vec::<GpuBatchData>::new();
         let mut triangle_vertices = vec![None; preview.triangles.len()];
         let updateable_triangles = updateable_preview_triangles(preview);
@@ -432,7 +434,14 @@ impl GpuSceneData {
                 continue;
             }
             let pipeline_key = material.state.pipeline_key(triangle.render_layer);
-            let mirror_visible = triangle_is_mirror_visible(triangle, &mirror_actor_models);
+            let mirror_actor_position = preview
+                .mirror_actor_positions
+                .get(&triangle.model_index)
+                .copied();
+            let mirror_actor_model_index = mirror_actor_position.map(|_| triangle.model_index);
+            let mirror_actor_slot =
+                mirror_actor_position.and_then(|position| preview.active_mirror_slot(position));
+            let mirror_visible = triangle_is_mirror_visible(triangle, mirror_actor_position);
             let mirror_slot = (triangle.render_layer == PreviewRenderLayer::MirrorSurface)
                 .then(|| {
                     preview
@@ -448,6 +457,7 @@ impl GpuSceneData {
                     render_layer_id(triangle.render_layer),
                     mirror_visible,
                     mirror_slot,
+                    mirror_actor_model_index,
                     pipeline_key,
                 ))
                 .or_insert_with(|| {
@@ -459,6 +469,9 @@ impl GpuSceneData {
                         render_layer: triangle.render_layer,
                         mirror_visible,
                         mirror_slot,
+                        mirror_actor_model_index,
+                        mirror_actor_position,
+                        mirror_actor_slot,
                         vertices: Vec::new(),
                         indices: None,
                         updateable: false,
@@ -628,6 +641,15 @@ impl GpuSceneData {
         }
         if mirror_surface_updated {
             self.mirror_plane_y_by_slot = mirror_plane_y_by_slot_from_preview(preview);
+        }
+        for batch in &mut self.batches {
+            let Some(model_index) = batch.mirror_actor_model_index else {
+                continue;
+            };
+            batch.mirror_actor_position = preview.mirror_actor_positions.get(&model_index).copied();
+            batch.mirror_actor_slot = batch
+                .mirror_actor_position
+                .and_then(|position| active_mirror_slot_for_cubes(&self.mirror_cubes, position));
         }
         geometry_changed
     }
@@ -871,14 +893,49 @@ fn mirror_plane_y_by_slot_from_preview(preview: &ModelPreview) -> BTreeMap<usize
     planes
 }
 
+fn active_mirror_slot_for_cubes(
+    mirror_cubes: &[PreviewMirrorCube],
+    position: [f32; 3],
+) -> Option<usize> {
+    mirror_cubes
+        .iter()
+        .find(|cube| cube.contains(position))
+        .map(|cube| cube.model_slot)
+}
+
 fn triangle_is_mirror_visible(
     triangle: &PreviewTriangle,
-    mirror_actor_models: &BTreeSet<usize>,
+    mirror_actor_position: Option<[f32; 3]>,
 ) -> bool {
     triangle.render_layer == PreviewRenderLayer::MirrorScene
         || triangle.render_layer == PreviewRenderLayer::Sky
-        || (triangle.render_layer == PreviewRenderLayer::Main
-            && mirror_actor_models.contains(&triangle.model_index))
+        || (triangle.render_layer == PreviewRenderLayer::Main && mirror_actor_position.is_some())
+}
+
+// TMirrorModelManager::isUpperThanMirrorPlane keeps actors whose root is no
+// more than 50 world units behind the active plane.
+const MIRROR_ACTOR_PLANE_TOLERANCE: f32 = 50.0;
+
+fn mirror_batch_is_visible(
+    render_layer: PreviewRenderLayer,
+    mirror_actor_position: Option<[f32; 3]>,
+    mirror_actor_slot: Option<usize>,
+    active_mirror_slot: Option<usize>,
+    mirror_plane_y: Option<f32>,
+) -> bool {
+    if matches!(
+        render_layer,
+        PreviewRenderLayer::MirrorScene | PreviewRenderLayer::Sky
+    ) {
+        return true;
+    }
+    let Some(position) = mirror_actor_position else {
+        return false;
+    };
+    if mirror_actor_slot.is_none() || mirror_actor_slot != active_mirror_slot {
+        return false;
+    }
+    mirror_plane_y.is_none_or(|plane_y| position[1] + MIRROR_ACTOR_PLANE_TOLERANCE >= plane_y)
 }
 
 fn legacy_vertex_colors(triangle: &PreviewTriangle, normal: [f32; 3]) -> [[f32; 4]; 3] {
@@ -1733,6 +1790,9 @@ struct GpuBatchData {
     render_layer: PreviewRenderLayer,
     mirror_visible: bool,
     mirror_slot: Option<usize>,
+    mirror_actor_model_index: Option<usize>,
+    mirror_actor_position: Option<[f32; 3]>,
+    mirror_actor_slot: Option<usize>,
     vertices: Vec<GpuVertex>,
     indices: Option<Vec<u32>>,
     updateable: bool,
@@ -2309,9 +2369,11 @@ impl GpuViewportResources {
             let Some(data) = scene.batches.get(batch_index) else {
                 continue;
             };
-            let Some(resources) = self.batches.get(batch_index) else {
+            let Some(resources) = self.batches.get_mut(batch_index) else {
                 continue;
             };
+            resources.mirror_actor_position = data.mirror_actor_position;
+            resources.mirror_actor_slot = data.mirror_actor_slot;
             let Some(vertices) = data.vertices.get(dirty_range.clone()) else {
                 continue;
             };
@@ -2520,7 +2582,12 @@ impl GpuViewportResources {
         }
     }
 
-    fn render_scene(&self, encoder: &mut wgpu::CommandEncoder, active_mirror_slot: Option<usize>) {
+    fn render_scene(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        active_mirror_slot: Option<usize>,
+        mirror_plane_y: Option<f32>,
+    ) {
         let Some(target) = &self.viewport_target else {
             return;
         };
@@ -2570,7 +2637,15 @@ impl GpuViewportResources {
                 let Some(batch) = self.batches.get(command.batch_index) else {
                     continue;
                 };
-                if !batch.mirror_visible {
+                if !batch.mirror_visible
+                    || !mirror_batch_is_visible(
+                        batch.render_layer,
+                        batch.mirror_actor_position,
+                        batch.mirror_actor_slot,
+                        active_mirror_slot,
+                        mirror_plane_y,
+                    )
+                {
                     continue;
                 }
                 let Some(pipeline) = self.pipelines.get(&batch.pipeline_key) else {
@@ -3059,6 +3134,8 @@ struct GpuBatchResources {
     render_layer: PreviewRenderLayer,
     mirror_visible: bool,
     mirror_slot: Option<usize>,
+    mirror_actor_position: Option<[f32; 3]>,
+    mirror_actor_slot: Option<usize>,
     vertex_buffer: wgpu::Buffer,
     vertex_count: u32,
     index_buffer: Option<wgpu::Buffer>,
@@ -3081,6 +3158,8 @@ impl GpuBatchResources {
             render_layer: batch.render_layer,
             mirror_visible: batch.mirror_visible,
             mirror_slot: batch.mirror_slot,
+            mirror_actor_position: batch.mirror_actor_position,
+            mirror_actor_slot: batch.mirror_actor_slot,
             vertex_buffer: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("sms viewport J3D vertex buffer"),
                 contents: bytemuck::cast_slice(&batch.vertices),

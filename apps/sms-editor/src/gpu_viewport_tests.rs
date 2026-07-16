@@ -596,18 +596,98 @@ fn mirror_scene_includes_sky_and_actor_models_but_not_level_water() {
     let preview = geometry_update_preview();
     let level = preview.triangles[0];
     let actor = preview.triangles[1];
-    let actor_models = BTreeSet::from([actor.model_index]);
 
-    assert!(!triangle_is_mirror_visible(&level, &actor_models));
-    assert!(triangle_is_mirror_visible(&actor, &actor_models));
+    assert!(!triangle_is_mirror_visible(&level, None));
+    assert!(triangle_is_mirror_visible(&actor, Some([0.0; 3])));
 
     let mut sky = level;
     sky.render_layer = PreviewRenderLayer::Sky;
-    assert!(triangle_is_mirror_visible(&sky, &actor_models));
+    assert!(triangle_is_mirror_visible(&sky, None));
 
     let mut water = actor;
     water.render_layer = PreviewRenderLayer::Water;
-    assert!(!triangle_is_mirror_visible(&water, &actor_models));
+    assert!(!triangle_is_mirror_visible(&water, Some([0.0; 3])));
+}
+
+#[test]
+fn mirror_actor_submission_matches_runtime_cube_and_plane_checks() {
+    let position = [100.0, 950.0, 200.0];
+
+    assert!(mirror_batch_is_visible(
+        PreviewRenderLayer::Main,
+        Some(position),
+        Some(0),
+        Some(0),
+        Some(1000.0),
+    ));
+    assert!(!mirror_batch_is_visible(
+        PreviewRenderLayer::Main,
+        Some([100.0, 949.0, 200.0]),
+        Some(0),
+        Some(0),
+        Some(1000.0),
+    ));
+    assert!(!mirror_batch_is_visible(
+        PreviewRenderLayer::Main,
+        Some(position),
+        Some(1),
+        Some(0),
+        Some(1000.0),
+    ));
+    assert!(!mirror_batch_is_visible(
+        PreviewRenderLayer::Main,
+        Some(position),
+        None,
+        Some(0),
+        Some(1000.0),
+    ));
+
+    assert!(mirror_batch_is_visible(
+        PreviewRenderLayer::MirrorScene,
+        None,
+        None,
+        Some(0),
+        Some(1000.0),
+    ));
+    assert!(mirror_batch_is_visible(
+        PreviewRenderLayer::Sky,
+        None,
+        None,
+        Some(0),
+        Some(1000.0),
+    ));
+}
+
+#[test]
+fn gpu_scene_tracks_actor_root_for_mirror_submission() {
+    let mut preview = geometry_update_preview();
+    preview.triangles[0].render_layer = PreviewRenderLayer::MirrorSurface;
+    preview.mirror_model_slots.insert(1, 0);
+    preview.mirror_cubes.push(crate::PreviewMirrorCube {
+        center: [0.0, -500.0, 0.0],
+        rotation_degrees: [0.0; 3],
+        dimensions: [2000.0, 2000.0, 2000.0],
+        model_slot: 0,
+    });
+    let actor_model_index = preview.triangles[1].model_index;
+    preview
+        .mirror_actor_positions
+        .insert(actor_model_index, [0.0, -100.0, 0.0]);
+
+    let scene = GpuSceneData::from_preview(&preview);
+    let actor_batch = scene
+        .batches
+        .iter()
+        .find(|batch| batch.mirror_actor_model_index == Some(actor_model_index))
+        .expect("actor mirror batch");
+    assert_eq!(actor_batch.mirror_actor_slot, Some(0));
+    assert!(!mirror_batch_is_visible(
+        actor_batch.render_layer,
+        actor_batch.mirror_actor_position,
+        actor_batch.mirror_actor_slot,
+        Some(0),
+        Some(0.0),
+    ));
 }
 
 #[test]
@@ -686,6 +766,7 @@ fn geometry_update_preview() -> ModelPreview {
         source_triangles: 2,
         source_textures: 0,
         object_model_indices: BTreeMap::new(),
+        mirror_actor_positions: BTreeMap::new(),
         mirror_cubes: Vec::new(),
         mirror_model_slots: BTreeMap::new(),
         animated_models: Vec::new(),

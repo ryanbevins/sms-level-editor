@@ -1244,6 +1244,7 @@ fn preview_for_texture_alpha(has_alpha: bool, has_translucent_alpha: bool) -> Mo
         source_triangles: 0,
         source_textures: 1,
         object_model_indices: BTreeMap::new(),
+        mirror_actor_positions: BTreeMap::new(),
         mirror_cubes: Vec::new(),
         mirror_model_slots: BTreeMap::new(),
         animated_models: Vec::new(),
@@ -2292,6 +2293,7 @@ fn updating_object_transform_moves_cached_preview_mesh() {
             source_triangles: 1,
             source_textures: 0,
             object_model_indices,
+            mirror_actor_positions: BTreeMap::from([(7, old_transform.translation)]),
             mirror_cubes: Vec::new(),
             mirror_model_slots: BTreeMap::new(),
             animated_models: Vec::new(),
@@ -2309,6 +2311,12 @@ fn updating_object_transform_moves_cached_preview_mesh() {
     assert!(app
         .update_object_preview_transform("obj-1", old_transform, new_transform)
         .is_some());
+    assert_eq!(
+        app.model_preview
+            .as_ref()
+            .and_then(|preview| preview.mirror_actor_positions.get(&7)),
+        Some(&new_transform.translation)
+    );
     let preview = app.model_preview.as_ref().unwrap();
     let ranges = document_commands::preview_triangle_ranges_for_model(preview, "obj-1");
     assert_eq!(ranges.len(), 1);

@@ -363,6 +363,19 @@ fn bianco_mirror_surface_follows_runtime_cube_volume() {
         preview.mirror_model_slots.get(&mirror_model_index),
         Some(&0)
     );
+    let mirror_plane_y = mirror_triangles[0].vertices[0][1];
+    let bridge = document
+        .objects
+        .iter()
+        .find(|object| object.raw_param("actor_tail_string") == Some("BiaBridge"))
+        .expect("bianco6 BiaBridge placement");
+    let bridge_model_index = preview.object_model_indices[&bridge.id];
+    let bridge_position = preview.mirror_actor_positions[&bridge_model_index];
+    assert_eq!(bridge_position, bridge.transform.translation);
+    assert!(
+        bridge_position[1] + 50.0 < mirror_plane_y,
+        "BiaBridge is submerged far enough that Sunshine excludes its model from the mirror draw"
+    );
 
     let inside = [600.0, 20_000.0, -2550.0];
     let overview = [600.0, 26_000.0, -2550.0];

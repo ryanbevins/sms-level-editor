@@ -919,6 +919,7 @@ impl SmsEditorApp {
         let mut source_triangles = 0;
         let mut source_textures = 0;
         let mut object_model_indices = BTreeMap::new();
+        let mut mirror_actor_positions = BTreeMap::new();
         let mut mirror_model_slots = BTreeMap::new();
 
         for asset in models {
@@ -1162,7 +1163,16 @@ impl SmsEditorApp {
                 );
                 points.extend(grass.points);
                 triangles.extend(grass.triangles);
-                object_model_indices.extend(grass.object_model_indices);
+                for (object_id, model_index) in grass.object_model_indices {
+                    if let Some(object) = document
+                        .objects
+                        .iter()
+                        .find(|object| object.id == object_id)
+                    {
+                        mirror_actor_positions.insert(model_index, object.transform.translation);
+                    }
+                    object_model_indices.insert(object_id, model_index);
+                }
                 next_packet_index += 1;
             }
 
@@ -1219,7 +1229,16 @@ impl SmsEditorApp {
                         ..(animation.triangle_range.end + triangle_base);
                     animation
                 }));
-                object_model_indices.extend(flags.object_model_indices);
+                for (object_id, model_index) in flags.object_model_indices {
+                    if let Some(object) = document
+                        .objects
+                        .iter()
+                        .find(|object| object.id == object_id)
+                    {
+                        mirror_actor_positions.insert(model_index, object.transform.translation);
+                    }
+                    object_model_indices.insert(object_id, model_index);
+                }
                 next_packet_index += flags.packet_count;
                 material_animation_bindings.resize_with(materials.len(), Vec::new);
             }
@@ -1373,6 +1392,7 @@ impl SmsEditorApp {
             loaded_models += 1;
             let model_index = loaded_models;
             object_model_indices.insert(object.id.clone(), model_index);
+            mirror_actor_positions.insert(model_index, object_preview_transform.translation);
             source_vertices += cached.preview.positions.len();
             source_triangles += cached.preview.triangles.len();
             source_textures += cached.preview.textures.len();
@@ -1795,6 +1815,7 @@ impl SmsEditorApp {
             source_triangles,
             source_textures,
             object_model_indices,
+            mirror_actor_positions,
             mirror_cubes,
             mirror_model_slots,
             animated_models,

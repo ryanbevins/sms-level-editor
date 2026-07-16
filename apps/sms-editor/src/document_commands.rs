@@ -668,6 +668,9 @@ impl SmsEditorApp {
                 )
             })
             .unwrap_or((old_transform, new_transform));
+        preview
+            .mirror_actor_positions
+            .insert(model_index, new_preview_transform.translation);
 
         for model in &mut preview.animated_models {
             if let Some(instance) = model
