@@ -19,11 +19,10 @@ repository = "https://github.com/ryanbevins/sms-level-editor"
 anyhow = "1.0"
 bytemuck = { version = "1.25", features = ["derive"] }
 clap = { version = "4.5", features = ["derive"] }
-eframe = "0.35.0"
+eframe = { version = "0.35.0", default-features = false, features = ["accesskit", "default_fonts", "wayland", "wgpu", "x11"] }
 egui = "0.35.0"
 encoding_rs = "0.8"
 regex = "1.11"
-naga = { version = "30.0.0", features = ["wgsl-in"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
@@ -35,6 +34,12 @@ sms-formats = { path = "crates/sms-formats" }
 sms-render = { path = "crates/sms-render" }
 sms-scene = { path = "crates/sms-scene" }
 sms-schema = { path = "crates/sms-schema" }
+
+[patch.crates-io]
+# The published 0.31.10 still pins vulnerable quick-xml 0.39. The upstream
+# 0.31.10 manifest has moved to quick-xml 0.41; pin that reviewed revision
+# until the next wayland-scanner release reaches crates.io.
+wayland-scanner = { git = "https://github.com/Smithay/wayland-rs.git", rev = "249f35c8ce18c8a8000c627ffe04ac235bc0764f" }
 
 [profile.release]
 # Optimize the distributable for runtime speed while retaining the baseline

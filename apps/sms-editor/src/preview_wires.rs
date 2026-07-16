@@ -178,24 +178,30 @@ fn load_wire_definitions(document: &StageDocument) -> Vec<WireDefinition> {
                     record.offset > table.start && record.offset + record.size <= table.end
                 })
         }) {
-            let Some(transform) = record.transform else {
+            let Some(definition) = record.cube_general_info.and_then(wire_definition_from_cube)
+            else {
                 continue;
             };
-            let dimensions = transform.scale.map(|value| value * 100.0);
-            if !dimensions.iter().all(|value| value.is_finite())
-                || dimensions[2] <= 50.0
-                || dimensions[2] > 1_000_000.0
-            {
-                continue;
-            }
-            definitions.push(WireDefinition {
-                center: transform.translation,
-                rotation_degrees: transform.rotation,
-                dimensions,
-            });
+            definitions.push(definition);
         }
     }
     definitions
+}
+
+fn wire_definition_from_cube(info: sms_formats::JDramaCubeGeneralInfo) -> Option<WireDefinition> {
+    if !info.center.iter().all(|value| value.is_finite())
+        || !info.rotation_degrees.iter().all(|value| value.is_finite())
+        || !info.dimensions.iter().all(|value| value.is_finite())
+        || info.dimensions[2] <= 50.0
+        || info.dimensions[2] > 1_000_000.0
+    {
+        return None;
+    }
+    Some(WireDefinition {
+        center: info.center,
+        rotation_degrees: info.rotation_degrees,
+        dimensions: info.dimensions,
+    })
 }
 
 fn load_wire_style(document: &StageDocument) -> WireStyle {
@@ -559,10 +565,27 @@ mod tests {
     }
 
     #[test]
+    fn wire_definition_uses_explicit_cube_layout_instead_of_actor_transform() {
+        let definition = wire_definition_from_cube(sms_formats::JDramaCubeGeneralInfo {
+            center: [100.0, 200.0, 300.0],
+            rotation_degrees: [0.0, 90.0, 0.0],
+            dimensions: [400.0, 500.0, 600.0],
+            flags: 0,
+            data_no: 0,
+        })
+        .expect("valid wire cube");
+
+        assert_eq!(definition.center, [100.0, 200.0, 300.0]);
+        assert_eq!(definition.rotation_degrees, [0.0, 90.0, 0.0]);
+        assert_eq!(definition.dimensions, [400.0, 500.0, 600.0]);
+    }
+
+    #[test]
+    #[ignore = "requires SMS_BASE_ROOT with extracted retail assets"]
     fn representative_stages_load_their_wire_tables_when_assets_are_available() {
-        let Ok(base_root) = std::env::var("SMS_WIRE_TEST_BASE_ROOT") else {
-            return;
-        };
+        let base_root = std::env::var("SMS_BASE_ROOT")
+            .or_else(|_| std::env::var("SMS_WIRE_TEST_BASE_ROOT"))
+            .expect("set SMS_BASE_ROOT to an extracted retail base root");
         for (stage, expected) in [("bianco0", 13), ("mamma0", 16), ("mare0", 1)] {
             let document = StageDocument::open(&base_root, stage).unwrap();
             assert_eq!(load_wire_definitions(&document).len(), expected, "{stage}");

@@ -57,6 +57,110 @@ fn parses_section_table_and_preserves_bytes() {
 }
 
 #[test]
+fn requires_the_complete_j3d_file_header() {
+    let mut bytes = vec![0; 0x10];
+    bytes[..4].copy_from_slice(b"J3D2");
+    assert!(matches!(
+        J3dFile::parse(bytes),
+        Err(FormatError::TooSmall { .. })
+    ));
+}
+
+#[test]
+fn sections_cannot_extend_past_the_declared_file_boundary() {
+    let mut bytes = vec![0; 0x30];
+    bytes[..4].copy_from_slice(b"J3D2");
+    bytes[4..8].copy_from_slice(b"bmd3");
+    bytes[8..12].copy_from_slice(&0x28u32.to_be_bytes());
+    bytes[12..16].copy_from_slice(&1u32.to_be_bytes());
+    bytes[0x20..0x24].copy_from_slice(b"INF1");
+    bytes[0x24..0x28].copy_from_slice(&0x10u32.to_be_bytes());
+
+    assert!(matches!(
+        J3dFile::parse(bytes),
+        Err(FormatError::InvalidOffset { .. })
+    ));
+}
+
+#[test]
+fn preserves_but_does_not_parse_bytes_after_the_declared_j3d_size() {
+    let mut bytes = vec![0; 0x28];
+    bytes[..4].copy_from_slice(b"J3D2");
+    bytes[4..8].copy_from_slice(b"bmd3");
+    bytes[8..12].copy_from_slice(&0x28u32.to_be_bytes());
+    bytes[12..16].copy_from_slice(&1u32.to_be_bytes());
+    bytes[0x20..0x24].copy_from_slice(b"INF1");
+    bytes[0x24..0x28].copy_from_slice(&8u32.to_be_bytes());
+    bytes.extend_from_slice(b"unparsed tail");
+
+    let file = J3dFile::parse(&bytes).unwrap();
+    assert_eq!(file.sections().len(), 1);
+    assert_eq!(file.to_bytes(), bytes);
+}
+
+#[test]
+fn texture_offsets_cannot_read_from_preserved_trailing_bytes() {
+    let mut bytes = vec![0; 0x60];
+    bytes[..4].copy_from_slice(b"J3D2");
+    bytes[4..8].copy_from_slice(b"bmt3");
+    bytes[8..12].copy_from_slice(&0x60u32.to_be_bytes());
+    bytes[12..16].copy_from_slice(&1u32.to_be_bytes());
+    bytes[0x20..0x24].copy_from_slice(b"TEX1");
+    bytes[0x24..0x28].copy_from_slice(&0x40u32.to_be_bytes());
+    bytes[0x28..0x2A].copy_from_slice(&1u16.to_be_bytes());
+    bytes[0x2C..0x30].copy_from_slice(&0x20u32.to_be_bytes());
+    bytes[0x42..0x44].copy_from_slice(&8u16.to_be_bytes());
+    bytes[0x44..0x46].copy_from_slice(&8u16.to_be_bytes());
+    bytes.extend_from_slice(&[0; 32]);
+
+    let file = J3dFile::parse(bytes).unwrap();
+    assert!(matches!(
+        file.texture_previews(),
+        Err(FormatError::InvalidOffset { .. })
+    ));
+}
+
+#[test]
+fn tex1_repeated_headers_cannot_exceed_the_aggregate_decode_budget() {
+    let mut bytes = vec![0u8; 0xA0];
+    bytes[..4].copy_from_slice(b"J3D2");
+    bytes[4..8].copy_from_slice(b"bmt3");
+    bytes[8..12].copy_from_slice(&0xA0u32.to_be_bytes());
+    bytes[12..16].copy_from_slice(&1u32.to_be_bytes());
+    bytes[0x20..0x24].copy_from_slice(b"TEX1");
+    bytes[0x24..0x28].copy_from_slice(&0x80u32.to_be_bytes());
+    bytes[0x28..0x2A].copy_from_slice(&2u16.to_be_bytes());
+    bytes[0x2C..0x30].copy_from_slice(&0x20u32.to_be_bytes());
+
+    for (header, image_offset) in [(0x40usize, 0x40u32), (0x60, 0x20)] {
+        bytes[header + 2..header + 4].copy_from_slice(&8u16.to_be_bytes());
+        bytes[header + 4..header + 6].copy_from_slice(&8u16.to_be_bytes());
+        bytes[header + 0x18] = 1;
+        bytes[header + 0x1C..header + 0x20].copy_from_slice(&image_offset.to_be_bytes());
+    }
+
+    let file = J3dFile::parse(bytes).unwrap();
+    assert!(matches!(
+        file.texture_previews_with_limits(2, 8 * 8 * 4 * 2),
+        Err(FormatError::ResourceLimit {
+            resource: "TEX1 retained decoded texture bytes",
+            requested: 1024,
+            limit: 512,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn gx_primitive_commands_report_nonzero_vat_indices() {
+    assert_eq!(gx_primitive_opcode(GX_DRAW_TRIANGLES).unwrap(), 0x90);
+    assert!(matches!(
+        gx_primitive_opcode(GX_DRAW_TRIANGLES | 1),
+        Err(FormatError::Unsupported { .. })
+    ));
+}
+
+#[test]
 fn accepts_retail_texture_only_bmt_with_overreported_block_count() {
     let mut bytes = vec![0u8; 0x28];
     bytes[0..4].copy_from_slice(b"J3D2");
@@ -618,7 +722,7 @@ fn precomputed_joint_matrices_preserve_direct_draw_matrix_selection() {
             offset: 0,
             size: bytes.len() as u32,
         }],
-        bytes: bytes.into(),
+        bytes: J3dSource::full(bytes.into()),
     };
     let identity = identity_mtx34();
     let mut translated = identity;
@@ -640,7 +744,7 @@ fn draw_matrix_refactor_preserves_joint_only_models() {
             section_count: 0,
         },
         sections: Vec::new(),
-        bytes: Arc::from([]),
+        bytes: J3dSource::full(Arc::from([])),
     };
     let joint_matrices = file.preview_joint_matrices(0, None, &[]).unwrap();
 
@@ -662,14 +766,14 @@ fn prepared_source_guard_survives_j3d_file_clone() {
     bytes.extend_from_slice(&8u32.to_be_bytes());
     let file = J3dFile::parse(&bytes).unwrap();
     let prepared = J3dPreparedAnimatedTriangles {
-        source: PreparedModelSource(Arc::clone(&file.bytes)),
+        source: PreparedModelSource(file.bytes.clone()),
         packets: Vec::new(),
         source_triangle_count: 0,
         max_packet_vertex_count: 0,
     };
 
     let cloned = file.clone();
-    assert!(Arc::ptr_eq(&file.bytes, &cloned.bytes));
+    assert!(Arc::ptr_eq(&file.bytes.source, &cloned.bytes.source));
     assert!(cloned.prepared_animation_source_matches(&prepared));
 
     let independently_parsed = J3dFile::parse(&bytes).unwrap();
@@ -756,7 +860,7 @@ fn prepared_display_lists_match_legacy_pose_and_topology_exactly() {
     let source_triangle_count = prepared_display_list.triangle_indices.len();
     let max_packet_vertex_count = prepared_display_list.vertices.len();
     let prepared = J3dPreparedAnimatedTriangles {
-        source: PreparedModelSource(Arc::from([])),
+        source: PreparedModelSource(J3dSource::full(Arc::from([]))),
         packets: vec![PreparedAnimatedPacket {
             vertices: prepared_display_list.vertices,
             triangle_indices: prepared_display_list.triangle_indices,

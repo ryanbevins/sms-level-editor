@@ -1,10 +1,18 @@
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
-use crate::{decode_yaz0, FormatError, RarcArchive, Result};
+use crate::{decode_yaz0, FormatError, PreserveBytes, RarcArchive, Result};
+
+const ARCHIVE_CACHE_CAPACITY: usize = 8;
+const ARCHIVE_CACHE_MAX_BYTES: usize = 512 * 1024 * 1024;
+const ARCHIVE_STABLE_READ_ATTEMPTS: usize = 3;
+static ARCHIVE_CACHE: OnceLock<Mutex<ArchiveCache>> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StageAssetKind {
@@ -49,12 +57,11 @@ pub fn scan_stage_assets(base_root: impl AsRef<Path>, stage_id: &str) -> Result<
     let scene_archives = discover_scene_archives(base_root)?;
     let selected_archives = select_scene_archives(&scene_archives, &needle)?;
 
-    for entry in WalkDir::new(base_root)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(std::result::Result::ok)
-        .filter(|entry| entry.file_type().is_file())
-    {
+    for entry in WalkDir::new(base_root).follow_links(false) {
+        let entry = entry.map_err(walk_error)?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
         let path = entry.path();
         if is_repo_workspace_file(base_root, path) {
             continue;
@@ -99,12 +106,11 @@ pub fn discover_scene_archives(base_root: impl AsRef<Path>) -> Result<Vec<SceneA
     }
 
     let mut archives = Vec::new();
-    for entry in WalkDir::new(base_root)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(std::result::Result::ok)
-        .filter(|entry| entry.file_type().is_file())
-    {
+    for entry in WalkDir::new(base_root).follow_links(false) {
+        let entry = entry.map_err(walk_error)?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
         let path = entry.path();
         if is_repo_workspace_file(base_root, path) || !is_archive_path(path) {
             continue;
@@ -133,7 +139,7 @@ pub fn discover_scene_archives(base_root: impl AsRef<Path>) -> Result<Vec<SceneA
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|_| path.to_path_buf()),
             path: path.to_path_buf(),
-            size_bytes: entry.metadata().map(|metadata| metadata.len()).unwrap_or(0),
+            size_bytes: entry.metadata().map_err(walk_error)?.len(),
         });
     }
 
@@ -143,16 +149,9 @@ pub fn discover_scene_archives(base_root: impl AsRef<Path>) -> Result<Vec<SceneA
 
 pub fn mount_scene_archive(path: impl AsRef<Path>) -> Result<Vec<StageAsset>> {
     let path = path.as_ref();
-    let source = fs::read(path)?;
-    let archive_bytes = if source.starts_with(b"Yaz0") {
-        decode_yaz0(&source)?
-    } else {
-        source
-    };
-
-    let archive = RarcArchive::parse(&archive_bytes)?;
+    let archive = load_scene_archive(path)?;
     let mut assets = Vec::new();
-    for entry in archive.files()? {
+    for entry in archive.file_entries() {
         let virtual_path = format!("{}!/{}", path.display(), entry.path);
         let virtual_path = PathBuf::from(virtual_path);
         assets.push(StageAsset {
@@ -178,15 +177,172 @@ pub fn extract_archive_file(
     archive_path: impl AsRef<Path>,
     internal_path: impl AsRef<str>,
 ) -> Result<Vec<u8>> {
-    let source = fs::read(archive_path)?;
+    let archive = load_scene_archive(archive_path.as_ref())?;
+    archive.file_bytes(internal_path.as_ref())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ArchiveStamp {
+    len: u64,
+    modified: SystemTime,
+}
+
+#[derive(Debug)]
+struct CachedArchive {
+    path: PathBuf,
+    stamp: ArchiveStamp,
+    last_used: u64,
+    size_bytes: usize,
+    archive: Arc<RarcArchive>,
+}
+
+#[derive(Debug, Default)]
+struct ArchiveCache {
+    entries: Vec<CachedArchive>,
+    clock: u64,
+    size_bytes: usize,
+}
+
+struct StableArchiveRead {
+    archive: Arc<RarcArchive>,
+    cache_stamp: Option<ArchiveStamp>,
+}
+
+impl ArchiveCache {
+    fn get(&mut self, path: &Path, stamp: ArchiveStamp) -> Option<Arc<RarcArchive>> {
+        let index = self.entries.iter().position(|entry| entry.path == path)?;
+        if self.entries[index].stamp != stamp {
+            let removed = self.entries.swap_remove(index);
+            self.size_bytes = self.size_bytes.saturating_sub(removed.size_bytes);
+            return None;
+        }
+        self.clock = self.clock.wrapping_add(1);
+        self.entries[index].last_used = self.clock;
+        Some(Arc::clone(&self.entries[index].archive))
+    }
+
+    fn insert(&mut self, path: PathBuf, stamp: ArchiveStamp, archive: Arc<RarcArchive>) {
+        self.clock = self.clock.wrapping_add(1);
+        let size_bytes = archive.source_bytes().len();
+        if let Some(index) = self.entries.iter().position(|entry| entry.path == path) {
+            let removed = self.entries.swap_remove(index);
+            self.size_bytes = self.size_bytes.saturating_sub(removed.size_bytes);
+        }
+        if size_bytes > ARCHIVE_CACHE_MAX_BYTES {
+            return;
+        }
+        while !self.entries.is_empty()
+            && (self.entries.len() >= ARCHIVE_CACHE_CAPACITY
+                || self.size_bytes.saturating_add(size_bytes) > ARCHIVE_CACHE_MAX_BYTES)
+        {
+            let oldest = self
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(index, _)| index)
+                .expect("a non-empty archive cache has an oldest entry");
+            let removed = self.entries.swap_remove(oldest);
+            self.size_bytes = self.size_bytes.saturating_sub(removed.size_bytes);
+        }
+        self.size_bytes = self.size_bytes.saturating_add(size_bytes);
+        self.entries.push(CachedArchive {
+            path,
+            stamp,
+            last_used: self.clock,
+            size_bytes,
+            archive,
+        });
+    }
+}
+
+fn load_scene_archive(path: &Path) -> Result<Arc<RarcArchive>> {
+    let path = fs::canonicalize(path)?;
+    let stamp = archive_stamp(&path)?;
+    if let Some(archive) = archive_cache()?.get(&path, stamp) {
+        return Ok(archive);
+    }
+
+    let loaded = read_scene_archive_stably(
+        &path,
+        |path| fs::read(path).map_err(FormatError::from),
+        archive_stamp,
+    )?;
+    if let Some(stamp) = loaded.cache_stamp {
+        archive_cache()?.insert(path, stamp, Arc::clone(&loaded.archive));
+    }
+    Ok(loaded.archive)
+}
+
+fn read_scene_archive_stably<ReadSource, ReadStamp>(
+    path: &Path,
+    mut read_source: ReadSource,
+    mut read_stamp: ReadStamp,
+) -> Result<StableArchiveRead>
+where
+    ReadSource: FnMut(&Path) -> Result<Vec<u8>>,
+    ReadStamp: FnMut(&Path) -> Result<ArchiveStamp>,
+{
+    let mut latest_source = None;
+    for _ in 0..ARCHIVE_STABLE_READ_ATTEMPTS {
+        let before = read_stamp(path)?;
+        let source = read_source(path)?;
+        let after = read_stamp(path)?;
+        if before == after {
+            return Ok(StableArchiveRead {
+                archive: parse_scene_archive_source(source)?,
+                cache_stamp: Some(after),
+            });
+        }
+        latest_source = Some(source);
+    }
+
+    let source = latest_source.ok_or_else(|| FormatError::Unsupported {
+        format: "stage archive cache",
+        message: "no archive read attempts were made".to_string(),
+    })?;
+    Ok(StableArchiveRead {
+        archive: parse_scene_archive_source(source)?,
+        cache_stamp: None,
+    })
+}
+
+fn parse_scene_archive_source(source: Vec<u8>) -> Result<Arc<RarcArchive>> {
     let archive_bytes = if source.starts_with(b"Yaz0") {
         decode_yaz0(&source)?
     } else {
         source
     };
+    Ok(Arc::new(RarcArchive::parse(archive_bytes)?))
+}
 
-    let archive = RarcArchive::parse(&archive_bytes)?;
-    archive.file_bytes(internal_path.as_ref())
+fn archive_stamp(path: &Path) -> Result<ArchiveStamp> {
+    let metadata = fs::metadata(path)?;
+    Ok(ArchiveStamp {
+        len: metadata.len(),
+        modified: metadata.modified()?,
+    })
+}
+
+fn archive_cache() -> Result<std::sync::MutexGuard<'static, ArchiveCache>> {
+    ARCHIVE_CACHE
+        .get_or_init(|| Mutex::new(ArchiveCache::default()))
+        .lock()
+        .map_err(|_| FormatError::Unsupported {
+            format: "stage archive cache",
+            message: "archive cache lock was poisoned".to_string(),
+        })
+}
+
+fn walk_error(error: walkdir::Error) -> FormatError {
+    let kind = error
+        .io_error()
+        .map(|source| source.kind())
+        .unwrap_or(io::ErrorKind::Other);
+    FormatError::Io(io::Error::new(
+        kind,
+        format!("failed while traversing stage assets: {error}"),
+    ))
 }
 
 fn select_scene_archives<'a>(
@@ -301,6 +457,10 @@ fn is_repo_workspace_file(base_root: &Path, path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    static TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn groups_scene_names_by_prefix() {
@@ -321,6 +481,124 @@ mod tests {
     fn fuzzy_scene_archive_match_rejects_ambiguous_stage_ids() {
         let archives = vec![scene("dolpic0"), scene("dolpic1"), scene("bianco0")];
         assert!(select_scene_archives(&archives, "dolpic").is_err());
+    }
+
+    #[test]
+    fn repeated_archive_loads_reuse_the_parsed_archive() {
+        let path = temporary_archive_path();
+        fs::write(&path, minimal_rarc()).unwrap();
+
+        let first = load_scene_archive(&path).unwrap();
+        let second = load_scene_archive(&path).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn archive_cache_is_invalidated_when_file_length_changes() {
+        let path = temporary_archive_path();
+        fs::write(&path, minimal_rarc()).unwrap();
+        let first = load_scene_archive(&path).unwrap();
+
+        let mut changed = minimal_rarc();
+        changed.push(0);
+        fs::write(&path, changed).unwrap();
+        let second = load_scene_archive(&path).unwrap();
+        assert!(!Arc::ptr_eq(&first, &second));
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn racing_read_is_only_cacheable_under_the_matching_stamp() {
+        let path = Path::new("injected-racing-archive.arc");
+        let old_source = minimal_rarc_with_tail(b'A');
+        let new_source = minimal_rarc_with_tail(b'B');
+        let old_stamp = test_stamp(old_source.len(), 1);
+        let new_stamp = test_stamp(new_source.len(), 2);
+        let mut sources = [old_source, new_source.clone()].into_iter();
+        let mut stamps = [old_stamp, new_stamp, new_stamp, new_stamp].into_iter();
+
+        let loaded = read_scene_archive_stably(
+            path,
+            |_| Ok(sources.next().expect("one source per read attempt")),
+            |_| Ok(stamps.next().expect("two stamps per read attempt")),
+        )
+        .unwrap();
+
+        assert_eq!(loaded.archive.source_bytes(), new_source);
+        assert_eq!(loaded.cache_stamp, Some(new_stamp));
+
+        let mut cache = ArchiveCache::default();
+        cache.insert(
+            path.to_path_buf(),
+            loaded.cache_stamp.unwrap(),
+            Arc::clone(&loaded.archive),
+        );
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.entries[0].stamp, new_stamp);
+        assert_eq!(cache.entries[0].archive.source_bytes(), new_source);
+    }
+
+    #[test]
+    fn continuously_changing_archive_is_parsed_but_not_cached() {
+        let path = Path::new("injected-unstable-archive.arc");
+        let sources = [
+            minimal_rarc_with_tail(b'A'),
+            minimal_rarc_with_tail(b'B'),
+            minimal_rarc_with_tail(b'C'),
+        ];
+        let expected = sources[2].clone();
+        let mut sources = sources.into_iter();
+        let stamps = [
+            test_stamp(0x21, 1),
+            test_stamp(0x21, 2),
+            test_stamp(0x21, 2),
+            test_stamp(0x21, 3),
+            test_stamp(0x21, 3),
+            test_stamp(0x21, 4),
+        ];
+        let mut stamps = stamps.into_iter();
+
+        let loaded = read_scene_archive_stably(
+            path,
+            |_| Ok(sources.next().expect("one source per read attempt")),
+            |_| Ok(stamps.next().expect("two stamps per read attempt")),
+        )
+        .unwrap();
+
+        assert_eq!(loaded.archive.source_bytes(), expected);
+        assert_eq!(loaded.cache_stamp, None);
+    }
+
+    fn temporary_archive_path() -> PathBuf {
+        let id = TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "sms-formats-stage-assets-{}-{id}.arc",
+            std::process::id()
+        ))
+    }
+
+    fn minimal_rarc() -> Vec<u8> {
+        let mut bytes = vec![0; 0x20];
+        bytes[..4].copy_from_slice(b"RARC");
+        bytes[4..8].copy_from_slice(&0x20u32.to_be_bytes());
+        bytes[8..12].copy_from_slice(&0x20u32.to_be_bytes());
+        bytes
+    }
+
+    fn minimal_rarc_with_tail(marker: u8) -> Vec<u8> {
+        let mut bytes = minimal_rarc();
+        bytes.push(marker);
+        bytes
+    }
+
+    fn test_stamp(len: usize, seconds: u64) -> ArchiveStamp {
+        ArchiveStamp {
+            len: len as u64,
+            modified: SystemTime::UNIX_EPOCH + Duration::from_secs(seconds),
+        }
     }
 
     fn scene(stage_id: &str) -> SceneArchiveInfo {

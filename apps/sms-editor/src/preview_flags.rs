@@ -37,13 +37,12 @@ pub(super) fn build_procedural_flag_preview(
 
     for definition in &registry.map_obj_flags {
         let flutter_speed = runtime_flag_flutter_speed(document, definition);
-        for object in document.objects.iter().filter(|object| {
-            object
-                .factory_name
-                .eq_ignore_ascii_case(&definition.factory_name)
-        }) {
-            let resource_key = format!("stream_string_{}", definition.resource_name_stream_index);
-            let Some(resource_name) = object.raw_params.get(&resource_key) else {
+        for object in document
+            .objects
+            .iter()
+            .filter(|object| flag_definition_matches_object(object, definition))
+        {
+            let Some(resource_name) = flag_resource_name(object, definition) else {
                 continue;
             };
             if !definition
@@ -69,7 +68,7 @@ pub(super) fn build_procedural_flag_preview(
                     let Ok(mut texture) = decode_bti_texture(bytes) else {
                         continue;
                     };
-                    texture.name = resource_name.clone();
+                    texture.name = resource_name.to_string();
                     let texture_index =
                         push_j3d_preview_textures(textures, std::slice::from_ref(&texture));
                     let material_index = materials.len();
@@ -132,6 +131,31 @@ pub(super) fn build_procedural_flag_preview(
     preview.source_textures = texture_cache.len();
     preview.packet_count = texture_cache.len();
     preview
+}
+
+fn flag_resource_name<'a>(
+    object: &'a SceneObject,
+    definition: &sms_schema::MapObjFlagDefinition,
+) -> Option<&'a str> {
+    let resource_key = format!("stream_string_{}", definition.resource_name_stream_index);
+    if definition.resource_name_stream_index == 0 {
+        // TMapObjFlag::load reads its texture resource after TMapObjBase's
+        // common TActor stream, so the first subclass string is the authored
+        // selector. Keep stream_string_0 only for older overlays and synthetic
+        // objects created before actor_tail_string was exposed.
+        object
+            .raw_param("actor_tail_string")
+            .or_else(|| object.raw_param(&resource_key))
+    } else {
+        object.raw_param(&resource_key)
+    }
+}
+
+fn flag_definition_matches_object(
+    object: &SceneObject,
+    definition: &sms_schema::MapObjFlagDefinition,
+) -> bool {
+    object.factory_name == definition.factory_name
 }
 
 fn find_flag_texture_asset<'a>(
@@ -599,16 +623,39 @@ mod tests {
             load_issues: Vec::new(),
             lighting: Default::default(),
             actor_previews: BTreeMap::new(),
+            loaded_project: None,
         };
-        document.objects[0]
-            .raw_params
-            .insert("stream_string_0".to_string(), "derivedTexture".to_string());
+        document.objects[0].raw_params.insert(
+            "stream_string_0".to_string(),
+            "derivedTexture".to_string().into(),
+        );
 
         let preview =
             build_procedural_flag_preview(&document, 1, 2, &mut Vec::new(), &mut Vec::new());
         assert_eq!(
             preview.flag_count, 0,
             "the non-schema factory must not match"
+        );
+        assert!(flag_definition_matches_object(
+            &SceneObject::new("exact", "DerivedFlagFactory"),
+            &definition()
+        ));
+        assert!(!flag_definition_matches_object(
+            &SceneObject::new("wrong-case", "derivedflagfactory"),
+            &definition()
+        ));
+    }
+
+    #[test]
+    fn flag_texture_selector_prefers_the_subclass_tail_over_actor_character() {
+        let definition = definition();
+        let mut object = SceneObject::new("flag", "DerivedFlagFactory");
+        object.set_raw_param("stream_string_0", "shared flag character");
+        object.set_raw_param("actor_tail_string", "derivedTexture");
+
+        assert_eq!(
+            flag_resource_name(&object, &definition),
+            Some("derivedTexture")
         );
     }
 
@@ -626,10 +673,11 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires SMS_BASE_ROOT with extracted retail assets"]
     fn dolpic_flags_use_retail_bti_assets_when_available() {
-        let Ok(base_root) = std::env::var("SMS_FLAG_TEST_BASE_ROOT") else {
-            return;
-        };
+        let base_root = std::env::var("SMS_BASE_ROOT")
+            .or_else(|_| std::env::var("SMS_FLAG_TEST_BASE_ROOT"))
+            .expect("set SMS_BASE_ROOT to an extracted retail base root");
         let decomp_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
         let registry = SchemaGenerator::new(decomp_root)
             .generate()
@@ -649,12 +697,12 @@ mod tests {
         let placed_flags = document
             .objects
             .iter()
-            .filter(|object| object.factory_name.eq_ignore_ascii_case("MapObjFlag"))
+            .filter(|object| object.factory_name == "MapObjFlag")
             .count();
         let rendered_flags = document
             .objects
             .iter()
-            .filter(|object| object.factory_name.eq_ignore_ascii_case("MapObjFlag"))
+            .filter(|object| object.factory_name == "MapObjFlag")
             .filter(|object| preview.object_model_indices.contains_key(&object.id))
             .count();
         let flag_materials = preview

@@ -1,9 +1,129 @@
 use super::*;
 
+impl ObjectUndoRecord {
+    #[cfg(test)]
+    fn between(before: &[SceneObject], after: &[SceneObject]) -> Self {
+        let before_by_id = before
+            .iter()
+            .enumerate()
+            .map(|(index, object)| (object.id.as_str(), (index, object)))
+            .collect::<BTreeMap<_, _>>();
+        let after_by_id = after
+            .iter()
+            .enumerate()
+            .map(|(index, object)| (object.id.as_str(), (index, object)))
+            .collect::<BTreeMap<_, _>>();
+        let mut deltas = Vec::new();
+        for (id, (index, object)) in &before_by_id {
+            match after_by_id.get(id) {
+                None => deltas.push(ObjectDelta::Remove {
+                    index: *index,
+                    object: (*object).clone(),
+                }),
+                Some((_, after)) if *object != *after => deltas.push(ObjectDelta::Update {
+                    before: Box::new((*object).clone()),
+                    after: Box::new((*after).clone()),
+                }),
+                Some(_) => {}
+            }
+        }
+        for (id, (index, object)) in after_by_id {
+            if !before_by_id.contains_key(id) {
+                deltas.push(ObjectDelta::Insert {
+                    index,
+                    object: object.clone(),
+                });
+            }
+        }
+        Self { deltas }
+    }
+
+    fn apply_forward(&self, objects: &mut Vec<SceneObject>) {
+        let mut removals = self
+            .deltas
+            .iter()
+            .filter_map(|delta| match delta {
+                ObjectDelta::Remove { index, object } => Some((*index, object)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        removals.sort_by_key(|(index, _)| std::cmp::Reverse(*index));
+        for (index, object) in removals {
+            remove_object_delta(objects, index, &object.id);
+        }
+        for delta in &self.deltas {
+            if let ObjectDelta::Update { before, after } = delta {
+                replace_object_delta(objects, &before.id, after.as_ref().clone());
+            }
+        }
+        let mut inserts = self
+            .deltas
+            .iter()
+            .filter_map(|delta| match delta {
+                ObjectDelta::Insert { index, object } => Some((*index, object)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        inserts.sort_by_key(|(index, _)| *index);
+        for (index, object) in inserts {
+            objects.insert(index.min(objects.len()), object.clone());
+        }
+    }
+
+    fn apply_reverse(&self, objects: &mut Vec<SceneObject>) {
+        let mut inserted = self
+            .deltas
+            .iter()
+            .filter_map(|delta| match delta {
+                ObjectDelta::Insert { index, object } => Some((*index, object)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        inserted.sort_by_key(|(index, _)| std::cmp::Reverse(*index));
+        for (index, object) in inserted {
+            remove_object_delta(objects, index, &object.id);
+        }
+        for delta in &self.deltas {
+            if let ObjectDelta::Update { before, after } = delta {
+                replace_object_delta(objects, &after.id, before.as_ref().clone());
+            }
+        }
+        let mut removed = self
+            .deltas
+            .iter()
+            .filter_map(|delta| match delta {
+                ObjectDelta::Remove { index, object } => Some((*index, object)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        removed.sort_by_key(|(index, _)| *index);
+        for (index, object) in removed {
+            objects.insert(index.min(objects.len()), object.clone());
+        }
+    }
+}
+
+fn remove_object_delta(objects: &mut Vec<SceneObject>, expected_index: usize, id: &str) {
+    let index = objects
+        .get(expected_index)
+        .filter(|object| object.id == id)
+        .map(|_| expected_index)
+        .or_else(|| objects.iter().position(|object| object.id == id));
+    if let Some(index) = index {
+        objects.remove(index);
+    }
+}
+
+fn replace_object_delta(objects: &mut [SceneObject], id: &str, replacement: SceneObject) {
+    if let Some(object) = objects.iter_mut().find(|object| object.id == id) {
+        *object = replacement;
+    }
+}
+
 impl SmsEditorApp {
     pub(super) fn validate(&mut self) {
         if let Some(document) = &self.document {
-            self.issues = document.validate();
+            self.issues = validation_issues_for_preview(document, self.model_preview.as_ref());
             self.log.push(format!(
                 "Validation produced {} issue(s).",
                 self.issues.len()
@@ -21,10 +141,6 @@ impl SmsEditorApp {
 
     pub(super) fn save_project(&mut self) -> bool {
         if let Some(document) = &mut self.document {
-            if let Err(err) = document.queue_editor_overlay_change() {
-                self.log.push(format!("Scene overlay export failed: {err}"));
-                return false;
-            }
             self.issues = document.validate();
             if self
                 .issues
@@ -37,16 +153,27 @@ impl SmsEditorApp {
             }
         }
 
-        let result = match &self.document {
-            Some(document) => match document.save_project_folder(PathBuf::from(&self.project_root))
-            {
-                Ok(manifest) => {
+        let project_root = self.project_root.trim().to_string();
+        if project_root.is_empty() {
+            self.log.push("Project folder is required.".to_string());
+            return false;
+        }
+        let result = match &mut self.document {
+            Some(document) => match document.save_project_folder(PathBuf::from(project_root)) {
+                Ok(outcome) => {
                     self.saved_objects = document.objects.clone();
                     self.document_dirty = false;
                     self.log.push(format!(
                         "Saved editor project with {} file(s).",
-                        manifest.changed_files.len()
+                        outcome.manifest.changed_files.len()
                     ));
+                    for warning in outcome.warnings {
+                        self.log.push(format!(
+                            "Project save warning (recovery path {}): {}",
+                            warning.recovery_path.display(),
+                            warning.message
+                        ));
+                    }
                     true
                 }
                 Err(err) => {
@@ -105,7 +232,16 @@ impl SmsEditorApp {
             }
         }
 
-        self.mutate_document("Added object", |document| document.add_object(object));
+        let index = self
+            .document
+            .as_ref()
+            .map_or(0, |document| document.objects.len());
+        self.apply_object_edit(
+            "Added object",
+            ObjectUndoRecord {
+                deltas: vec![ObjectDelta::Insert { index, object }],
+            },
+        );
         self.selected_object_id = Some(id);
         self.rebuild_model_preview_from_document();
     }
@@ -125,7 +261,19 @@ impl SmsEditorApp {
         clone.id = id.clone();
         clone.transform.translation[0] += self.snap_translation.max(25.0);
         clone.transform.translation[2] += self.snap_translation.max(25.0);
-        self.mutate_document("Duplicated object", |document| document.add_object(clone));
+        let index = self
+            .document
+            .as_ref()
+            .map_or(0, |document| document.objects.len());
+        self.apply_object_edit(
+            "Duplicated object",
+            ObjectUndoRecord {
+                deltas: vec![ObjectDelta::Insert {
+                    index,
+                    object: clone,
+                }],
+            },
+        );
         self.selected_object_id = Some(id);
         self.rebuild_model_preview_from_document();
     }
@@ -134,9 +282,22 @@ impl SmsEditorApp {
         let Some(selected_id) = self.selected_object_id.clone() else {
             return;
         };
-        self.mutate_document("Deleted object", |document| {
-            document.objects.retain(|object| object.id != selected_id);
-        });
+        let Some((index, object)) = self.document.as_ref().and_then(|document| {
+            document
+                .objects
+                .iter()
+                .enumerate()
+                .find(|(_, object)| object.id == selected_id)
+                .map(|(index, object)| (index, object.clone()))
+        }) else {
+            return;
+        };
+        self.apply_object_edit(
+            "Deleted object",
+            ObjectUndoRecord {
+                deltas: vec![ObjectDelta::Remove { index, object }],
+            },
+        );
         self.selected_object_id = None;
         self.rebuild_model_preview_from_document();
     }
@@ -151,15 +312,20 @@ impl SmsEditorApp {
         if old_transform == transform {
             return;
         }
-        self.mutate_document("Updated transform", |document| {
-            if let Some(object) = document
-                .objects
-                .iter_mut()
-                .find(|object| object.id == selected_id)
-            {
-                object.transform = transform;
-            }
-        });
+        let Some(before) = self.selected_object().cloned() else {
+            return;
+        };
+        let mut after = before.clone();
+        after.transform = transform;
+        self.apply_object_edit(
+            "Updated transform",
+            ObjectUndoRecord {
+                deltas: vec![ObjectDelta::Update {
+                    before: Box::new(before),
+                    after: Box::new(after),
+                }],
+            },
+        );
         let has_rendered_model = self
             .model_preview
             .as_ref()
@@ -199,13 +365,29 @@ impl SmsEditorApp {
         self.update_selected_transform(object.transform);
     }
 
+    #[cfg(test)]
     pub(super) fn mutate_document(&mut self, label: &str, mutate: impl FnOnce(&mut StageDocument)) {
         let in_transaction = self.undo_transaction.is_some();
-        if !in_transaction {
-            self.push_undo_snapshot();
-        }
+        let before = if in_transaction {
+            None
+        } else {
+            self.document
+                .as_ref()
+                .map(|document| document.objects.clone())
+        };
         if let Some(document) = &mut self.document {
             mutate(document);
+        }
+        let undo_record = if in_transaction {
+            None
+        } else {
+            before
+                .as_ref()
+                .zip(self.document.as_ref())
+                .map(|(before, document)| ObjectUndoRecord::between(before, &document.objects))
+        };
+        if let Some(record) = undo_record {
+            self.push_undo_record(record);
         }
         self.document_dirty = if in_transaction {
             true
@@ -220,6 +402,27 @@ impl SmsEditorApp {
         }
     }
 
+    fn apply_object_edit(&mut self, label: &str, record: ObjectUndoRecord) {
+        if record.deltas.is_empty() {
+            return;
+        }
+        let in_transaction = self.undo_transaction.is_some();
+        let Some(document) = &mut self.document else {
+            return;
+        };
+        record.apply_forward(&mut document.objects);
+        self.document_dirty = if in_transaction {
+            true
+        } else {
+            document.objects != self.saved_objects
+        };
+        if !in_transaction {
+            self.push_undo_record(record);
+            self.flush_document_change();
+            self.log.push(format!("{label}."));
+        }
+    }
+
     fn flush_document_change(&mut self) {
         let Some(document) = &mut self.document else {
             return;
@@ -227,88 +430,112 @@ impl SmsEditorApp {
         if let Err(err) = document.queue_editor_overlay_change() {
             self.log.push(format!("Scene overlay update failed: {err}"));
         }
-        self.issues = document.validate();
+        self.issues = validation_issues_for_preview(document, self.model_preview.as_ref());
     }
 
     pub(super) fn begin_undo_transaction(&mut self) {
         if self.undo_transaction.is_none() {
-            self.undo_transaction = self
-                .document
-                .as_ref()
-                .map(|document| document.objects.clone());
+            self.undo_transaction = self.selected_object_id.as_ref().and_then(|selected_id| {
+                self.document.as_ref().and_then(|document| {
+                    document
+                        .objects
+                        .iter()
+                        .enumerate()
+                        .find(|(_, object)| &object.id == selected_id)
+                        .map(|(index, object)| ObjectUndoTransaction {
+                            index,
+                            before: object.clone(),
+                        })
+                })
+            });
         }
     }
 
     pub(super) fn commit_undo_transaction(&mut self, label: &str) {
-        let Some(before) = self.undo_transaction.take() else {
+        let Some(transaction) = self.undo_transaction.take() else {
             return;
         };
         if let Some(preview) = &mut self.model_preview {
             recompute_model_preview_bounds(preview);
         }
-        let changed = self
-            .document
-            .as_ref()
-            .is_some_and(|document| document.objects != before);
+        let record = self.document.as_ref().map(|document| {
+            if let Some(after) = document
+                .objects
+                .iter()
+                .find(|object| object.id == transaction.before.id)
+            {
+                ObjectUndoRecord {
+                    deltas: (after != &transaction.before)
+                        .then(|| ObjectDelta::Update {
+                            before: Box::new(transaction.before.clone()),
+                            after: Box::new(after.clone()),
+                        })
+                        .into_iter()
+                        .collect(),
+                }
+            } else {
+                ObjectUndoRecord {
+                    deltas: vec![ObjectDelta::Remove {
+                        index: transaction.index,
+                        object: transaction.before.clone(),
+                    }],
+                }
+            }
+        });
         self.document_dirty = self
             .document
             .as_ref()
             .is_some_and(|document| document.objects != self.saved_objects);
-        if !changed {
+        let Some(record) = record.filter(|record| !record.deltas.is_empty()) else {
             return;
-        }
-        self.undo_stack.push(before);
-        if self.undo_stack.len() > 80 {
-            self.undo_stack.remove(0);
-        }
-        self.redo_stack.clear();
+        };
+        self.push_undo_record(record);
         self.flush_document_change();
         self.log.push(format!("{label}."));
     }
 
-    pub(super) fn push_undo_snapshot(&mut self) {
-        if let Some(document) = &self.document {
-            self.undo_stack.push(document.objects.clone());
-            if self.undo_stack.len() > 80 {
-                self.undo_stack.remove(0);
-            }
-            self.redo_stack.clear();
+    fn push_undo_record(&mut self, record: ObjectUndoRecord) {
+        if record.deltas.is_empty() {
+            return;
         }
+        self.undo_stack.push_back(record);
+        if self.undo_stack.len() > 80 {
+            self.undo_stack.pop_front();
+        }
+        self.redo_stack.clear();
     }
 
     pub(super) fn undo(&mut self) {
-        let Some(document) = &mut self.document else {
+        if self.document.is_none() {
             return;
-        };
-        let Some(previous) = self.undo_stack.pop() else {
-            return;
-        };
-        self.redo_stack.push(document.objects.clone());
-        document.objects = previous;
-        self.document_dirty = document.objects != self.saved_objects;
-        if let Err(err) = document.queue_editor_overlay_change() {
-            self.log.push(format!("Scene overlay update failed: {err}"));
         }
-        self.issues = document.validate();
+        let Some(record) = self.undo_stack.pop_back() else {
+            return;
+        };
+        if let Some(document) = &mut self.document {
+            record.apply_reverse(&mut document.objects);
+            self.document_dirty = document.objects != self.saved_objects;
+        }
+        self.redo_stack.push_back(record);
+        self.flush_document_change();
         self.ensure_selection_exists();
         self.rebuild_model_preview_from_document();
         self.log.push("Undo.".to_string());
     }
 
     pub(super) fn redo(&mut self) {
-        let Some(document) = &mut self.document else {
+        if self.document.is_none() {
             return;
-        };
-        let Some(next) = self.redo_stack.pop() else {
-            return;
-        };
-        self.undo_stack.push(document.objects.clone());
-        document.objects = next;
-        self.document_dirty = document.objects != self.saved_objects;
-        if let Err(err) = document.queue_editor_overlay_change() {
-            self.log.push(format!("Scene overlay update failed: {err}"));
         }
-        self.issues = document.validate();
+        let Some(record) = self.redo_stack.pop_back() else {
+            return;
+        };
+        if let Some(document) = &mut self.document {
+            record.apply_forward(&mut document.objects);
+            self.document_dirty = document.objects != self.saved_objects;
+        }
+        self.undo_stack.push_back(record);
+        self.flush_document_change();
         self.ensure_selection_exists();
         self.rebuild_model_preview_from_document();
         self.log.push("Redo.".to_string());
@@ -402,6 +629,9 @@ impl SmsEditorApp {
             });
         self.render_scene = render_scene;
         self.model_preview = model_preview;
+        if let Some(document) = &self.document {
+            self.issues = validation_issues_for_preview(document, self.model_preview.as_ref());
+        }
         self.last_level_transform_progress_bits = u32::MAX;
         self.rebuild_gpu_viewport_scene();
         self.clear_viewport_preview_cache();
@@ -425,15 +655,16 @@ impl SmsEditorApp {
             .document
             .as_ref()
             .and_then(|document| {
-                document
+                let object = document
                     .objects
                     .iter()
-                    .find(|object| object.id == object_id)
+                    .find(|object| object.id == object_id)?;
+                Some((object, document.registry.as_ref()))
             })
-            .map(|object| {
+            .map(|(object, registry)| {
                 (
-                    reset_fruit_preview_transform(object, old_transform),
-                    reset_fruit_preview_transform(object, new_transform),
+                    reset_fruit_preview_transform(object, old_transform, registry),
+                    reset_fruit_preview_transform(object, new_transform, registry),
                 )
             })
             .unwrap_or((old_transform, new_transform));

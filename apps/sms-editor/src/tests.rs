@@ -76,6 +76,25 @@ fn camera_app() -> SmsEditorApp {
 }
 
 #[test]
+fn automatic_scene_refresh_is_queued_once_per_base_root() {
+    let mut app = SmsEditorApp {
+        base_root: ".".to_string(),
+        ..SmsEditorApp::default()
+    };
+    let (_sender, receiver) = mpsc::channel();
+    app.background_receiver = Some(receiver);
+
+    app.refresh_scene_browser_if_needed();
+    assert_eq!(app.pending_auto_refresh_root.as_deref(), Some("."));
+    assert!(app.last_auto_refresh_attempt_root.is_empty());
+
+    app.pending_auto_refresh_root = None;
+    app.last_auto_refresh_attempt_root = ".".to_string();
+    app.refresh_scene_browser_if_needed();
+    assert!(app.pending_auto_refresh_root.is_none());
+}
+
+#[test]
 fn fly_camera_velocity_interpolates_in_and_out() {
     let accelerated =
         viewport_ui::interpolate_camera_velocity([0.0; 3], [1000.0, 0.0, 0.0], 1.0 / 60.0, 8.0);
@@ -395,59 +414,197 @@ fn selected_object_outline_merges_overlapping_polygon_coverage() {
 }
 
 #[test]
-fn nozzle_box_tev_color_matches_runtime_item_type() {
-    let mut rocket = SceneObject::new("rocket-box", "NozzleBox");
-    rocket.raw_params.insert(
-        "stream_string_1".to_string(),
-        "rocket_nozzle_item".to_string(),
-    );
-    let mut hover = SceneObject::new("hover-box", "NozzleBox");
-    hover.raw_params.insert(
-        "stream_string_1".to_string(),
-        "back_nozzle_item".to_string(),
-    );
+fn bounded_outline_coverage_matches_full_frame_coverage() {
+    let size = [9, 7];
+    let bounds = [3, 6, 2, 4];
+    let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(180.0, 140.0));
+    let mut full = vec![false; size[0] * size[1]];
+    for y in bounds[2]..=bounds[3] {
+        for x in bounds[0]..=bounds[1] {
+            full[y * size[0] + x] = !(x == 4 && y == 3);
+        }
+    }
+    let bounded_size = [bounds[1] - bounds[0] + 1, bounds[3] - bounds[2] + 1];
+    let mut bounded = vec![false; bounded_size[0] * bounded_size[1]];
+    for y in bounds[2]..=bounds[3] {
+        for x in bounds[0]..=bounds[1] {
+            bounded[(y - bounds[2]) * bounded_size[0] + x - bounds[0]] = full[y * size[0] + x];
+        }
+    }
 
-    assert_eq!(nozzle_box_tev_reg1_color(&rocket), Some([255, 0, 0, 100]));
-    assert_eq!(nozzle_box_tev_reg1_color(&hover), Some([90, 90, 120, 100]));
     assert_eq!(
-        nozzle_box_tev_reg1_color(&SceneObject::new("coin", "Coin")),
+        viewport_ui::outline_segments_from_coverage(&full, size, bounds, rect),
+        viewport_ui::outline_segments_from_bounded_coverage(
+            &bounded,
+            bounded_size,
+            [bounds[0], bounds[2]],
+            size,
+            bounds,
+            rect,
+        )
+    );
+}
+
+#[test]
+fn nozzle_box_tev_color_matches_runtime_item_type() {
+    let registry = ObjectRegistry {
+        objects: vec![sms_schema::ObjectDefinition {
+            factory_name: "NozzleBox".to_string(),
+            class_name: "TNozzleBox".to_string(),
+            category: "MapObj".to_string(),
+            source: sms_schema::SchemaSource::MarNameRefGen,
+            display_name: None,
+            preview_model: None,
+            hidden: false,
+            unsafe_to_edit: false,
+        }],
+        map_obj_string_tev_programs: vec![sms_schema::MapObjStringTevProgramDefinition {
+            resource_name: "NozzleBox".to_string(),
+            class_name: "TNozzleBox".to_string(),
+            tev_register: 1,
+            default_color: [255, 255, 255, 100],
+            variants: vec![
+                sms_schema::MapObjStringTevVariantDefinition {
+                    selector_value: "normal_nozzle_item".to_string(),
+                    color: [0, 0, 255, 100],
+                },
+                sms_schema::MapObjStringTevVariantDefinition {
+                    selector_value: "rocket_nozzle_item".to_string(),
+                    color: [255, 0, 0, 100],
+                },
+                sms_schema::MapObjStringTevVariantDefinition {
+                    selector_value: "back_nozzle_item".to_string(),
+                    color: [90, 90, 120, 100],
+                },
+            ],
+            source_file: "src/MoveBG/Item.cpp".to_string(),
+        }],
+        ..ObjectRegistry::default()
+    };
+    let mut rocket = SceneObject::new("rocket-box", "NozzleBox");
+    rocket.set_raw_param("actor_tail_string", "NozzleBox");
+    rocket.set_raw_param("nozzle_box_item", "rocket_nozzle_item");
+    let mut hover = SceneObject::new("hover-box", "NozzleBox");
+    hover.set_raw_param("actor_tail_string", "NozzleBox");
+    hover.set_raw_param("nozzle_box_item", "back_nozzle_item");
+    let mut legacy = SceneObject::new("legacy-box", "NozzleBox");
+    legacy.set_raw_param("actor_tail_string", "NozzleBox");
+    legacy.set_raw_param("stream_string_1", "normal_nozzle_item");
+    let color = |object: &SceneObject| {
+        map_obj_string_tev_color(object, Some(&registry)).map(|definition| definition.color)
+    };
+
+    assert_eq!(color(&rocket), Some([255, 0, 0, 100]));
+    assert_eq!(color(&hover), Some([90, 90, 120, 100]));
+    assert_eq!(color(&legacy), Some([0, 0, 255, 100]));
+    rocket.set_raw_param("nozzle_box_item", "Rocket_Nozzle_Item");
+    assert_eq!(color(&rocket), Some([255, 255, 255, 100]));
+    rocket.set_raw_param("actor_tail_string", "nozzlebox");
+    assert_eq!(color(&rocket), None);
+
+    let mut wrong_factory = SceneObject::new("wrong", "NozzleBoxAlias");
+    wrong_factory.set_raw_param("actor_tail_string", "NozzleBox");
+    wrong_factory.set_raw_param("nozzle_box_item", "normal_nozzle_item");
+    assert_eq!(
+        map_obj_string_tev_color(&wrong_factory, Some(&registry)),
         None
     );
 }
 
 #[test]
-fn monte_material_colors_follow_retail_instance_indices() {
+#[ignore = "requires the extracted retail game"]
+fn retail_nozzle_boxes_keep_typed_items_and_tev_colors() {
+    let base_root = std::env::var_os("SMS_BASE_ROOT")
+        .map(PathBuf::from)
+        .expect("set SMS_BASE_ROOT to the extracted game's root");
+    let expected = [
+        (
+            "mamma0",
+            vec![
+                ("normal_nozzle_item", [0, 0, 255, 100]),
+                ("rocket_nozzle_item", [255, 0, 0, 100]),
+                ("back_nozzle_item", [90, 90, 120, 100]),
+            ],
+        ),
+        ("dolpic0", vec![("rocket_nozzle_item", [255, 0, 0, 100])]),
+        (
+            "dolpic10",
+            vec![
+                ("normal_nozzle_item", [0, 0, 255, 100]),
+                ("rocket_nozzle_item", [255, 0, 0, 100]),
+                ("rocket_nozzle_item", [255, 0, 0, 100]),
+                ("back_nozzle_item", [90, 90, 120, 100]),
+            ],
+        ),
+    ];
+
+    let decomp_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let registry = SchemaGenerator::new(decomp_root)
+        .generate()
+        .expect("generate decomp-derived NozzleBox colors");
+    for (stage, mut expected) in expected {
+        let document = StageDocument::open(&base_root, stage)
+            .unwrap_or_else(|error| panic!("open retail {stage}: {error}"))
+            .with_registry(registry.clone());
+        let mut actual: Vec<_> = document
+            .objects
+            .iter()
+            .filter(|object| object.factory_name == "NozzleBox")
+            .map(|object| {
+                (
+                    object.raw_param("nozzle_box_item").unwrap_or_else(|| {
+                        panic!("{stage} NozzleBox lost its typed item selector")
+                    }),
+                    map_obj_string_tev_color(object, document.registry.as_ref())
+                        .map(|definition| definition.color)
+                        .unwrap_or_else(|| panic!("{stage} NozzleBox lost its TEV color")),
+                )
+            })
+            .collect();
+        actual.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(actual, expected, "unexpected retail {stage} NozzleBoxes");
+    }
+}
+
+#[test]
+fn npc_root_material_colors_follow_schema_channels() {
     let mut monte = SceneObject::new("monte", "NPCMonteMA");
     monte
         .raw_params
-        .insert("npc_body_color_index".to_string(), "9".to_string());
+        .insert("npc_body_color_index".to_string(), "9".to_string().into());
     monte
         .raw_params
-        .insert("npc_cloth_color_index".to_string(), "3".to_string());
+        .insert("npc_cloth_color_index".to_string(), "3".to_string().into());
+    let registry = ObjectRegistry {
+        npc_actors: vec![sms_schema::NpcActorDefinition {
+            actor_key: "MonteMA".to_string(),
+            source_file: "src/NPC/NpcInitData.cpp".to_string(),
+            parts: Vec::new(),
+        }],
+        npc_material_colors: vec![sms_schema::NpcMaterialColorDefinition {
+            actor_key: "MonteMA".to_string(),
+            model_index: 0,
+            color_index_channel: 1,
+            change: sms_schema::NpcColorChangeDefinition {
+                mode: 2,
+                material_name: "_fuku_mat".to_string(),
+                colors0: vec![[1, 2, 3, 255]],
+                colors1: vec![[4, 5, 6, 255]],
+            },
+            source_file: "src/NPC/NpcInitData.cpp".to_string(),
+        }],
+        ..ObjectRegistry::default()
+    };
 
-    let colors = monte_material_colors(&monte).unwrap();
-    assert_eq!(colors.body_reg0, Some([400, 250, 100, 255]));
+    assert_eq!(npc_root_color_index(&monte, 0), Some(9));
+    assert_eq!(npc_root_color_index(&monte, 1), Some(3));
     assert_eq!(
-        colors.cloth_reg1_reg2,
-        Some([[200, 200, 170, 255], [200, 200, 170, 255]])
-    );
-}
-
-#[test]
-fn mare_body_colors_follow_retail_instance_indices() {
-    let mut male = SceneObject::new("mare-m", "NPCMareMB");
-    male.raw_params
-        .insert("npc_body_color_index".to_string(), "4".to_string());
-    let mut female = SceneObject::new("mare-w", "NPCMareWB");
-    female
-        .raw_params
-        .insert("npc_body_color_index".to_string(), "2".to_string());
-
-    assert_eq!(mare_body_color(&male), Some([300, 200, 60, 255]));
-    assert_eq!(mare_body_color(&female), Some([440, 330, 255, 255]));
-    assert_eq!(
-        mare_body_color(&SceneObject::new("monte", "NPCMonteM")),
-        None
+        registry
+            .npc_material_colors_for(&monte.factory_name)
+            .next()
+            .map(|definition| definition.change.material_name.as_str()),
+        Some("_fuku_mat")
     );
 }
 
@@ -456,16 +613,17 @@ fn npc_pollution_uses_white_k_color_with_amount_as_alpha() {
     let mut monte = SceneObject::new("monte", "NPCMonteMA");
     monte
         .raw_params
-        .insert("npc_pollution_amount".to_string(), "37".to_string());
-    monte
-        .raw_params
-        .insert("npc_parts_color_index_0".to_string(), "2".to_string());
+        .insert("npc_pollution_amount".to_string(), "37".to_string().into());
+    monte.raw_params.insert(
+        "npc_parts_color_index_0".to_string(),
+        "2".to_string().into(),
+    );
 
     assert_eq!(npc_pollution_k_color(&monte), Some([255, 255, 255, 37]));
     let mut maremb = SceneObject::new("fisher", "NPCMareMB");
     maremb
         .raw_params
-        .insert("npc_pollution_amount".to_string(), "0".to_string());
+        .insert("npc_pollution_amount".to_string(), "0".to_string().into());
     assert_eq!(npc_pollution_k_color(&maremb), Some([255, 255, 255, 0]));
 }
 
@@ -721,9 +879,10 @@ fn gatekeeper_uses_retail_sleep_and_texture_animations() {
 #[test]
 fn gatekeeper_replaces_its_dummy_with_the_stage_pollution_texture() {
     assert_eq!(
-        actor_runtime_texture_replacements("gatekeeper"),
+        actor_runtime_texture_replacements("GateKeeper"),
         [("Q_kepper_dummy_128IA4", "/map/pollution/h_ma_rak.bti")]
     );
+    assert!(actor_runtime_texture_replacements("gatekeeper").is_empty());
 }
 
 #[test]
@@ -760,6 +919,71 @@ fn enemy_material_colors_override_only_decomp_assigned_channels() {
     apply_enemy_tev_overrides(&mut tev_colors, "_body", "PoiHanaRed", Some(&registry));
 
     assert_eq!(tev_colors[0], [283, -53, -122, 77]);
+
+    let mut wrong_case = [[0; 4]; 4];
+    apply_enemy_tev_overrides(&mut wrong_case, "_body", "poihanared", Some(&registry));
+    assert_eq!(wrong_case, [[0; 4]; 4]);
+}
+
+#[test]
+fn surf_geso_shared_model_colors_follow_exact_decomp_resource_variants() {
+    let variants = [
+        ("SurfGesoRed", [255, 180, 255, 255]),
+        ("SurfGesoYellow", [255, 255, 125, 255]),
+        ("SurfGesoGreen", [180, 255, 180, 255]),
+    ];
+    let registry = ObjectRegistry {
+        objects: variants
+            .iter()
+            .map(|(factory_name, _)| ObjectDefinition {
+                factory_name: (*factory_name).to_string(),
+                class_name: "TSurfGesoObj".to_string(),
+                category: "MapObj".to_string(),
+                source: sms_schema::SchemaSource::MarNameRefGen,
+                display_name: None,
+                preview_model: None,
+                hidden: false,
+                unsafe_to_edit: false,
+            })
+            .collect(),
+        map_obj_model_overrides: variants
+            .iter()
+            .map(
+                |(resource_name, color)| sms_schema::MapObjModelOverrideDefinition {
+                    resource_name: (*resource_name).to_string(),
+                    class_name: "TSurfGesoObj".to_string(),
+                    model_path: "/scene/mapObj/surfgeso.bmd".to_string(),
+                    load_flags: 0x1022_0000,
+                    tev_color: Some(sms_schema::MapObjTevColorDefinition {
+                        register: 1,
+                        color: *color,
+                    }),
+                    binding_source_file: "src/MoveBG/MapObjRicco.cpp".to_string(),
+                    model_source_file: "src/MoveBG/MapObjManager.cpp".to_string(),
+                },
+            )
+            .collect(),
+        ..ObjectRegistry::default()
+    };
+
+    for (factory_name, expected) in variants {
+        let mut object = SceneObject::new(factory_name, factory_name);
+        object.set_raw_param("actor_tail_string", factory_name);
+        assert_eq!(
+            map_obj_model_override_tev_color(&object, Some(&registry)),
+            Some(sms_schema::MapObjTevColorDefinition {
+                register: 1,
+                color: expected
+            })
+        );
+    }
+
+    let mut wrong_class = SceneObject::new("wrong", "Shine");
+    wrong_class.set_raw_param("actor_tail_string", "SurfGesoRed");
+    assert_eq!(
+        map_obj_model_override_tev_color(&wrong_class, Some(&registry)),
+        None
+    );
 }
 
 #[test]
@@ -790,7 +1014,7 @@ fn npc_parts_mask_uses_decomp_schema_metadata() {
     });
     let mut mare = SceneObject::new("mare", "NPCMareMA");
     mare.raw_params
-        .insert("npc_parts_mask".to_string(), "1".to_string());
+        .insert("npc_parts_mask".to_string(), "1".to_string().into());
     let parts = npc_accessory_specs(&document, &mare);
 
     assert_eq!(parts.len(), 1);
@@ -872,9 +1096,8 @@ fn coin_circle_shadow_uses_retail_radius_on_the_world_surface() {
 #[test]
 fn invisible_coin_proxy_does_not_get_a_preview_shadow() {
     let mut object = SceneObject::new("coin-proxy", "Coin");
-    object
-        .raw_params
-        .insert("stream_string_0".to_string(), "invisible_coin".to_string());
+    object.set_raw_param("stream_string_0", "コイン キャラ");
+    object.set_raw_param("actor_tail_string", "invisible_coin");
 
     assert!(!is_coin_object(&object));
 }
@@ -901,6 +1124,10 @@ fn monte_model_loader_flags_follow_manager_entries() {
     assert_eq!(
         actor_model_loader_flags(&SceneObject::new("mare-w", "NPCMareWB")),
         Some(0x1030_0000)
+    );
+    assert_eq!(
+        actor_model_loader_flags(&SceneObject::new("wrong-case", "npcMonteMA")),
+        None
     );
 }
 
@@ -942,7 +1169,7 @@ fn palm_leaf_placement_is_kept_as_an_object_preview() {
     let mut palm_leaf = SceneObject::new("PalmLeaf 2", "Palm");
     palm_leaf
         .raw_params
-        .insert("name".to_string(), "PalmLeaf 2".to_string());
+        .insert("name".to_string(), "PalmLeaf 2".to_string().into());
     palm_leaf.asset_hints.push(AssetRef {
         path: "stage.szs!/mapobj/palmleaf.bmd".to_string(),
         role: AssetRole::PreviewModel,
@@ -1012,10 +1239,13 @@ fn preview_for_texture_alpha(has_alpha: bool, has_translucent_alpha: bool) -> Mo
         camera_bounds_max: [1.0, 1.0, 1.0],
         loaded_models: 1,
         failed_models: 0,
+        model_failures: Vec::new(),
         source_vertices: 0,
         source_triangles: 0,
         source_textures: 1,
         object_model_indices: BTreeMap::new(),
+        mirror_cubes: Vec::new(),
+        mirror_model_slots: BTreeMap::new(),
         animated_models: Vec::new(),
         animated_flags: Vec::new(),
         rotating_models: Vec::new(),
@@ -1140,6 +1370,7 @@ fn authored_water_reflections_follow_environment_visibility() {
     // drawing it. The editor mirrors its already-loaded sky instead of showing
     // the unpatched helper geometry.
     let reflect_sky = "stage.szs!/map/map/reflectsky.bmd";
+    assert!(path_is_mirror_sky_helper_model_path(reflect_sky));
     assert!(!path_is_water_reflection_model_path(reflect_sky));
     assert!(!is_default_preview_model_path(
         reflect_sky,
@@ -1147,6 +1378,16 @@ fn authored_water_reflections_follow_environment_visibility() {
         true,
         false
     ));
+    assert!(!is_default_preview_model_path(
+        reflect_sky,
+        true,
+        true,
+        true
+    ));
+    assert_eq!(
+        preview_render_layer_for_model_path(reflect_sky),
+        PreviewRenderLayer::MirrorScene
+    );
 }
 
 #[test]
@@ -1189,6 +1430,30 @@ fn mirror_surface_slots_follow_the_runtime_filename_mapping() {
         "stage.szs!/map/mirror/mirror01.bmd",
         &active,
     ));
+}
+
+#[test]
+fn mirror_cube_membership_matches_sunshines_bottom_anchored_rotated_volume() {
+    let axis_aligned = PreviewMirrorCube {
+        center: [10.0, 20.0, 30.0],
+        rotation_degrees: [0.0; 3],
+        dimensions: [100.0, 200.0, 300.0],
+        model_slot: 0,
+    };
+    assert!(axis_aligned.contains([10.0, 20.1, 30.0]));
+    assert!(axis_aligned.contains([59.9, 219.9, 179.9]));
+    assert!(!axis_aligned.contains([10.0, 20.0, 30.0]));
+    assert!(!axis_aligned.contains([10.0, 220.0, 30.0]));
+    assert!(!axis_aligned.contains([60.0, 100.0, 30.0]));
+
+    let yawed = PreviewMirrorCube {
+        center: [0.0; 3],
+        rotation_degrees: [0.0, 90.0, 0.0],
+        dimensions: [100.0, 100.0, 20.0],
+        model_slot: 1,
+    };
+    assert!(yawed.contains([0.0, 50.0, 40.0]));
+    assert!(!yawed.contains([40.0, 50.0, 0.0]));
 }
 
 #[test]
@@ -1249,6 +1514,7 @@ fn shimmer_draw_transform_keeps_scale_but_cancels_placement_pose() {
 
 #[test]
 fn reset_fruit_draw_transform_matches_runtime_body_radius_offsets() {
+    let registry = reset_fruit_registry();
     let transform = Transform {
         translation: [10.0, 300.0, 30.0],
         rotation_degrees: [0.0; 3],
@@ -1260,16 +1526,17 @@ fn reset_fruit_draw_transform_matches_runtime_body_radius_offsets() {
         ("FruitPapaya", 340.0),
         ("FruitDurian", 345.0),
         ("FruitPine", 350.0),
-        ("RedPepper", 300.0),
+        ("RedPepper", 350.0),
         ("FruitBanana", 300.0),
     ] {
         let mut object = SceneObject::new(resource_name, "ResetFruit");
-        object
-            .raw_params
-            .insert("stream_string_0".to_string(), resource_name.to_string());
+        object.raw_params.insert(
+            "stream_string_0".to_string(),
+            resource_name.to_string().into(),
+        );
 
         assert_eq!(
-            reset_fruit_preview_transform(&object, transform).translation[1],
+            reset_fruit_preview_transform(&object, transform, Some(&registry)).translation[1],
             expected_y
         );
     }
@@ -1277,10 +1544,12 @@ fn reset_fruit_draw_transform_matches_runtime_body_radius_offsets() {
 
 #[test]
 fn reset_fruit_draw_transform_scales_the_runtime_body_radius() {
+    let registry = reset_fruit_registry();
     let mut object = SceneObject::new("pine", "ResetFruit");
-    object
-        .raw_params
-        .insert("stream_string_0".to_string(), "FruitPine".to_string());
+    object.raw_params.insert(
+        "stream_string_0".to_string(),
+        "FruitPine".to_string().into(),
+    );
     let transform = Transform {
         translation: [0.0, 100.0, 0.0],
         rotation_degrees: [0.0; 3],
@@ -1288,9 +1557,90 @@ fn reset_fruit_draw_transform_scales_the_runtime_body_radius() {
     };
 
     assert_eq!(
-        reset_fruit_preview_transform(&object, transform).translation[1],
+        reset_fruit_preview_transform(&object, transform, Some(&registry)).translation[1],
         210.0
     );
+
+    object.factory_name = "resetFruit".to_string();
+    assert_eq!(
+        reset_fruit_preview_transform(&object, transform, Some(&registry)),
+        transform
+    );
+}
+
+#[test]
+fn reset_fruit_matrix_correction_includes_xyz_rotation() {
+    let registry = reset_fruit_registry();
+    let mut banana = SceneObject::new("banana", "ResetFruit");
+    banana.set_raw_param("actor_tail_string", "FruitBanana");
+    let transform = Transform {
+        translation: [0.0, 100.0, 0.0],
+        rotation_degrees: [30.0, 40.0, 50.0],
+        scale: [1.0, 1.5, 1.0],
+    };
+
+    let transformed = reset_fruit_preview_transform(&banana, transform, Some(&registry));
+    assert!((transformed.translation[1] - 114.784_58).abs() < 0.000_1);
+}
+
+fn reset_fruit_registry() -> ObjectRegistry {
+    let entries = [
+        ("FruitCoconut", 0x4000_0390, 40, None, None),
+        ("FruitPapaya", 0x4000_0391, 40, None, None),
+        ("FruitPine", 0x4000_0392, 50, None, Some(10)),
+        ("FruitDurian", 0x4000_0393, 45, None, None),
+        ("FruitBanana", 0x4000_0394, 50, Some(50), None),
+        ("RedPepper", 0x4000_0395, 50, None, None),
+    ];
+    ObjectRegistry {
+        map_obj_resources: entries
+            .iter()
+            .map(
+                |(resource_name, actor_type, _, _, _)| sms_schema::MapObjResourceDefinition {
+                    resource_name: (*resource_name).to_string(),
+                    actor_type: *actor_type,
+                    primary_model: Some(format!("{resource_name}.bmd")),
+                    load_flags: 0x1022_0000,
+                    source_file: "src/MoveBG/MapObjInit.cpp".to_string(),
+                },
+            )
+            .collect(),
+        map_obj_ball_transforms: entries
+            .iter()
+            .map(|(_, actor_type, body_radius, positive, one_minus)| {
+                sms_schema::MapObjBallTransformDefinition {
+                    actor_type: *actor_type,
+                    body_radius: *body_radius,
+                    positive_y_axis_subtract: *positive,
+                    one_minus_y_axis_subtract: *one_minus,
+                    source_file: "src/MoveBG/MapObjBall.cpp".to_string(),
+                }
+            })
+            .collect(),
+        ..ObjectRegistry::default()
+    }
+}
+
+#[test]
+fn case_distinct_factories_do_not_inherit_coin_or_npc_behavior() {
+    assert!(!is_coin_object(&SceneObject::new("wrong-case", "coinRed")));
+    assert_eq!(
+        runtime_yaw_degrees_per_frame(&SceneObject::new("wrong-case", "shine")),
+        0.0
+    );
+
+    let wrong_case_npc = SceneObject::new("wrong-case", "npcMonteMA");
+    assert!(starting_joint_animation_candidates(
+        &wrong_case_npc,
+        "C:/game/dolpic0.szs!/montema/moma_model.bmd"
+    )
+    .is_empty());
+    assert!(starting_texture_pattern_candidates(
+        &wrong_case_npc,
+        "C:/game/dolpic0.szs!/montema/moma_model.bmd"
+    )
+    .is_empty());
+    assert!(actor_runtime_texture_replacements(&wrong_case_npc.factory_name).is_empty());
 }
 
 #[test]
@@ -1536,32 +1886,40 @@ fn decomp_owned_map_static_models_require_a_matching_placement() {
         map_static_models: vec![
             sms_schema::MapStaticModelDefinition {
                 actor_name: "BiancoRiver".to_string(),
-                model_path: "/scene/map/map/BiancoRiver.bmd".to_string(),
+                model_path: Some("/scene/map/map/BiancoRiver.bmd".to_string()),
                 load_flags: 0x1021_0000,
                 source_file: "src/Map/MapStaticObject.cpp".to_string(),
                 stage_bootstrap_created: false,
             },
             sms_schema::MapStaticModelDefinition {
                 actor_name: "BiaWaterPollution".to_string(),
-                model_path: "/scene/map/map/BiaWaterPollution.bmd".to_string(),
+                model_path: Some("/scene/map/map/BiaWaterPollution.bmd".to_string()),
                 load_flags: 0x1122_0000,
                 source_file: "src/Map/MapStaticObject.cpp".to_string(),
                 stage_bootstrap_created: false,
             },
             sms_schema::MapStaticModelDefinition {
                 actor_name: "sea".to_string(),
-                model_path: "/scene/map/map/sea.bmd".to_string(),
+                model_path: Some("/scene/map/map/sea.bmd".to_string()),
                 load_flags: 0x1022_0000,
                 source_file: "src/Map/MapStaticObject.cpp".to_string(),
                 stage_bootstrap_created: true,
+            },
+            sms_schema::MapStaticModelDefinition {
+                actor_name: "mareSeaPollutionS34567".to_string(),
+                model_path: None,
+                load_flags: 0x1021_0000,
+                source_file: "src/Map/MapStaticObject.cpp".to_string(),
+                stage_bootstrap_created: false,
             },
         ],
         ..ObjectRegistry::default()
     });
     let mut river = SceneObject::new("river", "MapStaticObj");
-    river
-        .raw_params
-        .insert("stream_string_0".to_string(), "BiancoRiver".to_string());
+    river.raw_params.insert(
+        "stream_string_0".to_string(),
+        "BiancoRiver".to_string().into(),
+    );
     document.objects.push(river);
 
     assert!(map_static_model_is_active(
@@ -1580,17 +1938,34 @@ fn decomp_owned_map_static_models_require_a_matching_placement() {
         &document,
         "stage.szs!/map/map/map.bmd"
     ));
+    assert_eq!(
+        map_static_model_loader_flags(&document, "stage.szs!/map/map/sea.bmd"),
+        Some(0x1022_0000)
+    );
 
     let mut pollution = SceneObject::new("dirty lake", "MapStaticObj");
     pollution.raw_params.insert(
         "stream_string_0".to_string(),
-        "BiaWaterPollution".to_string(),
+        "BiaWaterPollution".to_string().into(),
     );
     document.objects.push(pollution);
     assert!(map_static_model_is_active(
         &document,
         "stage.szs!/map/map/BiaWaterPollution.bmd"
     ));
+    assert_eq!(
+        map_static_model_loader_flags(&document, "stage.szs!/map/map/BiaWaterPollution.bmd"),
+        Some(0x1122_0000)
+    );
+
+    assert!(map_static_model_is_active(
+        &document,
+        "stage.szs!/map/map/mareSeaPollutionS34567.bmd"
+    ));
+    assert_eq!(
+        map_static_model_loader_flags(&document, "stage.szs!/map/map/mareSeaPollutionS34567.bmd"),
+        None
+    );
 }
 
 #[test]
@@ -1912,10 +2287,13 @@ fn updating_object_transform_moves_cached_preview_mesh() {
             camera_bounds_max: [1.0, 2.0, 3.0],
             loaded_models: 1,
             failed_models: 0,
+            model_failures: Vec::new(),
             source_vertices: 3,
             source_triangles: 1,
             source_textures: 0,
             object_model_indices,
+            mirror_cubes: Vec::new(),
+            mirror_model_slots: BTreeMap::new(),
             animated_models: Vec::new(),
             animated_flags: Vec::new(),
             rotating_models: Vec::new(),
@@ -1963,6 +2341,125 @@ fn dirty_state_tracks_saved_object_content() {
 }
 
 #[test]
+fn project_save_uses_the_same_trimmed_project_path_as_project_load() {
+    let root = std::env::temp_dir().join(format!(
+        "sms-editor-app-save-path-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut app = SmsEditorApp {
+        project_root: format!("  {}  ", root.display()),
+        document: Some(test_document(vec![SceneObject::new("obj-1", "Coin")])),
+        ..SmsEditorApp::default()
+    };
+
+    assert!(app.save_project());
+    assert!(root.join("sms-project.toml").is_file());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn completed_stage_load_is_discarded_when_the_project_path_changed() {
+    let document = test_document(Vec::new());
+    let scene = RenderScene::from_document(&document);
+    let mut app = SmsEditorApp {
+        base_root: "base-root".to_string(),
+        project_root: "project-b".to_string(),
+        stage_id: "dolpic0".to_string(),
+        ..SmsEditorApp::default()
+    };
+    let loaded = LoadedStage {
+        base_root: "base-root".to_string(),
+        project_root: "project-a".to_string(),
+        archives: Vec::new(),
+        registry: None,
+        schema_warning: None,
+        document,
+        scene,
+        preview: None,
+    };
+
+    app.apply_loaded_stage(loaded);
+
+    assert!(app.document.is_none());
+    assert!(app
+        .log
+        .iter()
+        .any(|message| message.contains("superseded project root")));
+}
+
+#[test]
+fn completed_stage_load_is_discarded_when_the_selected_stage_changed() {
+    let document = test_document(Vec::new());
+    let scene = RenderScene::from_document(&document);
+    let mut app = SmsEditorApp {
+        base_root: "base-root".to_string(),
+        project_root: "project".to_string(),
+        stage_id: "bianco0".to_string(),
+        ..SmsEditorApp::default()
+    };
+    let loaded = LoadedStage {
+        base_root: "base-root".to_string(),
+        project_root: "project".to_string(),
+        archives: Vec::new(),
+        registry: None,
+        schema_warning: None,
+        document,
+        scene,
+        preview: None,
+    };
+
+    app.apply_loaded_stage(loaded);
+
+    assert!(app.document.is_none());
+    assert!(app
+        .log
+        .iter()
+        .any(|message| message.contains("superseded stage")));
+}
+
+#[test]
+fn schema_refresh_updates_derived_preview_metadata_without_marking_the_document_dirty() {
+    let object = SceneObject::new("obj-1", "Fixture");
+    let mut document = test_document(vec![object.clone()]);
+    document.assets.push(StageAsset {
+        path: PathBuf::from("stage.szs!/map/fixture.bmd"),
+        kind: StageAssetKind::Model,
+    });
+    let mut app = SmsEditorApp {
+        document: Some(document),
+        saved_objects: vec![object],
+        ..SmsEditorApp::default()
+    };
+    let registry = ObjectRegistry {
+        object_resources: vec![sms_schema::ObjectResourceBinding {
+            factory_name: "Fixture".to_string(),
+            model_index: 0,
+            role: sms_schema::ObjectResourceRole::Primary,
+            model_name: "fixture.bmd".to_string(),
+            resource_base: None,
+            load_flags: 0,
+            source_file: "src/fixture.cpp".to_string(),
+        }],
+        ..ObjectRegistry::default()
+    };
+    let (sender, receiver) = std::sync::mpsc::channel();
+    sender
+        .send(BackgroundResult::Schema(Box::new(Ok(registry))))
+        .unwrap();
+    app.background_receiver = Some(receiver);
+
+    app.poll_background_task(&egui::Context::default());
+
+    assert!(!app.is_dirty());
+    assert_eq!(app.document.as_ref().unwrap().objects, app.saved_objects);
+    assert_eq!(app.saved_objects[0].asset_hints.len(), 1);
+}
+
+#[test]
 fn transform_transaction_creates_one_undo_entry() {
     let object = SceneObject::new("obj-1", "coin");
     let mut app = SmsEditorApp {
@@ -1985,9 +2482,20 @@ fn transform_transaction_creates_one_undo_entry() {
     app.commit_undo_transaction("Moved object");
 
     assert_eq!(app.undo_stack.len(), 1);
+    assert!(matches!(
+        app.undo_stack.back().unwrap().deltas.as_slice(),
+        [ObjectDelta::Update { before, after }]
+            if before.transform.translation[0] == 0.0
+                && after.transform.translation[0] == 20.0
+    ));
     assert_eq!(app.document.as_ref().unwrap().changed_files.len(), 1);
     app.undo();
     assert_eq!(app.selected_object().unwrap().transform.translation[0], 0.0);
+    app.redo();
+    assert_eq!(
+        app.selected_object().unwrap().transform.translation[0],
+        20.0
+    );
 }
 
 fn test_document(objects: Vec<SceneObject>) -> StageDocument {
@@ -2001,5 +2509,83 @@ fn test_document(objects: Vec<SceneObject>) -> StageDocument {
         load_issues: Vec::new(),
         lighting: Default::default(),
         actor_previews: BTreeMap::new(),
+        loaded_project: None,
     }
+}
+
+#[test]
+fn model_preview_failures_are_deduplicated_and_detail_bounded() {
+    let mut failed_assets = BTreeSet::new();
+    let mut failures = Vec::new();
+    for index in 0..(MAX_MODEL_FAILURE_DETAILS + 3) {
+        record_model_preview_failure(
+            &mut failed_assets,
+            &mut failures,
+            &format!("stage.szs!/map/model-{index}.bmd"),
+            format!("parse error {index}"),
+        );
+    }
+    record_model_preview_failure(
+        &mut failed_assets,
+        &mut failures,
+        "STAGE.SZS!/MAP/MODEL-0.BMD",
+        "duplicate error".to_string(),
+    );
+
+    assert_eq!(failed_assets.len(), MAX_MODEL_FAILURE_DETAILS + 3);
+    assert_eq!(failures.len(), MAX_MODEL_FAILURE_DETAILS);
+    assert_eq!(failures[0].error, "parse error 0");
+}
+
+#[test]
+fn a_failure_only_preview_retains_actionable_asset_details() {
+    let mut document = test_document(Vec::new());
+    document.assets.push(StageAsset {
+        path: PathBuf::from("definitely-missing-preview-model.bmd"),
+        kind: StageAssetKind::Model,
+    });
+
+    let preview = SmsEditorApp::build_model_preview(
+        &document,
+        PreviewVisibility {
+            environment: true,
+            goop: true,
+            effects: true,
+        },
+    )
+    .expect("failure details survive without decoded geometry");
+
+    assert_eq!(preview.failed_models, 1);
+    assert_eq!(preview.model_failures.len(), 1);
+    assert!(preview.model_failures[0]
+        .asset_path
+        .contains("definitely-missing-preview-model.bmd"));
+    assert!(preview.model_failures[0].error.contains("read asset"));
+}
+
+#[test]
+fn renderer_validation_names_only_framebuffer_dependent_logic_materials() {
+    let mut issues = Vec::new();
+    append_gpu_blend_validation_issue(&mut issues, 7, "logic-xor", 2, 6);
+    append_gpu_blend_validation_issue(&mut issues, 8, "logic-copy", 2, 3);
+
+    assert_eq!(issues.len(), 1);
+    assert_eq!(issues[0].code, "renderer-gx-logic-op-unsupported-7");
+    assert!(issues[0].message.contains("logic-xor"));
+    assert!(issues[0].message.contains("operation 6"));
+}
+
+#[test]
+fn renderer_validation_reports_unsupported_texture_lod_flags() {
+    let mut preview = preview_for_texture_alpha(true, true);
+    preview.textures[0].do_edge_lod = true;
+    preview.textures[0].bias_clamp = true;
+    let issues = validation_issues_for_preview(&test_document(Vec::new()), Some(&preview));
+
+    let issue = issues
+        .iter()
+        .find(|issue| issue.code == "renderer-gx-texture-lod-unsupported-0")
+        .expect("LOD fidelity warning");
+    assert!(issue.message.contains("edge LOD"));
+    assert!(issue.message.contains("LOD bias clamp"));
 }

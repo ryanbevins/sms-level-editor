@@ -37,7 +37,7 @@ pub(super) fn level_transform_targets(
             continue;
         };
         for record in records {
-            let lower_type = record.type_name.to_ascii_lowercase();
+            let type_name = record.type_name.clone();
             if let (Some(layer_index), Some(event)) =
                 (pollution_layer_index, record.map_event_sink.as_ref())
             {
@@ -91,11 +91,11 @@ pub(super) fn level_transform_targets(
                         RetailLevelTransform::Sink { event_index },
                     ));
                 }
-            } else if lower_type == "dolpiceventriccogate" {
+            } else if type_name == "DolpicEventRiccoGate" {
                 event_targets.push((1, RetailLevelTransform::ScaleGate));
-            } else if lower_type == "dolpiceventmammagate" {
+            } else if type_name == "DolpicEventMammaGate" {
                 event_targets.push((2, RetailLevelTransform::ScaleGate));
-            } else if lower_type == "mareeventwallrock" {
+            } else if type_name == "MareEventWallRock" {
                 for building_index in 1..=7 {
                     event_targets.push((building_index, RetailLevelTransform::WallRock));
                 }
@@ -113,11 +113,11 @@ pub(super) fn level_transform_targets(
                 let (translation_offset, scale_multiplier) = match transform {
                     RetailLevelTransform::Sink { event_index } => {
                         let bounds_depth = (bounds_max[1] - bounds_min[1]).abs();
-                        let sink_depth = match lower_type.as_str() {
-                            "mapeventsinkbianco" if event_index == 0 => 1700.0,
-                            "mapeventsinkbianco" => 1500.0,
-                            "mapeventsirenasink" => 3500.0,
-                            "airporteventsink" => 200.0,
+                        let sink_depth = match type_name.as_str() {
+                            "MapEventSinkBianco" if event_index == 0 => 1700.0,
+                            "MapEventSinkBianco" => 1500.0,
+                            "MapEventSirenaSink" => 3500.0,
+                            "AirportEventSink" => 200.0,
                             _ if bounds_depth.is_finite() && bounds_depth > 0.0 => bounds_depth,
                             _ => 1000.0,
                         };
@@ -595,31 +595,32 @@ pub(super) fn starting_joint_animation_candidates(
 ) -> Vec<String> {
     let normalized = model_path.replace('\\', "/");
     let archive = normalized.split_once("!/").map(|(archive, _)| archive);
-    let factory = object.factory_name.to_ascii_lowercase();
+    let factory = object.factory_name.as_str();
     let mut relative_candidates = Vec::new();
     // Actor-specific animation volumes conventionally use the factory name
     // without its NPC prefix (NPCMareMB -> maremb/maremb_wait.bck). Prefer
     // that data-driven path before falling back to a shared family animation.
-    if let Some(actor_key) = factory.strip_prefix("npc") {
+    if let Some(actor_key) = factory.strip_prefix("NPC") {
+        let actor_key = actor_key.to_ascii_lowercase();
         relative_candidates.push(format!("{actor_key}/{actor_key}_wait.bck"));
     }
-    let family_candidates: &[&str] = if factory.starts_with("npcmontem") {
+    let family_candidates: &[&str] = if factory.starts_with("NPCMonteM") {
         &["montemcommon/mom_wait.bck", "montem/mom_wait.bck"]
-    } else if factory.starts_with("npcmontew") {
+    } else if factory.starts_with("NPCMonteW") {
         &["montewcommon/mow_wait.bck", "montew/mow_wait.bck"]
-    } else if factory.starts_with("npcmarem") {
+    } else if factory.starts_with("NPCMareM") {
         &["marem/marem_wait.bck"]
-    } else if factory.starts_with("npcmarew") {
+    } else if factory.starts_with("NPCMareW") {
         &["marew/marew_wait.bck"]
-    } else if factory == "npckinopio" {
+    } else if factory == "NPCKinopio" {
         &["kinopio/kinopio_wait.bck"]
-    } else if factory == "npckinojii" {
+    } else if factory == "NPCKinojii" {
         &["kinojii/kinoji_wait.bck"]
-    } else if factory == "npcpeach" {
+    } else if factory == "NPCPeach" {
         &["peach/peach_wait.bck"]
-    } else if factory == "npcraccoondog" {
+    } else if factory == "NPCRaccoonDog" {
         &["raccoondog/tanuki_wait_a.bck"]
-    } else if factory == "gatekeeper" {
+    } else if factory == "GateKeeper" {
         // TNerveBGKSleep starts BCK index 10, which is wait1 in the manager's
         // alphabetically indexed GateKeeper animation resources.
         &["gatekeeper/gene_pakkun_wait1.bck"]
@@ -720,16 +721,15 @@ pub(super) fn starting_texture_pattern_candidates(
 ) -> Vec<String> {
     let normalized = model_path.replace('\\', "/");
     let archive = normalized.split_once("!/").map(|(archive, _)| archive);
-    let factory = object.factory_name.to_ascii_lowercase();
-    let Some(relative) = (match factory.as_str() {
-        "npcmontema" | "npcmontemh" => Some("montemcommon/moma_wink.btp"),
-        "npcmontemb" => Some("montemcommon/momb_wink.btp"),
-        "npcmontemc" | "npcmontemg" => Some("montemcommon/momc_wink.btp"),
-        "npcmontemd" => Some("montemcommon/momd_wink.btp"),
-        "npcmontem" | "npcmontemf" => Some("montemcommon/mom_wink.btp"),
-        "npcmontewa" => Some("montewcommon/mowa_wink.btp"),
-        "npcmontewb" => Some("montewcommon/mowb_wink.btp"),
-        "npcmontew" | "npcmontewc" => Some("montewcommon/mow_wink.btp"),
+    let Some(relative) = (match object.factory_name.as_str() {
+        "NPCMonteMA" | "NPCMonteMH" => Some("montemcommon/moma_wink.btp"),
+        "NPCMonteMB" => Some("montemcommon/momb_wink.btp"),
+        "NPCMonteMC" | "NPCMonteMG" => Some("montemcommon/momc_wink.btp"),
+        "NPCMonteMD" => Some("montemcommon/momd_wink.btp"),
+        "NPCMonteM" | "NPCMonteMF" => Some("montemcommon/mom_wink.btp"),
+        "NPCMonteWA" => Some("montewcommon/mowa_wink.btp"),
+        "NPCMonteWB" => Some("montewcommon/mowb_wink.btp"),
+        "NPCMonteW" | "NPCMonteWC" => Some("montewcommon/mow_wink.btp"),
         _ => None,
     }) else {
         return Vec::new();
@@ -840,8 +840,7 @@ pub(super) fn apply_actor_runtime_textures(
     object: &SceneObject,
     preview: &mut J3dGeometryPreview,
 ) {
-    let factory = object.factory_name.to_ascii_lowercase();
-    let replacements = actor_runtime_texture_replacements(&factory);
+    let replacements = actor_runtime_texture_replacements(&object.factory_name);
     if replacements.is_empty() {
         return;
     }
@@ -888,26 +887,26 @@ pub(super) fn apply_actor_runtime_textures(
 pub(super) fn actor_runtime_texture_replacements(
     factory: &str,
 ) -> Vec<(&'static str, &'static str)> {
-    if factory == "gatekeeper" {
+    if factory == "GateKeeper" {
         // TBiancoGateKeeper::init replaces this authored dummy texture with
         // the current stage's pollution texture.
         return vec![("Q_kepper_dummy_128IA4", "/map/pollution/h_ma_rak.bti")];
     }
-    if !factory.starts_with("npc") {
+    if !factory.starts_with("NPC") {
         return Vec::new();
     }
 
     let mut replacements = Vec::new();
     let monte_uses_pollution_texture = matches!(
         factory,
-        "npcmontem" | "npcmontema" | "npcmontemc" | "npcmontew" | "npcmontewa"
+        "NPCMonteM" | "NPCMonteMA" | "NPCMonteMC" | "NPCMonteW" | "NPCMonteWA"
     );
-    if !factory.starts_with("npcmonte") || monte_uses_pollution_texture {
+    if !factory.starts_with("NPCMonte") || monte_uses_pollution_texture {
         replacements.push(("H_ma_rak_dummy", "/map/pollution/h_ma_rak.bti"));
     }
-    if factory.starts_with("npcmontem") && factory != "npcmonteme" {
+    if factory.starts_with("NPCMonteM") && factory != "NPCMonteME" {
         replacements.push(("I_mom_mino_dummyI4", "/montemcommon/i_mom_mino_rgba.bti"));
-    } else if factory.starts_with("npcmontew") {
+    } else if factory.starts_with("NPCMonteW") {
         replacements.push(("I_mow_mino_dummyI4", "/montewcommon/i_mow_mino_rgba.bti"));
     }
 
@@ -915,7 +914,7 @@ pub(super) fn actor_runtime_texture_replacements(
 }
 
 pub(super) fn apply_npc_eye_decal_culling(object: &SceneObject, preview: &mut J3dGeometryPreview) {
-    if !object.factory_name.to_ascii_lowercase().starts_with("npc") {
+    if !object.factory_name.starts_with("NPC") {
         return;
     }
     let eye_materials = preview

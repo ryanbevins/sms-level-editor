@@ -556,14 +556,15 @@ impl SmsEditorApp {
 
             ui.separator();
             ui.heading("Params");
-            if object.raw_params.is_empty() && object.decoded_params.is_empty() {
+            if object.raw_params.is_empty() {
                 ui.label("No decoded params yet.");
             } else {
-                for (key, value) in object.raw_params {
-                    ui.label(format!("{key}: {value}"));
-                }
-                for (key, value) in object.decoded_params {
-                    ui.label(format!("{key}: {value:?}"));
+                for (key, parameter) in object.raw_params {
+                    if let Some(decoded) = parameter.decoded() {
+                        ui.label(format!("{key}: {parameter} ({decoded:?})"));
+                    } else {
+                        ui.label(format!("{key}: {parameter}"));
+                    }
                 }
             }
         } else {

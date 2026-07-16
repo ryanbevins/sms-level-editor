@@ -1,16 +1,56 @@
 use super::*;
 
-use std::{env, fs, path::PathBuf};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+};
 
-const BASE_ROOT_ENV: &str = "SMS_NOKI_TEST_BASE_ROOT";
+const BASE_ROOT_ENV: &str = "SMS_BASE_ROOT";
+const LEGACY_BASE_ROOT_ENV: &str = "SMS_NOKI_TEST_BASE_ROOT";
 const OUTPUT_ENV: &str = "SMS_NOKI_TEST_OUTPUT";
+
+fn retail_base_root() -> PathBuf {
+    env::var_os(BASE_ROOT_ENV)
+        .or_else(|| env::var_os(LEGACY_BASE_ROOT_ENV))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            panic!(
+                "set {BASE_ROOT_ENV} (or legacy {LEGACY_BASE_ROOT_ENV}) to the extracted game's data directory"
+            )
+        })
+}
+
+fn retail_placement_census(
+    base_root: &Path,
+    selectors: &[(&str, &str)],
+) -> BTreeMap<(String, String, String), usize> {
+    let selectors = selectors.iter().copied().collect::<BTreeSet<_>>();
+    let mut census = BTreeMap::new();
+    for archive in discover_scene_archives(base_root).expect("discover retail scene archives") {
+        let document = StageDocument::open(base_root, &archive.stage_id)
+            .unwrap_or_else(|error| panic!("open {}: {error}", archive.stage_id));
+        for object in &document.objects {
+            let Some(resource_name) = object.raw_param("actor_tail_string") else {
+                continue;
+            };
+            if selectors.contains(&(object.factory_name.as_str(), resource_name)) {
+                *census
+                    .entry((
+                        archive.stage_id.clone(),
+                        object.factory_name.clone(),
+                        resource_name.to_string(),
+                    ))
+                    .or_default() += 1;
+            }
+        }
+    }
+    census
+}
 
 #[test]
 #[ignore = "requires an extracted retail base root"]
 fn mamma0_ocean_water_survives_enemy_preview_catalog() {
-    let base_root = env::var_os(BASE_ROOT_ENV)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| panic!("set {BASE_ROOT_ENV} to the extracted game's data directory"));
+    let base_root = retail_base_root();
     let decomp_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
     let registry = SchemaGenerator::new(decomp_root)
         .generate()
@@ -43,7 +83,7 @@ fn mamma0_ocean_water_survives_enemy_preview_catalog() {
         let object = document
             .objects
             .iter()
-            .find(|object| object.factory_name.eq_ignore_ascii_case(factory_name))
+            .find(|object| object.factory_name == factory_name)
             .unwrap_or_else(|| panic!("mamma0 contains {factory_name}"));
         let model_index = preview.object_model_indices[&object.id];
         let body_material = preview
@@ -65,9 +105,7 @@ fn mamma0_ocean_water_survives_enemy_preview_catalog() {
 #[test]
 #[ignore = "requires an extracted retail base root"]
 fn dolpic0_includes_animated_sea_indirect_screen_copy() {
-    let base_root = env::var_os(BASE_ROOT_ENV)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| panic!("set {BASE_ROOT_ENV} to the extracted game's data directory"));
+    let base_root = retail_base_root();
     let decomp_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
     let registry = SchemaGenerator::new(decomp_root)
         .generate()
@@ -208,9 +246,7 @@ fn dolpic0_includes_animated_sea_indirect_screen_copy() {
 #[test]
 #[ignore = "requires an extracted retail base root"]
 fn bianco_water_pollution_model_follows_map_static_placement() {
-    let base_root = env::var_os(BASE_ROOT_ENV)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| panic!("set {BASE_ROOT_ENV} to the extracted game's data directory"));
+    let base_root = retail_base_root();
     let decomp_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
     let registry = SchemaGenerator::new(decomp_root)
         .generate()
@@ -243,13 +279,12 @@ fn bianco_water_pollution_model_follows_map_static_placement() {
 
 #[test]
 #[ignore = "requires an extracted retail base root"]
-fn bianco7_dirty_lake_does_not_activate_unreferenced_mirror_surface() {
-    let base_root = env::var_os(BASE_ROOT_ENV)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| panic!("set {BASE_ROOT_ENV} to the extracted game's data directory"));
+fn bianco_mirror_surface_follows_runtime_cube_volume() {
+    let base_root = retail_base_root();
     for episode in 0..=7 {
         let stage_id = format!("bianco{episode}");
         let document = StageDocument::open(&base_root, &stage_id).expect("open Bianco episode");
+        let cubes = mirror_cubes(&document);
         let expected = if episode == 7 {
             BTreeSet::new()
         } else {
@@ -260,6 +295,15 @@ fn bianco7_dirty_lake_does_not_activate_unreferenced_mirror_surface() {
             expected,
             "{stage_id} must follow its retail CubeMirror table"
         );
+        assert_eq!(cubes.len(), usize::from(episode != 7), "{stage_id}");
+        if let Some(cube) = cubes.first() {
+            let inside = [
+                cube.center[0],
+                cube.center[1] + cube.dimensions[1] * 0.5,
+                cube.center[2],
+            ];
+            assert!(cube.contains(inside), "{stage_id} cube midpoint");
+        }
     }
     let document = StageDocument::open(&base_root, "bianco7").expect("open bianco7");
     let slots = active_mirror_model_slots(&document);
@@ -281,14 +325,940 @@ fn bianco7_dirty_lake_does_not_activate_unreferenced_mirror_surface() {
         &mirror.path.to_string_lossy(),
         &slots,
     ));
+
+    let document = StageDocument::open(&base_root, "bianco6").expect("open bianco6");
+    let cubes = mirror_cubes(&document);
+    assert_eq!(
+        cubes,
+        vec![PreviewMirrorCube {
+            center: [600.0, -4650.0, -2550.0],
+            rotation_degrees: [0.0; 3],
+            dimensions: [50_000.0, 30_000.0, 50_000.0],
+            model_slot: 0,
+        }],
+        "bianco6 retail CubeMirror volume"
+    );
+    let preview = SmsEditorApp::build_model_preview(
+        &document,
+        PreviewVisibility {
+            environment: true,
+            goop: true,
+            effects: false,
+        },
+    )
+    .expect("build bianco6 preview");
+    let mirror_triangles = preview
+        .triangles
+        .iter()
+        .filter(|triangle| triangle.render_layer == PreviewRenderLayer::MirrorSurface)
+        .collect::<Vec<_>>();
+    assert_eq!(mirror_triangles.len(), 27, "bianco6 mirror00 geometry");
+    let mirror_model_indices = mirror_triangles
+        .iter()
+        .map(|triangle| triangle.model_index)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(mirror_model_indices.len(), 1);
+    let mirror_model_index = *mirror_model_indices.first().expect("mirror00 model index");
+    assert_eq!(
+        preview.mirror_model_slots.get(&mirror_model_index),
+        Some(&0)
+    );
+
+    let inside = [600.0, 20_000.0, -2550.0];
+    let overview = [600.0, 26_000.0, -2550.0];
+    assert_eq!(preview.active_mirror_slot(inside), Some(0));
+    assert_eq!(preview.active_mirror_slot(overview), None);
+    assert!(preview.mirror_surface_model_is_visible(mirror_model_index, inside));
+    assert!(!preview.mirror_surface_model_is_visible(mirror_model_index, overview));
+
+    let frame = gpu_viewport::GpuViewportFrame {
+        camera_position: overview,
+        right: [1.0, 0.0, 0.0],
+        up: [0.0, 0.0, 1.0],
+        forward: [0.0, -1.0, 0.0],
+        focal: 180.0,
+        viewport_size: [320.0, 224.0],
+        viewport_pan: [0.0; 2],
+        near: 8.0,
+        animation_seconds: 0.0,
+        ..Default::default()
+    };
+    let with_dormant_mirror = gpu_viewport::render_preview_offscreen(&preview, frame, [320, 224])
+        .expect("render bianco6 from above its CubeMirror volume");
+    let mut without_mirror = preview.clone();
+    without_mirror
+        .triangles
+        .retain(|triangle| triangle.render_layer != PreviewRenderLayer::MirrorSurface);
+    let without_mirror = gpu_viewport::render_preview_offscreen(&without_mirror, frame, [320, 224])
+        .expect("render bianco6 without mirror00 geometry");
+    assert_eq!(
+        with_dormant_mirror.pixels, without_mirror.pixels,
+        "an overview camera outside CubeMirror must not draw the giant reflection plane"
+    );
+}
+
+#[test]
+#[ignore = "requires an extracted retail base root"]
+fn retail_reflect_sky_helpers_never_enter_the_main_viewport() {
+    let base_root = retail_base_root();
+    let expected_stage_ids = [
+        "bianco0",
+        "bianco1",
+        "bianco2",
+        "bianco3",
+        "bianco4",
+        "bianco5",
+        "bianco6",
+        "bianco7",
+        "mamma0",
+        "mamma1",
+        "mamma2",
+        "mamma3",
+        "mamma4",
+        "mamma5",
+        "mamma6",
+        "mamma7",
+        "pinnaBoss0",
+        "pinnaBoss1",
+        "pinnaParco0",
+        "pinnaParco1",
+        "pinnaParco2",
+        "pinnaParco3",
+        "pinnaParco4",
+        "pinnaParco5",
+        "pinnaParco6",
+        "pinnaParco7",
+    ];
+    let expected_census = expected_stage_ids
+        .iter()
+        .map(|stage_id| {
+            (
+                (
+                    (*stage_id).to_string(),
+                    "MapStaticObj".to_string(),
+                    "ReflectSky".to_string(),
+                ),
+                1,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        retail_placement_census(&base_root, &[("MapStaticObj", "ReflectSky")]),
+        expected_census,
+        "complete Japanese retail ReflectSky placement census"
+    );
+
+    for stage_id in expected_stage_ids {
+        let document = StageDocument::open(&base_root, stage_id)
+            .unwrap_or_else(|error| panic!("open {stage_id}: {error}"));
+        let helper = document
+            .objects
+            .iter()
+            .find(|object| {
+                object.factory_name == "MapStaticObj"
+                    && object.raw_param("actor_tail_string") == Some("ReflectSky")
+            })
+            .unwrap_or_else(|| panic!("{stage_id} ReflectSky placement"));
+        let helper_asset = document
+            .assets
+            .iter()
+            .find(|asset| {
+                asset
+                    .path
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .to_ascii_lowercase()
+                    .ends_with("/map/map/reflectsky.bmd")
+            })
+            .unwrap_or_else(|| panic!("{stage_id} reflectsky.bmd"));
+        assert!(path_is_mirror_sky_helper_model_path(
+            &helper_asset.path.to_string_lossy()
+        ));
+        assert!(!is_default_preview_model_path(
+            &helper_asset.path.to_string_lossy(),
+            true,
+            true,
+            true,
+        ));
+
+        let preview = SmsEditorApp::build_model_preview(
+            &document,
+            PreviewVisibility {
+                environment: true,
+                goop: true,
+                effects: true,
+            },
+        )
+        .unwrap_or_else(|| panic!("build {stage_id} preview"));
+        assert!(
+            !preview.object_model_indices.contains_key(&helper.id),
+            "{stage_id} ReflectSky must stay exclusive to the mirror-sky pass"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires SMS_BASE_ROOT with extracted retail assets"]
+fn retail_stage_preview_matrix_keeps_environment_and_instance_models() {
+    let base_root = env::var_os("SMS_BASE_ROOT")
+        .map(PathBuf::from)
+        .expect("set SMS_BASE_ROOT to the extracted game's data directory");
+    let decomp_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let registry = SchemaGenerator::new(decomp_root)
+        .generate()
+        .expect("generate decomp-derived object metadata");
+    let visibility = PreviewVisibility {
+        environment: true,
+        goop: true,
+        effects: false,
+    };
+
+    let bianco = StageDocument::open(&base_root, "bianco7")
+        .expect("open bianco7")
+        .with_registry(registry.clone());
+    let dirty_lake = bianco
+        .objects
+        .iter()
+        .find(|object| {
+            object.factory_name == "MapStaticObj"
+                && object.raw_param("actor_tail_string") == Some("BiaWaterPollution")
+        })
+        .expect("bianco7 BiaWaterPollution placement");
+    assert!(
+        dirty_lake.asset_hints.iter().any(|hint| {
+            hint.role == AssetRole::InferredPreviewModel
+                && hint
+                    .path
+                    .replace('\\', "/")
+                    .to_ascii_lowercase()
+                    .ends_with("/map/map/biawaterpollution.bmd")
+        }),
+        "bianco7 dirty-lake placement lost BiaWaterPollution.bmd: {:?}",
+        dirty_lake.asset_hints
+    );
+    let bianco_preview =
+        SmsEditorApp::build_model_preview(&bianco, visibility).expect("build bianco7 preview");
+    assert_eq!(
+        bianco_preview
+            .triangles
+            .iter()
+            .filter(|triangle| triangle.render_layer == PreviewRenderLayer::Goop)
+            .count(),
+        400,
+        "bianco7 retail BiaWaterPollution geometry"
+    );
+
+    let assert_instances = |document: &StageDocument,
+                            preview: &ModelPreview,
+                            factory_name: &str,
+                            resource_name: &str,
+                            expected_count: usize,
+                            expected_model_suffix: &str,
+                            expected_triangles: usize| {
+        let objects = document
+            .objects
+            .iter()
+            .filter(|object| {
+                object.factory_name == factory_name
+                    && object.raw_param("actor_tail_string") == Some(resource_name)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            objects.len(),
+            expected_count,
+            "{} retail {factory_name}/{resource_name} placement count",
+            document.stage_id
+        );
+
+        for object in objects {
+            assert!(
+                object.asset_hints.iter().any(|hint| {
+                    hint.role == AssetRole::InferredPreviewModel
+                        && hint
+                            .path
+                            .replace('\\', "/")
+                            .to_ascii_lowercase()
+                            .ends_with(expected_model_suffix)
+                }),
+                "{} {factory_name}/{resource_name} selected the wrong model: {:?}",
+                document.stage_id,
+                object.asset_hints
+            );
+            let model_index = preview
+                .object_model_indices
+                .get(&object.id)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{} {factory_name}/{resource_name} has no rendered model index",
+                        document.stage_id
+                    )
+                });
+            let triangle_count = preview
+                .triangles
+                .iter()
+                .filter(|triangle| triangle.model_index == *model_index)
+                .count();
+            assert_eq!(
+                triangle_count, expected_triangles,
+                "{} {factory_name}/{resource_name} rendered the wrong model",
+                document.stage_id
+            );
+        }
+    };
+
+    let mamma = StageDocument::open(&base_root, "mamma0")
+        .expect("open mamma0")
+        .with_registry(registry.clone());
+    let mamma_preview =
+        SmsEditorApp::build_model_preview(&mamma, visibility).expect("build mamma0 preview");
+    for (resource, triangles) in [
+        ("SandBombBaseMushroom", 394),
+        ("SandBombBasePyramid", 104),
+        ("SandBombBaseShit", 326),
+        ("SandBombBaseStar", 328),
+        ("SandBombBaseTurtle", 780),
+        ("SandBombBaseFoot", 649),
+        ("SandBombBaseStairs", 202),
+    ] {
+        let suffix = format!("/mapobj/{}.bmd", resource.to_ascii_lowercase());
+        assert_instances(
+            &mamma,
+            &mamma_preview,
+            "SandBombBase",
+            resource,
+            1,
+            &suffix,
+            triangles,
+        );
+    }
+    assert_instances(
+        &mamma,
+        &mamma_preview,
+        "BananaTree",
+        "BananaTree",
+        19,
+        "/mapobj/bananatree.bmd",
+        448,
+    );
+    assert_instances(
+        &mamma,
+        &mamma_preview,
+        "MapObjTreeScale",
+        "BananaTree",
+        2,
+        "/mapobj/bananatree.bmd",
+        448,
+    );
+    for (resource, count, triangles) in [("palmNormal", 3, 638), ("palmLeaf", 3, 516)] {
+        let suffix = format!("/mapobj/{}.bmd", resource.to_ascii_lowercase());
+        assert_instances(
+            &mamma,
+            &mamma_preview,
+            "Palm",
+            resource,
+            count,
+            &suffix,
+            triangles,
+        );
+    }
+
+    let dolpic = StageDocument::open(&base_root, "dolpic10")
+        .expect("open dolpic10")
+        .with_registry(registry);
+    let dolpic_preview =
+        SmsEditorApp::build_model_preview(&dolpic, visibility).expect("build dolpic10 preview");
+    for (resource, count, triangles) in [("palmNormal", 18, 638), ("palmLeaf", 5, 516)] {
+        let suffix = format!("/mapobj/{}.bmd", resource.to_ascii_lowercase());
+        assert_instances(
+            &dolpic,
+            &dolpic_preview,
+            "Palm",
+            resource,
+            count,
+            &suffix,
+            triangles,
+        );
+    }
+    for (resource, count, triangles) in [
+        ("FruitCoconut", 9, 234),
+        ("FruitPapaya", 3, 280),
+        ("FruitPine", 3, 362),
+        ("FruitDurian", 3, 360),
+        ("FruitBanana", 6, 248),
+        ("RedPepper", 4, 98),
+    ] {
+        let suffix = format!("/mapobj/{}.bmd", resource.to_ascii_lowercase());
+        assert_instances(
+            &dolpic,
+            &dolpic_preview,
+            "ResetFruit",
+            resource,
+            count,
+            &suffix,
+            triangles,
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires SMS_BASE_ROOT with extracted Japanese retail assets"]
+fn retail_surf_geso_overrides_render_all_variants_with_runtime_colors() {
+    let base_root = retail_base_root();
+    let decomp_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let registry = SchemaGenerator::new(decomp_root)
+        .generate()
+        .expect("generate decomp-derived SurfGeso metadata");
+    let archives = discover_scene_archives(&base_root).expect("discover retail scene archives");
+    let expected_colors = BTreeMap::from([
+        ("SurfGesoRed", [255, 180, 255, 255]),
+        ("SurfGesoYellow", [255, 255, 125, 255]),
+        ("SurfGesoGreen", [180, 255, 180, 255]),
+    ]);
+    let mut rendered = BTreeMap::<String, usize>::new();
+
+    for archive in archives {
+        let document = StageDocument::open(&base_root, &archive.stage_id)
+            .unwrap_or_else(|error| panic!("open {}: {error}", archive.stage_id))
+            .with_registry(registry.clone());
+        let objects = document
+            .objects
+            .iter()
+            .filter(|object| expected_colors.contains_key(object.factory_name.as_str()))
+            .collect::<Vec<_>>();
+        if objects.is_empty() {
+            continue;
+        }
+        let preview = SmsEditorApp::build_model_preview(
+            &document,
+            PreviewVisibility {
+                environment: false,
+                goop: false,
+                effects: false,
+            },
+        )
+        .unwrap_or_else(|| panic!("build {} preview", archive.stage_id));
+
+        for object in objects {
+            let expected_color = expected_colors[object.factory_name.as_str()];
+            assert_eq!(
+                object.raw_param("actor_tail_string"),
+                Some(object.factory_name.as_str())
+            );
+            assert!(object.asset_hints.iter().any(|hint| {
+                hint.role == AssetRole::InferredPreviewModel
+                    && hint
+                        .path
+                        .replace('\\', "/")
+                        .to_ascii_lowercase()
+                        .ends_with("/mapobj/surfgeso.bmd")
+            }));
+            let model_index = preview
+                .object_model_indices
+                .get(&object.id)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{} {} has no rendered SurfGeso model",
+                        archive.stage_id, object.factory_name
+                    )
+                });
+            let triangles = preview
+                .triangles
+                .iter()
+                .filter(|triangle| triangle.model_index == *model_index)
+                .collect::<Vec<_>>();
+            assert!(
+                !triangles.is_empty(),
+                "{} {} has no geometry",
+                archive.stage_id,
+                object.factory_name
+            );
+            let material_indices = triangles
+                .iter()
+                .filter_map(|triangle| triangle.material_index)
+                .collect::<BTreeSet<_>>();
+            assert!(!material_indices.is_empty());
+            for material_index in material_indices {
+                assert_eq!(
+                    preview.materials[material_index].tev_colors[1], expected_color,
+                    "{} {} TEVREG1",
+                    archive.stage_id, object.factory_name
+                );
+            }
+            *rendered.entry(object.factory_name.clone()).or_default() += 1;
+        }
+    }
+
+    assert_eq!(
+        rendered,
+        BTreeMap::from([
+            ("SurfGesoGreen".to_string(), 4),
+            ("SurfGesoRed".to_string(), 4),
+            ("SurfGesoYellow".to_string(), 4),
+        ]),
+        "all 12 Japanese retail SurfGeso placements"
+    );
+}
+
+#[test]
+#[ignore = "requires SMS_BASE_ROOT with extracted Japanese retail assets"]
+fn retail_map_obj_indirect_flags_render_all_dokan_gate_and_ice_block_placements() {
+    let base_root = retail_base_root();
+    let decomp_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let registry = SchemaGenerator::new(decomp_root)
+        .generate()
+        .expect("generate decomp-derived MapObj loader flags");
+    let expected = BTreeMap::from([
+        ("dolpic0", vec![("MapObjBase", "DokanGate", 2)]),
+        ("dolpic1", vec![("MapObjBase", "DokanGate", 2)]),
+        ("dolpic5", vec![("MapObjBase", "DokanGate", 2)]),
+        ("dolpic6", vec![("MapObjBase", "DokanGate", 2)]),
+        ("dolpic7", vec![("MapObjBase", "DokanGate", 2)]),
+        ("dolpic8", vec![("MapObjBase", "DokanGate", 2)]),
+        ("dolpic9", vec![("MapObjBase", "DokanGate", 2)]),
+        ("dolpic10", vec![("MapObjBase", "DokanGate", 2)]),
+        ("coro_ex5", vec![("IceBlock", "IceBlock", 4)]),
+        ("dolpic_ex0", vec![("IceBlock", "IceBlock", 1)]),
+        ("mare0", vec![("IceBlock", "IceBlock", 1)]),
+        ("mare1", vec![("IceBlock", "IceBlock", 1)]),
+        ("mare3", vec![("IceBlock", "IceBlock", 1)]),
+        ("mare4", vec![("IceBlock", "IceBlock", 1)]),
+        ("mare6", vec![("IceBlock", "IceBlock", 1)]),
+        ("mare7", vec![("IceBlock", "IceBlock", 1)]),
+        ("sirena_ex1", vec![("IceBlock", "IceBlock", 1)]),
+    ]);
+    let expected_census = expected
+        .iter()
+        .flat_map(|(stage_id, resources)| {
+            resources
+                .iter()
+                .map(|(factory_name, resource_name, count)| {
+                    (
+                        (
+                            (*stage_id).to_string(),
+                            (*factory_name).to_string(),
+                            (*resource_name).to_string(),
+                        ),
+                        *count,
+                    )
+                })
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        retail_placement_census(
+            &base_root,
+            &[("MapObjBase", "DokanGate"), ("IceBlock", "IceBlock")]
+        ),
+        expected_census,
+        "complete Japanese retail DokanGate and IceBlock placement census"
+    );
+    let mut totals = BTreeMap::<String, usize>::new();
+
+    for (stage_id, resources) in expected {
+        let document = StageDocument::open(&base_root, stage_id)
+            .unwrap_or_else(|error| panic!("open {stage_id}: {error}"))
+            .with_registry(registry.clone());
+        let preview = SmsEditorApp::build_model_preview(
+            &document,
+            PreviewVisibility {
+                environment: false,
+                goop: false,
+                effects: false,
+            },
+        )
+        .unwrap_or_else(|| panic!("build {stage_id} preview"));
+
+        for (factory_name, resource_name, expected_count) in resources {
+            let objects = document
+                .objects
+                .iter()
+                .filter(|object| {
+                    object.factory_name == factory_name
+                        && object.raw_param("actor_tail_string") == Some(resource_name)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(objects.len(), expected_count, "{stage_id} {resource_name}");
+            for object in objects {
+                assert_eq!(
+                    document.object_preview_load_flags(object),
+                    Some(0x1122_0000),
+                    "{stage_id} {resource_name} schema flags"
+                );
+                let model_index = preview
+                    .object_model_indices
+                    .get(&object.id)
+                    .unwrap_or_else(|| panic!("{stage_id} {resource_name} has no rendered model"));
+                let material_indices = preview
+                    .triangles
+                    .iter()
+                    .filter(|triangle| triangle.model_index == *model_index)
+                    .filter_map(|triangle| triangle.material_index)
+                    .collect::<BTreeSet<_>>();
+                assert!(!material_indices.is_empty(), "{stage_id} {resource_name}");
+                assert!(material_indices
+                    .iter()
+                    .all(|index| preview.materials[*index].loader_flags == 0x1122_0000));
+                assert!(material_indices
+                    .iter()
+                    .any(|index| preview.materials[*index].indirect.enabled));
+                *totals.entry(resource_name.to_string()).or_default() += 1;
+            }
+        }
+    }
+    assert_eq!(
+        totals,
+        BTreeMap::from([("DokanGate".to_string(), 16), ("IceBlock".to_string(), 12)])
+    );
+}
+
+#[test]
+#[ignore = "requires SMS_BASE_ROOT with extracted Japanese retail assets"]
+fn retail_mare_pollution_uses_map_static_flags_and_keeps_collision_only_rows_model_less() {
+    let base_root = retail_base_root();
+    let decomp_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let registry = SchemaGenerator::new(decomp_root)
+        .generate()
+        .expect("generate decomp-derived map-static flags");
+    assert_eq!(
+        retail_placement_census(
+            &base_root,
+            &[
+                ("MapStaticObj", "mareSeaPollutionS0"),
+                ("MapStaticObj", "mareSeaPollutionS12"),
+                ("MapStaticObj", "mareSeaPollutionS34567"),
+            ]
+        ),
+        BTreeMap::from([
+            (
+                (
+                    "mare0".to_string(),
+                    "MapStaticObj".to_string(),
+                    "mareSeaPollutionS0".to_string(),
+                ),
+                1,
+            ),
+            (
+                (
+                    "mare1".to_string(),
+                    "MapStaticObj".to_string(),
+                    "mareSeaPollutionS12".to_string(),
+                ),
+                1,
+            ),
+            (
+                (
+                    "mare2".to_string(),
+                    "MapStaticObj".to_string(),
+                    "mareSeaPollutionS12".to_string(),
+                ),
+                1,
+            ),
+            (
+                (
+                    "mare3".to_string(),
+                    "MapStaticObj".to_string(),
+                    "mareSeaPollutionS12".to_string(),
+                ),
+                1,
+            ),
+            (
+                (
+                    "mare4".to_string(),
+                    "MapStaticObj".to_string(),
+                    "mareSeaPollutionS34567".to_string(),
+                ),
+                1,
+            ),
+            (
+                (
+                    "mare5".to_string(),
+                    "MapStaticObj".to_string(),
+                    "mareSeaPollutionS34567".to_string(),
+                ),
+                1,
+            ),
+            (
+                (
+                    "mare6".to_string(),
+                    "MapStaticObj".to_string(),
+                    "mareSeaPollutionS34567".to_string(),
+                ),
+                1,
+            ),
+            (
+                (
+                    "mare7".to_string(),
+                    "MapStaticObj".to_string(),
+                    "mareSeaPollutionS34567".to_string(),
+                ),
+                1,
+            ),
+        ]),
+        "complete Japanese retail Mare pollution placement census"
+    );
+
+    for (stage_id, resource_name, material_name, expected_triangles) in [
+        ("mare0", "mareSeaPollutionS0", "_pollutionSea_s0o_1", 786),
+        ("mare1", "mareSeaPollutionS12", "_pollutionSea_s123o_3", 761),
+        ("mare2", "mareSeaPollutionS12", "_pollutionSea_s123o_3", 761),
+        ("mare3", "mareSeaPollutionS12", "_pollutionSea_s123o_3", 761),
+    ] {
+        let document = StageDocument::open(&base_root, stage_id)
+            .unwrap_or_else(|error| panic!("open {stage_id}: {error}"))
+            .with_registry(registry.clone());
+        let object = document
+            .objects
+            .iter()
+            .find(|object| {
+                object.factory_name == "MapStaticObj"
+                    && object.raw_param("actor_tail_string") == Some(resource_name)
+            })
+            .unwrap_or_else(|| panic!("{stage_id} {resource_name} placement"));
+        assert_eq!(
+            document.object_preview_load_flags(object),
+            Some(0x1021_0000)
+        );
+        let model_asset = document
+            .assets
+            .iter()
+            .find(|asset| {
+                asset
+                    .path
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .to_ascii_lowercase()
+                    .ends_with(&format!(
+                        "/map/map/{}.bmd",
+                        resource_name.to_ascii_lowercase()
+                    ))
+            })
+            .unwrap_or_else(|| panic!("{stage_id} {resource_name}.bmd"));
+        assert_eq!(
+            map_static_model_loader_flags(&document, &model_asset.path.to_string_lossy()),
+            Some(0x1021_0000)
+        );
+        let preview = SmsEditorApp::build_model_preview(
+            &document,
+            PreviewVisibility {
+                environment: true,
+                goop: true,
+                effects: false,
+            },
+        )
+        .unwrap_or_else(|| panic!("build {stage_id} preview"));
+        let target_materials = preview
+            .materials
+            .iter()
+            .enumerate()
+            .filter(|(_, material)| material.name == material_name)
+            .map(|(index, _)| index)
+            .collect::<BTreeSet<_>>();
+        assert!(!target_materials.is_empty(), "{stage_id} {material_name}");
+        let target_triangles = preview
+            .triangles
+            .iter()
+            .filter(|triangle| {
+                triangle
+                    .material_index
+                    .is_some_and(|index| target_materials.contains(&index))
+            })
+            .count();
+        assert_eq!(
+            target_triangles, expected_triangles,
+            "{stage_id} {material_name}"
+        );
+        assert!(target_materials.iter().all(|index| {
+            let material = &preview.materials[*index];
+            material.loader_flags == 0x1021_0000 && !material.indirect.enabled
+        }));
+    }
+
+    for stage_id in ["mare4", "mare5", "mare6", "mare7"] {
+        let document = StageDocument::open(&base_root, stage_id)
+            .unwrap_or_else(|error| panic!("open {stage_id}: {error}"))
+            .with_registry(registry.clone());
+        let object = document
+            .objects
+            .iter()
+            .find(|object| {
+                object.factory_name == "MapStaticObj"
+                    && object.raw_param("actor_tail_string") == Some("mareSeaPollutionS34567")
+            })
+            .unwrap_or_else(|| panic!("{stage_id} collision-only pollution placement"));
+        assert_eq!(
+            document.object_preview_load_flags(object),
+            Some(0x1021_0000)
+        );
+        assert!(object
+            .asset_hints
+            .iter()
+            .all(|hint| hint.role != AssetRole::InferredPreviewModel));
+        assert!(document.assets.iter().all(|asset| {
+            !asset
+                .path
+                .to_string_lossy()
+                .replace('\\', "/")
+                .to_ascii_lowercase()
+                .ends_with("/map/map/mareseapollutions34567.bmd")
+        }));
+    }
+}
+
+#[test]
+#[ignore = "requires SMS_BASE_ROOT with extracted Japanese retail assets"]
+fn retail_nozzle_colors_and_red_pepper_offsets_reach_rendered_materials_and_geometry() {
+    let base_root = retail_base_root();
+    let decomp_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let registry = SchemaGenerator::new(decomp_root)
+        .generate()
+        .expect("generate decomp-derived typed preview programs");
+    let archives = discover_scene_archives(&base_root).expect("discover retail scene archives");
+    let expected_nozzle_colors = BTreeMap::from([
+        ("normal_nozzle_item", [0, 0, 255, 100]),
+        ("rocket_nozzle_item", [255, 0, 0, 100]),
+        ("back_nozzle_item", [90, 90, 120, 100]),
+    ]);
+    let mut nozzle_counts = BTreeMap::<String, usize>::new();
+    let mut red_pepper_by_stage = BTreeMap::<String, usize>::new();
+    for archive in archives {
+        let document = StageDocument::open(&base_root, &archive.stage_id)
+            .unwrap_or_else(|error| panic!("open {}: {error}", archive.stage_id))
+            .with_registry(registry.clone());
+        for object in &document.objects {
+            if object.factory_name == "NozzleBox" {
+                assert_eq!(object.raw_param("actor_tail_string"), Some("NozzleBox"));
+                let selector = object
+                    .raw_param("nozzle_box_item")
+                    .unwrap_or_else(|| panic!("{} NozzleBox selector", archive.stage_id));
+                let expected = expected_nozzle_colors
+                    .get(selector)
+                    .unwrap_or_else(|| panic!("unknown retail NozzleBox selector {selector}"));
+                assert_eq!(
+                    map_obj_string_tev_color(object, document.registry.as_ref())
+                        .map(|definition| definition.color),
+                    Some(*expected)
+                );
+                *nozzle_counts.entry(selector.to_string()).or_default() += 1;
+            }
+            if object.factory_name == "ResetFruit"
+                && object.raw_param("actor_tail_string") == Some("RedPepper")
+            {
+                *red_pepper_by_stage
+                    .entry(archive.stage_id.clone())
+                    .or_default() += 1;
+            }
+        }
+    }
+    assert_eq!(
+        nozzle_counts,
+        BTreeMap::from([
+            ("back_nozzle_item".to_string(), 47),
+            ("normal_nozzle_item".to_string(), 47),
+            ("rocket_nozzle_item".to_string(), 61),
+        ])
+    );
+    assert_eq!(
+        red_pepper_by_stage,
+        BTreeMap::from([
+            ("delfinoBoss".to_string(), 10),
+            ("dolpic0".to_string(), 4),
+            ("dolpic1".to_string(), 4),
+            ("dolpic5".to_string(), 4),
+            ("dolpic6".to_string(), 4),
+            ("dolpic7".to_string(), 4),
+            ("dolpic8".to_string(), 4),
+            ("dolpic9".to_string(), 3),
+            ("dolpic10".to_string(), 4),
+        ])
+    );
+
+    let mamma = StageDocument::open(&base_root, "mamma0")
+        .expect("open mamma0")
+        .with_registry(registry.clone());
+    let mamma_preview = SmsEditorApp::build_model_preview(
+        &mamma,
+        PreviewVisibility {
+            environment: false,
+            goop: false,
+            effects: false,
+        },
+    )
+    .expect("build mamma0 preview");
+    let mut nozzle_materials = BTreeMap::<String, BTreeSet<usize>>::new();
+    for object in mamma
+        .objects
+        .iter()
+        .filter(|object| object.factory_name == "NozzleBox")
+    {
+        let selector = object.raw_param("nozzle_box_item").expect("typed selector");
+        let model_index = mamma_preview
+            .object_model_indices
+            .get(&object.id)
+            .unwrap_or_else(|| panic!("mamma0 {selector} rendered model"));
+        let indices = mamma_preview
+            .triangles
+            .iter()
+            .filter(|triangle| triangle.model_index == *model_index)
+            .filter_map(|triangle| triangle.material_index)
+            .collect::<BTreeSet<_>>();
+        assert!(!indices.is_empty(), "mamma0 {selector} materials");
+        assert!(indices.iter().all(|index| {
+            mamma_preview.materials[*index].tev_colors[1] == expected_nozzle_colors[selector]
+        }));
+        nozzle_materials.insert(selector.to_string(), indices);
+    }
+    assert_eq!(nozzle_materials.len(), 3);
+    let sets = nozzle_materials.values().collect::<Vec<_>>();
+    for left in 0..sets.len() {
+        for right in left + 1..sets.len() {
+            assert!(sets[left].is_disjoint(sets[right]));
+        }
+    }
+
+    let dolpic = StageDocument::open(&base_root, "dolpic0")
+        .expect("open dolpic0")
+        .with_registry(registry);
+    let dolpic_preview = SmsEditorApp::build_model_preview(
+        &dolpic,
+        PreviewVisibility {
+            environment: false,
+            goop: false,
+            effects: false,
+        },
+    )
+    .expect("build dolpic0 preview");
+    let red_peppers = dolpic
+        .objects
+        .iter()
+        .filter(|object| {
+            object.factory_name == "ResetFruit"
+                && object.raw_param("actor_tail_string") == Some("RedPepper")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(red_peppers.len(), 4);
+    for object in red_peppers {
+        assert_eq!(object.transform.translation[1], 300.0);
+        let model_index = dolpic_preview
+            .object_model_indices
+            .get(&object.id)
+            .expect("rendered RedPepper model");
+        let min_y = dolpic_preview
+            .triangles
+            .iter()
+            .filter(|triangle| triangle.model_index == *model_index)
+            .flat_map(|triangle| triangle.vertices.iter().map(|vertex| vertex[1]))
+            .fold(f32::INFINITY, f32::min);
+        assert!(
+            (min_y - 349.945_3).abs() < 0.01,
+            "dolpic0 RedPepper {} min Y {min_y}",
+            object.id
+        );
+    }
 }
 
 #[test]
 #[ignore = "requires an extracted retail base root and is a manual performance probe"]
 fn profiles_dolpic0_preview_and_animation_updates() {
-    let base_root = env::var_os(BASE_ROOT_ENV)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| panic!("set {BASE_ROOT_ENV} to the extracted game's data directory"));
+    let base_root = retail_base_root();
     let decomp_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
     let registry = SchemaGenerator::new(decomp_root)
         .generate()
@@ -378,9 +1348,7 @@ fn profiles_dolpic0_preview_and_animation_updates() {
 #[test]
 #[ignore = "requires an extracted retail base root"]
 fn renders_maremb_body_and_accessories_to_screenshot() {
-    let base_root = env::var_os(BASE_ROOT_ENV)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| panic!("set {BASE_ROOT_ENV} to the extracted game's data directory"));
+    let base_root = retail_base_root();
     let output = env::var_os(OUTPUT_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("target/noki-render/maremb-accessories.bmp"));
@@ -390,7 +1358,7 @@ fn renders_maremb_body_and_accessories_to_screenshot() {
         .objects
         .iter()
         .find(|object| {
-            object.factory_name.eq_ignore_ascii_case("NPCMareMB")
+            object.factory_name == "NPCMareMB"
                 && object
                     .raw_params
                     .get("npc_parts_mask")
@@ -449,9 +1417,7 @@ fn renders_maremb_body_and_accessories_to_screenshot() {
 #[test]
 #[ignore = "requires an extracted retail base root"]
 fn renders_marem_instance_palette_to_screenshot() {
-    let base_root = env::var_os(BASE_ROOT_ENV)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| panic!("set {BASE_ROOT_ENV} to the extracted game's data directory"));
+    let base_root = retail_base_root();
     let output = env::var_os("SMS_MAREM_TEST_OUTPUT")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("target/noki-render/marem-instance-palette.bmp"));
@@ -461,7 +1427,7 @@ fn renders_marem_instance_palette_to_screenshot() {
         .objects
         .iter()
         .find(|object| {
-            object.factory_name.eq_ignore_ascii_case("NPCMareM")
+            object.factory_name == "NPCMareM"
                 && object
                     .raw_params
                     .get("npc_parts_mask")

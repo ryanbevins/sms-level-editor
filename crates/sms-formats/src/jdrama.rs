@@ -23,6 +23,15 @@ pub struct JDramaObjectRecord {
     pub obj_manager_chara: Option<String>,
     #[serde(default)]
     pub live_actor_manager: Option<String>,
+    /// First length-prefixed string after the common TActor character and
+    /// light-map fields. Its meaning belongs to the decomp-derived class
+    /// schema; the format parser intentionally does not guess a subclass.
+    #[serde(default)]
+    pub actor_tail_string: Option<String>,
+    /// Item selector appended by `TNozzleBox::load` after the common
+    /// `TMapObjBase` resource name (for example `rocket_nozzle_item`).
+    #[serde(default)]
+    pub nozzle_box_item: Option<String>,
     #[serde(default)]
     pub actor_character: Option<String>,
     #[serde(default)]
@@ -37,6 +46,10 @@ pub struct JDramaObjectRecord {
     pub cube_general_info: Option<JDramaCubeGeneralInfo>,
     pub light: Option<JDramaLight>,
     pub ambient: Option<JDramaAmbient>,
+    /// Exact bytes after the record's TNameRef fields. Unknown class data is
+    /// intentionally kept opaque instead of being byte-scanned for metadata.
+    #[serde(default)]
+    pub raw_payload: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,6 +121,14 @@ pub struct JDramaTransform {
     pub translation: [f32; 3],
     pub rotation: [f32; 3],
     pub scale: [f32; 3],
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ActorStreamLayout {
+    transform: JDramaTransform,
+    character_name: String,
+    light_names: Vec<String>,
+    tail_offset: usize,
 }
 
 pub fn parse_jdrama_object_records(bytes: &[u8]) -> Result<Vec<JDramaObjectRecord>> {
@@ -198,16 +219,24 @@ fn name_ref_record_layout(
 }
 
 fn name_ref_array_children(bytes: &[u8], payload: usize, end: usize) -> Result<Vec<usize>> {
-    let count = be_u32(bytes, payload, FORMAT)? as usize;
+    name_ref_array_children_from_count(bytes, payload, end)
+}
+
+fn name_ref_array_children_from_count(
+    bytes: &[u8],
+    count_offset: usize,
+    end: usize,
+) -> Result<Vec<usize>> {
+    let count = be_u32(bytes, count_offset, FORMAT)? as usize;
     if count > MAX_SCAN_RECORDS {
         return Err(FormatError::Unsupported {
             format: FORMAT,
             message: format!("NameRef array has implausible child count {count}"),
         });
     }
-    let mut cursor = payload
+    let mut cursor = count_offset
         .checked_add(4)
-        .ok_or_else(|| invalid_offset(payload, end))?;
+        .ok_or_else(|| invalid_offset(count_offset, end))?;
     let mut children = Vec::with_capacity(count);
     for _ in 0..count {
         let size =
@@ -220,6 +249,59 @@ fn name_ref_array_children(bytes: &[u8], payload: usize, end: usize) -> Result<V
     (cursor == end)
         .then_some(children)
         .ok_or_else(|| invalid_offset(cursor, end))
+}
+
+fn record_child_offsets(
+    bytes: &[u8],
+    payload: usize,
+    end: usize,
+    type_name: &str,
+) -> Result<Option<Vec<usize>>> {
+    let short_type = type_name.rsplit("::").next().unwrap_or(type_name);
+    let count_offset = match short_type {
+        // Exact list/array layouts instantiated by JDrama::TNameRefGen and
+        // TMarNameRefGen in the neighboring decomp.
+        "GroupObj"
+        | "NameRefGrp"
+        | "Strategy"
+        | "LightAry"
+        | "AmbAry"
+        | "EventTable"
+        | "CameraMapToolTable"
+        | "CubeGeneralInfoTable"
+        | "StreamGeneralInfoTable"
+        | "ScenarioArchiveNameTable"
+        | "ScenarioArchiveNamesInStage"
+        | "PositionHolder" => payload,
+        // TIdxGroupObj::loadSuper appends its u32 group index before the
+        // inherited TViewObjPtrListT child count.
+        "IdxGroup" => payload
+            .checked_add(4)
+            .ok_or_else(|| invalid_offset(payload, end))?,
+        // TSmJ3DScn::loadSuper appends a TLightMap before its inherited child
+        // count. MarScene is the SMS factory alias for that same class.
+        "SmJ3DScn" | "MarScene" => light_map_end(bytes, payload, end)?,
+        _ => return Ok(None),
+    };
+    name_ref_array_children_from_count(bytes, count_offset, end).map(Some)
+}
+
+fn light_map_end(bytes: &[u8], start: usize, end: usize) -> Result<usize> {
+    let count = be_u32(bytes, start, FORMAT)? as usize;
+    let mut cursor = start
+        .checked_add(4)
+        .ok_or_else(|| invalid_offset(start, end))?;
+    if count > end.saturating_sub(cursor) / 6 {
+        return Err(invalid_offset(cursor, end));
+    }
+    for _ in 0..count {
+        cursor = cursor
+            .checked_add(4)
+            .ok_or_else(|| invalid_offset(cursor, end))?;
+        let (_, next) = read_len_string(bytes, cursor, end)?;
+        cursor = next;
+    }
+    Ok(cursor)
 }
 
 fn parse_record_at(
@@ -242,29 +324,48 @@ fn parse_record_at(
     let mut cursor = offset + 4;
     cursor += 2; // type key code
     let (type_name, after_type) = read_len_string(bytes, cursor, end)?;
-    let (object_name, after_name) = read_name_ref(bytes, after_type, end)
-        .map(|(name, cursor)| (Some(name), cursor))
-        .unwrap_or((None, after_type));
-    let transform = read_actor_transform(bytes, after_name, end);
-    let stream_strings = transform
-        .map(|_| scan_ascii_stream_strings(bytes, after_name + 36, end))
+    let (object_name, after_name) =
+        read_name_ref(bytes, after_type, end).map(|(name, cursor)| (Some(name), cursor))?;
+    let child_offsets = record_child_offsets(bytes, after_name, end, &type_name)?;
+    let actor_layout = child_offsets
+        .is_none()
+        .then(|| read_actor_stream_layout(bytes, after_name, end))
+        .flatten();
+    let transform = actor_layout.as_ref().map(|layout| layout.transform);
+    let stream_strings = actor_layout
+        .as_ref()
+        .map(|layout| {
+            std::iter::once(layout.character_name.clone())
+                .chain(layout.light_names.iter().cloned())
+                .filter(|value| !value.is_empty())
+                .collect()
+        })
         .unwrap_or_default();
     let obj_chara_folder = read_obj_chara_folder(bytes, after_name, end, &type_name);
     let obj_manager_chara = read_obj_manager_chara(bytes, after_name, end, &type_name);
-    let live_actor_manager =
-        transform.and_then(|_| read_live_actor_manager(bytes, after_name + 36, end));
-    let actor_character = transform.and_then(|_| {
-        read_len_string(bytes, after_name + 36, end)
-            .ok()
-            .map(|(value, _)| value)
-            .filter(|value| !value.is_empty())
+    let actor_tail_string = actor_layout
+        .as_ref()
+        .and_then(|layout| read_len_string(bytes, layout.tail_offset, end).ok())
+        .map(|(value, _)| value)
+        .filter(|value| !value.is_empty());
+    let nozzle_box_item = actor_layout.as_ref().and_then(|layout| {
+        read_nozzle_box_item_selector(bytes, layout.tail_offset, end, &type_name)
     });
-    let mario_modoki_telesa_imitation_index = transform.and_then(|_| {
+    let live_actor_manager = explicit_live_actor_layout(&type_name)
+        .then(|| actor_tail_string.clone())
+        .flatten();
+    let actor_character = actor_layout
+        .as_ref()
+        .map(|layout| layout.character_name.clone())
+        .filter(|value| !value.is_empty());
+    let mario_modoki_telesa_imitation_index = actor_layout.as_ref().and_then(|_| {
         read_mario_modoki_telesa_imitation_index(bytes, after_name + 36, end, &type_name)
     });
-    let npc_params =
-        transform.and_then(|_| read_npc_params(bytes, after_name + 36, end, &type_name));
-    let map_obj_grass_blade_count = transform
+    let npc_params = actor_layout
+        .as_ref()
+        .and_then(|_| read_npc_params(bytes, after_name + 36, end, &type_name));
+    let map_obj_grass_blade_count = actor_layout
+        .as_ref()
         .and_then(|_| read_map_obj_grass_blade_count(bytes, after_name + 36, end, &type_name));
     let map_wire_manager = read_map_wire_manager_params(bytes, after_name, end, &type_name);
     let map_event_sink = read_map_event_sink_params(bytes, after_name, end, &type_name);
@@ -276,6 +377,7 @@ fn parse_record_at(
     let ambient = (short_type == "AmbColor")
         .then(|| read_ambient(bytes, after_name, end, object_name.clone()))
         .flatten();
+    let raw_payload = bytes[after_name..end].to_vec();
 
     records.push(JDramaObjectRecord {
         offset,
@@ -287,6 +389,8 @@ fn parse_record_at(
         obj_chara_folder,
         obj_manager_chara,
         live_actor_manager,
+        actor_tail_string,
+        nozzle_box_item,
         actor_character,
         mario_modoki_telesa_imitation_index,
         npc_params,
@@ -296,19 +400,48 @@ fn parse_record_at(
         cube_general_info,
         light,
         ambient,
+        raw_payload,
     });
 
-    let mut scan = after_type;
-    while scan + 8 <= end && records.len() < MAX_SCAN_RECORDS {
-        if let Some(child_size) = plausible_record_size(bytes, scan, end) {
-            parse_record_at(bytes, scan, end, visited, records)?;
-            scan += child_size.max(1);
-        } else {
-            scan += 1;
+    if let Some(child_offsets) = child_offsets {
+        for child_offset in child_offsets {
+            if records.len() >= MAX_SCAN_RECORDS {
+                return Err(FormatError::Unsupported {
+                    format: FORMAT,
+                    message: format!("record tree exceeds the {MAX_SCAN_RECORDS}-record limit"),
+                });
+            }
+            parse_record_at(bytes, child_offset, end, visited, records)?;
         }
     }
 
     Ok(size)
+}
+
+fn read_nozzle_box_item_selector(
+    bytes: &[u8],
+    start: usize,
+    end: usize,
+    type_name: &str,
+) -> Option<String> {
+    // TNozzleBox::load calls TMapObjBase::load first. The retail NozzleBox
+    // resource has no damage-height field, so its exact subclass tail is the
+    // resource name, item selector, validity string, and two f32 values.
+    if type_name.rsplit("::").next()? != "NozzleBox" {
+        return None;
+    }
+    let (resource_name, cursor) = read_len_string(bytes, start, end).ok()?;
+    if resource_name != "NozzleBox" {
+        return None;
+    }
+    let (item, cursor) = read_len_string(bytes, cursor, end).ok()?;
+    let (_, cursor) = read_len_string(bytes, cursor, end).ok()?;
+    if cursor.checked_add(8)? != end {
+        return None;
+    }
+    let _box_break_time = be_f32(bytes, cursor, FORMAT).ok()?;
+    let _respawn_time = be_f32(bytes, cursor + 4, FORMAT).ok()?;
+    (!item.is_empty()).then_some(item)
 }
 
 fn read_mario_modoki_telesa_imitation_index(
@@ -334,16 +467,30 @@ fn read_mario_modoki_telesa_imitation_index(
     be_u32(bytes, selector, FORMAT).ok()
 }
 
+fn explicit_live_actor_layout(type_name: &str) -> bool {
+    matches!(
+        semantic_type_name(type_name),
+        "LiveActor" | "MarioModokiTelesa"
+    ) || is_npc_actor_type(type_name)
+}
+
+fn semantic_type_name(type_name: &str) -> &str {
+    type_name.rsplit("::").next().unwrap_or(type_name)
+}
+
+fn is_npc_actor_type(type_name: &str) -> bool {
+    // TMarNameRefGen's NPC factories use an exact, case-sensitive `NPC`
+    // prefix and all construct TBaseNPC with the same placement stream.
+    semantic_type_name(type_name).starts_with("NPC")
+}
+
 fn read_obj_chara_folder(
     bytes: &[u8],
     start: usize,
     end: usize,
     type_name: &str,
 ) -> Option<String> {
-    type_name
-        .rsplit("::")
-        .next()?
-        .eq_ignore_ascii_case("ObjChara")
+    (semantic_type_name(type_name) == "ObjChara")
         .then(|| {
             read_len_string(bytes, start, end)
                 .ok()
@@ -368,10 +515,6 @@ fn read_obj_manager_chara(
                 .map(|(value, _)| value)
         })
         .flatten()
-}
-
-fn read_live_actor_manager(bytes: &[u8], start: usize, end: usize) -> Option<String> {
-    read_live_actor_manager_with_cursor(bytes, start, end).map(|(manager, _)| manager)
 }
 
 fn read_live_actor_manager_with_cursor(
@@ -412,11 +555,7 @@ fn read_cube_general_info(
     end: usize,
     type_name: &str,
 ) -> Option<JDramaCubeGeneralInfo> {
-    if !type_name
-        .rsplit("::")
-        .next()?
-        .eq_ignore_ascii_case("CubeGeneralInfo")
-    {
+    if semantic_type_name(type_name) != "CubeGeneralInfo" {
         return None;
     }
     if start.checked_add(48)? > end {
@@ -439,11 +578,7 @@ fn read_map_wire_manager_params(
     end: usize,
     type_name: &str,
 ) -> Option<JDramaMapWireManagerParams> {
-    if !type_name
-        .rsplit("::")
-        .next()?
-        .eq_ignore_ascii_case("MapWireManager")
-    {
+    if semantic_type_name(type_name) != "MapWireManager" {
         return None;
     }
 
@@ -481,11 +616,7 @@ fn read_map_obj_grass_blade_count(
     end: usize,
     type_name: &str,
 ) -> Option<u32> {
-    if !type_name
-        .rsplit("::")
-        .next()?
-        .eq_ignore_ascii_case("MapObjGrassGroup")
-    {
+    if semantic_type_name(type_name) != "MapObjGrassGroup" {
         return None;
     }
 
@@ -545,32 +676,52 @@ fn read_map_event_sink_params(
     end: usize,
     type_name: &str,
 ) -> Option<JDramaMapEventSinkParams> {
-    let lower_type = type_name.to_ascii_lowercase();
-    if !lower_type.contains("event") || !lower_type.contains("sink") {
-        return None;
+    #[derive(Clone, Copy)]
+    enum BuildingLayout {
+        Standard,
+        ShadowMario,
     }
 
+    // These are the exact sink factories registered by TMarNameRefGen and
+    // getNameRef_MapObj in the neighboring decomp. TMapEventSinkShadowMario
+    // appends an actor-name string to every building entry; the other
+    // registered subclasses retain TMapEventSink's two-u32 entry layout.
+    let layout = match semantic_type_name(type_name) {
+        "MapEventSinkInPollution"
+        | "MapEventSinkInPollutionReset"
+        | "MapEventSirenaSink"
+        | "MapEventSinkBianco"
+        | "AirportEventSink" => BuildingLayout::Standard,
+        "MapEventSinkShadowMario" => BuildingLayout::ShadowMario,
+        _ => return None,
+    };
+
+    if start.checked_add(8)? > end {
+        return None;
+    }
     let building_count = be_u32(bytes, start, FORMAT).ok()? as usize;
     let first_building = be_u32(bytes, start.checked_add(4)?, FORMAT).ok()? as usize;
     if building_count == 0 || building_count > 64 || first_building > u16::MAX as usize {
         return None;
     }
-    let entries_end = start.checked_add(8 + building_count.checked_mul(8)?)?;
-    if entries_end > end {
-        return None;
+    let mut cursor = start.checked_add(8)?;
+    let mut buildings = Vec::with_capacity(building_count);
+    for index in 0..building_count {
+        let next = cursor.checked_add(8)?;
+        if next > end {
+            return None;
+        }
+        buildings.push(JDramaMapEventBuilding {
+            building_index: u16::try_from(first_building.checked_add(index)?).ok()?,
+            pollution_layer_index: u16::try_from(be_u32(bytes, cursor, FORMAT).ok()?).ok()?,
+            pollution_object_index: u16::try_from(be_u32(bytes, cursor + 4, FORMAT).ok()?).ok()?,
+        });
+        cursor = next;
+        if matches!(layout, BuildingLayout::ShadowMario) {
+            let (_, next) = read_len_string(bytes, cursor, end).ok()?;
+            cursor = next;
+        }
     }
-
-    let buildings = (0..building_count)
-        .map(|index| {
-            let entry = start + 8 + index * 8;
-            Some(JDramaMapEventBuilding {
-                building_index: u16::try_from(first_building + index).ok()?,
-                pollution_layer_index: u16::try_from(be_u32(bytes, entry, FORMAT).ok()?).ok()?,
-                pollution_object_index: u16::try_from(be_u32(bytes, entry + 4, FORMAT).ok()?)
-                    .ok()?,
-            })
-        })
-        .collect::<Option<Vec<_>>>()?;
     Some(JDramaMapEventSinkParams { buildings })
 }
 
@@ -580,7 +731,7 @@ fn read_npc_params(
     end: usize,
     type_name: &str,
 ) -> Option<JDramaNpcParams> {
-    if !type_name.to_ascii_lowercase().starts_with("npc") {
+    if !is_npc_actor_type(type_name) {
         return None;
     }
     let (_, mut cursor) = read_len_string(bytes, start, end).ok()?;
@@ -613,36 +764,6 @@ fn read_npc_params(
         motion_max: values[10],
         coin_flag: values[11],
     })
-}
-
-fn scan_ascii_stream_strings(bytes: &[u8], start: usize, end: usize) -> Vec<String> {
-    let mut strings = Vec::new();
-    let mut cursor = start;
-    while cursor + 2 <= end {
-        let Ok(length) = be_u16(bytes, cursor, FORMAT) else {
-            break;
-        };
-        let length = length as usize;
-        let value_start = cursor + 2;
-        let Some(value_end) = value_start.checked_add(length) else {
-            break;
-        };
-        let valid = (3..=80).contains(&length)
-            && value_end <= end
-            && bytes[value_start..value_end]
-                .iter()
-                .all(|byte| byte.is_ascii_graphic() || *byte == b' ')
-            && bytes[value_start..value_end]
-                .iter()
-                .any(|byte| byte.is_ascii_alphabetic());
-        if valid {
-            strings.push(String::from_utf8_lossy(&bytes[value_start..value_end]).into_owned());
-            cursor = value_end;
-        } else {
-            cursor += 1;
-        }
-    }
-    strings
 }
 
 fn plausible_record_size(bytes: &[u8], offset: usize, limit: usize) -> Option<usize> {
@@ -699,7 +820,11 @@ fn read_len_string(bytes: &[u8], offset: usize, limit: usize) -> Result<(String,
     Ok((value, end))
 }
 
-fn read_actor_transform(bytes: &[u8], offset: usize, limit: usize) -> Option<JDramaTransform> {
+fn read_actor_stream_layout(
+    bytes: &[u8],
+    offset: usize,
+    limit: usize,
+) -> Option<ActorStreamLayout> {
     if offset + 36 > limit {
         return None;
     }
@@ -711,7 +836,38 @@ fn read_actor_transform(bytes: &[u8], offset: usize, limit: usize) -> Option<JDr
         rotation,
         scale,
     };
-    is_plausible_actor_transform(transform).then_some(transform)
+    let finite = transform
+        .translation
+        .into_iter()
+        .chain(transform.rotation)
+        .chain(transform.scale)
+        .all(f32::is_finite);
+    if !finite {
+        return None;
+    }
+
+    // JDrama::TActor::load always follows its nine floats with a TCharacter
+    // name and an exact TLightMap stream. Requiring both base-class fields
+    // prevents arbitrary plausible float payloads from becoming transforms.
+    let (character_name, mut cursor) = read_len_string(bytes, offset + 36, limit).ok()?;
+    let light_count = be_u32(bytes, cursor, FORMAT).ok()? as usize;
+    cursor = cursor.checked_add(4)?;
+    if light_count > limit.checked_sub(cursor)? / 6 {
+        return None;
+    }
+    let mut light_names = Vec::with_capacity(light_count);
+    for _ in 0..light_count {
+        cursor = cursor.checked_add(4)?;
+        let (name, next) = read_len_string(bytes, cursor, limit).ok()?;
+        light_names.push(name);
+        cursor = next;
+    }
+    Some(ActorStreamLayout {
+        transform,
+        character_name,
+        light_names,
+        tail_offset: cursor,
+    })
 }
 
 fn read_vec3(bytes: &[u8], offset: usize) -> Option<[f32; 3]> {
@@ -720,33 +876,6 @@ fn read_vec3(bytes: &[u8], offset: usize) -> Option<[f32; 3]> {
         be_f32(bytes, offset + 4, FORMAT).ok()?,
         be_f32(bytes, offset + 8, FORMAT).ok()?,
     ])
-}
-
-fn is_plausible_actor_transform(transform: JDramaTransform) -> bool {
-    let values = transform
-        .translation
-        .into_iter()
-        .chain(transform.rotation)
-        .chain(transform.scale);
-    if !values.clone().all(|value| value.is_finite()) {
-        return false;
-    }
-    if !transform
-        .translation
-        .iter()
-        .all(|value| value.abs() <= 1_000_000.0)
-    {
-        return false;
-    }
-    if !transform
-        .rotation
-        .iter()
-        .all(|value| value.abs() <= 100_000.0)
-    {
-        return false;
-    }
-    transform.scale.iter().all(|value| value.abs() <= 1_000.0)
-        && transform.scale.iter().any(|value| value.abs() > 0.0001)
 }
 
 fn invalid_offset(offset: usize, len: usize) -> FormatError {
@@ -814,17 +943,61 @@ mod tests {
     }
 
     #[test]
-    fn scans_ascii_stream_strings_after_binary_fields() {
-        let bytes = [
-            0xFF, 0x00, 0x00, 0x09, b'N', b'o', b'z', b'z', b'l', b'e', b'B', b'o', b'x', 0x00,
-            0x12, b'r', b'o', b'c', b'k', b'e', b't', b'_', b'n', b'o', b'z', b'z', b'l', b'e',
-            b'_', b'i', b't', b'e', b'm', 0x80,
-        ];
+    fn actor_transform_requires_the_complete_tactor_base_stream() {
+        let mut payload = Vec::new();
+        for value in [1.0_f32, 2.0, 3.0, 0.0, 45.0, 0.0, 1.0, 1.0, 1.0] {
+            payload.extend_from_slice(&value.to_be_bytes());
+        }
+        put_len_string(&mut payload, b"character");
+        payload.extend_from_slice(&0u32.to_be_bytes());
+        let bytes = name_ref_record("SmJ3DAct", "actor", &payload);
 
-        assert_eq!(
-            scan_ascii_stream_strings(&bytes, 0, bytes.len()),
-            ["NozzleBox", "rocket_nozzle_item"]
-        );
+        let records = parse_jdrama_object_records(&bytes).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].transform.unwrap().translation, [1.0, 2.0, 3.0]);
+        assert_eq!(records[0].stream_strings, ["character"]);
+        assert_eq!(records[0].raw_payload, payload);
+    }
+
+    #[test]
+    fn plausible_floats_without_tactor_fields_do_not_become_a_transform() {
+        let mut payload = Vec::new();
+        for value in [1.0_f32, 2.0, 3.0, 0.0, 45.0, 0.0, 1.0, 1.0, 1.0] {
+            payload.extend_from_slice(&value.to_be_bytes());
+        }
+        let bytes = name_ref_record("Opaque", "opaque", &payload);
+
+        let records = parse_jdrama_object_records(&bytes).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].transform, None);
+        assert_eq!(records[0].raw_payload, payload);
+    }
+
+    #[test]
+    fn unknown_payload_is_not_scanned_for_record_shaped_children() {
+        let embedded = name_ref_record("Leaf", "embedded", &[]);
+        let bytes = name_ref_record("Opaque", "root", &embedded);
+
+        let records = parse_jdrama_object_records(&bytes).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].raw_payload, embedded);
+    }
+
+    #[test]
+    fn known_group_layout_parses_only_its_counted_children() {
+        let child = name_ref_record("Leaf", "child", &[]);
+        let bytes = name_ref_array("GroupObj", "root", &[child]);
+
+        let records = parse_jdrama_object_records(&bytes).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1].type_name, "Leaf");
+        assert_eq!(records[1].object_name.as_deref(), Some("child"));
+    }
+
+    #[test]
+    fn malformed_known_group_layout_is_rejected() {
+        let bytes = name_ref_record("GroupObj", "root", &1u32.to_be_bytes());
+        assert!(parse_jdrama_object_records(&bytes).is_err());
     }
 
     #[test]
@@ -871,6 +1044,7 @@ mod tests {
         assert_eq!(params.parts_color_indices, [1, 255, 2]);
         assert_eq!(params.parts_mask, 264);
         assert_eq!(params.action_flags, 100);
+        assert!(read_npc_params(&bytes, 0, bytes.len(), "npcMonteMA").is_none());
     }
 
     #[test]
@@ -888,6 +1062,10 @@ mod tests {
         );
         assert_eq!(
             read_map_obj_grass_blade_count(&bytes, 0, bytes.len(), "MapObjGrassManager"),
+            None
+        );
+        assert_eq!(
+            read_map_obj_grass_blade_count(&bytes, 0, bytes.len(), "mapObjGrassGroup"),
             None
         );
     }
@@ -916,6 +1094,7 @@ mod tests {
             })
         );
         assert!(read_map_wire_manager_params(&bytes, 0, bytes.len(), "MapObjManager").is_none());
+        assert!(read_map_wire_manager_params(&bytes, 0, bytes.len(), "mapWireManager").is_none());
     }
 
     #[test]
@@ -929,6 +1108,7 @@ mod tests {
         assert!(
             read_obj_chara_folder(&chara_bytes, 0, chara_bytes.len(), "HamuKuriManager").is_none()
         );
+        assert!(read_obj_chara_folder(&chara_bytes, 0, chara_bytes.len(), "objChara").is_none());
 
         let mut manager_bytes = Vec::new();
         put_len_string(&mut manager_bytes, b"HamuKuriChara");
@@ -960,9 +1140,84 @@ mod tests {
         put_len_string(&mut bytes, b"HamuKuri Manager");
 
         assert_eq!(
-            read_live_actor_manager(&bytes, 0, bytes.len()).as_deref(),
+            read_live_actor_manager_with_cursor(&bytes, 0, bytes.len())
+                .map(|(manager, _)| manager)
+                .as_deref(),
             Some("HamuKuri Manager")
         );
+    }
+
+    #[test]
+    fn live_actor_manager_tail_requires_exact_semantic_type_case() {
+        let actor_payload = |type_name: &str| {
+            let mut payload = Vec::new();
+            for value in [0.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0] {
+                payload.extend_from_slice(&value.to_be_bytes());
+            }
+            put_len_string(&mut payload, b"Enemy Character");
+            payload.extend_from_slice(&0_u32.to_be_bytes());
+            put_len_string(&mut payload, b"Enemy Manager");
+            name_ref_record(type_name, "actor", &payload)
+        };
+
+        let exact = parse_jdrama_object_records(&actor_payload("LiveActor")).unwrap();
+        assert_eq!(
+            exact[0].live_actor_manager.as_deref(),
+            Some("Enemy Manager")
+        );
+        assert_eq!(exact[0].actor_tail_string.as_deref(), Some("Enemy Manager"));
+
+        let wrong_case = parse_jdrama_object_records(&actor_payload("liveActor")).unwrap();
+        assert_eq!(wrong_case[0].live_actor_manager, None);
+        assert_eq!(
+            wrong_case[0].actor_tail_string.as_deref(),
+            Some("Enemy Manager")
+        );
+        assert!(wrong_case[0].transform.is_some());
+    }
+
+    #[test]
+    fn reads_nozzle_box_item_from_its_exact_subclass_tail() {
+        let nozzle_payload = |type_name: &str, trailing_byte: bool| {
+            let mut payload = Vec::new();
+            for value in [0.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0] {
+                payload.extend_from_slice(&value.to_be_bytes());
+            }
+            put_len_string(&mut payload, b"NozzleBox Character");
+            payload.extend_from_slice(&0_u32.to_be_bytes());
+            put_len_string(&mut payload, b"NozzleBox");
+            put_len_string(&mut payload, b"rocket_nozzle_item");
+            put_len_string(&mut payload, b"valid");
+            payload.extend_from_slice(&50.0_f32.to_be_bytes());
+            payload.extend_from_slice(&20.0_f32.to_be_bytes());
+            if trailing_byte {
+                payload.push(0);
+            }
+            (
+                payload.clone(),
+                name_ref_record(type_name, "nozzle box", &payload),
+            )
+        };
+
+        let (payload, bytes) = nozzle_payload("NozzleBox", false);
+        let exact = parse_jdrama_object_records(&bytes).unwrap();
+        assert_eq!(exact[0].actor_tail_string.as_deref(), Some("NozzleBox"));
+        assert_eq!(
+            exact[0].nozzle_box_item.as_deref(),
+            Some("rocket_nozzle_item")
+        );
+        assert_eq!(exact[0].raw_payload, payload);
+
+        let (_, wrong_case) = nozzle_payload("nozzleBox", false);
+        assert_eq!(
+            parse_jdrama_object_records(&wrong_case).unwrap()[0].nozzle_box_item,
+            None
+        );
+
+        let (_, malformed) = nozzle_payload("NozzleBox", true);
+        let malformed = parse_jdrama_object_records(&malformed).unwrap();
+        assert_eq!(malformed[0].nozzle_box_item, None);
+        assert_eq!(malformed[0].actor_tail_string.as_deref(), Some("NozzleBox"));
     }
 
     #[test]
@@ -977,7 +1232,9 @@ mod tests {
         put_len_string(&mut bytes, b"HamuKuri Manager");
 
         assert_eq!(
-            read_live_actor_manager(&bytes, 0, bytes.len()).as_deref(),
+            read_live_actor_manager_with_cursor(&bytes, 0, bytes.len())
+                .map(|(manager, _)| manager)
+                .as_deref(),
             Some("HamuKuri Manager")
         );
     }
@@ -1023,6 +1280,7 @@ mod tests {
             })
         );
         assert!(read_cube_general_info(&bytes, 0, bytes.len(), "MapObjBase").is_none());
+        assert!(read_cube_general_info(&bytes, 0, bytes.len(), "cubeGeneralInfo").is_none());
     }
 
     #[test]
@@ -1044,8 +1302,52 @@ mod tests {
         assert_eq!(params.buildings[1].building_index, 2);
         assert_eq!(params.buildings[1].pollution_layer_index, 1);
         assert_eq!(params.buildings[1].pollution_object_index, 1);
-        assert!(read_map_event_sink_params(&bytes, 0, bytes.len(), "MapEventSirenaSink").is_some());
+        for type_name in [
+            "MapEventSinkInPollution",
+            "MapEventSinkInPollutionReset",
+            "MapEventSirenaSink",
+            "MapEventSinkBianco",
+            "AirportEventSink",
+        ] {
+            assert!(
+                read_map_event_sink_params(&bytes, 0, bytes.len(), type_name).is_some(),
+                "registered standard sink {type_name}"
+            );
+        }
         assert!(read_map_event_sink_params(&bytes, 0, bytes.len(), "MapObjBase").is_none());
+        assert!(read_map_event_sink_params(&bytes, 0, bytes.len(), "mapEventSinkBianco").is_none());
+        assert!(read_map_event_sink_params(&bytes, 0, bytes.len(), "UnrelatedEventSink").is_none());
+    }
+
+    #[test]
+    fn reads_shadow_mario_event_sink_variable_building_entries() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&2_u32.to_be_bytes());
+        bytes.extend_from_slice(&4_u32.to_be_bytes());
+        bytes.extend_from_slice(&7_u32.to_be_bytes());
+        bytes.extend_from_slice(&8_u32.to_be_bytes());
+        put_len_string(&mut bytes, b"shadow actor 1");
+        bytes.extend_from_slice(&9_u32.to_be_bytes());
+        bytes.extend_from_slice(&10_u32.to_be_bytes());
+        put_len_string(&mut bytes, b"shadow actor 2");
+
+        let params =
+            read_map_event_sink_params(&bytes, 0, bytes.len(), "MapEventSinkShadowMario").unwrap();
+        assert_eq!(
+            params.buildings,
+            [
+                JDramaMapEventBuilding {
+                    building_index: 4,
+                    pollution_layer_index: 7,
+                    pollution_object_index: 8,
+                },
+                JDramaMapEventBuilding {
+                    building_index: 5,
+                    pollution_layer_index: 9,
+                    pollution_object_index: 10,
+                },
+            ]
+        );
     }
 
     fn put_len_string(bytes: &mut Vec<u8>, value: &[u8]) {

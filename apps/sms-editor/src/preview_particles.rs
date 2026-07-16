@@ -208,10 +208,7 @@ fn cpp_class_names_for_object<'a>(
             .next()
             .unwrap_or(&binding.class_name);
         let without_prefix = short_class.strip_prefix('T').unwrap_or(short_class);
-        if object_names
-            .iter()
-            .any(|name| name.eq_ignore_ascii_case(without_prefix))
-        {
+        if object_names.contains(&without_prefix) {
             classes.push(binding.class_name.as_str());
         }
     }

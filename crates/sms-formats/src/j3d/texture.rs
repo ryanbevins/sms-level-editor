@@ -1,6 +1,76 @@
 use super::*;
 
+const MAX_TEXTURE_DECODE_BYTES: usize = 256 * 1024 * 1024;
+
+pub(super) fn decoded_timg_retained_bytes(bytes: &[u8], header_offset: usize) -> Result<usize> {
+    let format = checked_slice(FORMAT, bytes, header_offset, 1)?[0];
+    let width = be_u16(bytes, header_offset + 0x02, FORMAT)?;
+    let height = be_u16(bytes, header_offset + 0x04, FORMAT)?;
+    if width == 0 || height == 0 {
+        return Err(FormatError::Unsupported {
+            format: FORMAT,
+            message: "texture has zero size".to_string(),
+        });
+    }
+    let mipmap_count = checked_slice(FORMAT, bytes, header_offset + 0x18, 1)?[0];
+    let relative_image_offset = match be_u32(bytes, header_offset + 0x1C, FORMAT)? as usize {
+        0 => 0x20,
+        offset => offset,
+    };
+    let mut level_offset = header_offset
+        .checked_add(relative_image_offset)
+        .ok_or_else(|| invalid_offset(header_offset, bytes.len()))?;
+    let mut level_width = width;
+    let mut level_height = height;
+    let mut decoded_mip_bytes = 0usize;
+    let mut base_mip_bytes = 0usize;
+
+    for level in 0..mipmap_count.max(1) {
+        let rgba_len = decoded_texture_level_size(level_width, level_height)?;
+        if level == 0 {
+            base_mip_bytes = rgba_len;
+        }
+        decoded_mip_bytes =
+            decoded_mip_bytes
+                .checked_add(rgba_len)
+                .ok_or(FormatError::ResourceLimit {
+                    format: FORMAT,
+                    resource: "retained decoded texture bytes",
+                    requested: usize::MAX,
+                    limit: MAX_TEXTURE_DECODE_BYTES,
+                })?;
+        let encoded_len = encoded_texture_level_size(format, level_width, level_height)?;
+        checked_slice(FORMAT, bytes, level_offset, encoded_len)?;
+        level_offset = level_offset
+            .checked_add(encoded_len)
+            .ok_or_else(|| invalid_offset(level_offset, bytes.len()))?;
+        if level_width == 1 && level_height == 1 {
+            break;
+        }
+        level_width = (level_width / 2).max(1);
+        level_height = (level_height / 2).max(1);
+    }
+
+    decoded_mip_bytes
+        .checked_add(base_mip_bytes)
+        .ok_or(FormatError::ResourceLimit {
+            format: FORMAT,
+            resource: "retained decoded texture bytes",
+            requested: usize::MAX,
+            limit: MAX_TEXTURE_DECODE_BYTES,
+        })
+}
+
 pub(super) fn decode_timg(bytes: &[u8], header_offset: usize) -> Result<J3dTexturePreview> {
+    let retained_bytes = decoded_timg_retained_bytes(bytes, header_offset)?;
+    if retained_bytes > MAX_TEXTURE_DECODE_BYTES {
+        return Err(FormatError::ResourceLimit {
+            format: FORMAT,
+            resource: "retained decoded texture bytes",
+            requested: retained_bytes,
+            limit: MAX_TEXTURE_DECODE_BYTES,
+        });
+    }
     let format = *checked_slice(FORMAT, bytes, header_offset, 1)?
         .first()
         .unwrap_or(&0);
@@ -25,39 +95,61 @@ pub(super) fn decode_timg(bytes: &[u8], header_offset: usize) -> Result<J3dTextu
         });
     }
     let image_offset = be_u32(bytes, header_offset + 0x1C, FORMAT)? as usize;
+    let relative_image_offset = if image_offset == 0 {
+        0x20
+    } else {
+        image_offset
+    };
     let image_offset = header_offset
-        + if image_offset == 0 {
-            0x20
-        } else {
-            image_offset
-        };
+        .checked_add(relative_image_offset)
+        .ok_or_else(|| invalid_offset(header_offset, bytes.len()))?;
     let mut mips = Vec::new();
     let mut level_offset = image_offset;
     let mut level_width = width;
     let mut level_height = height;
-    for level in 0..mipmap_count.max(1) {
-        let mut rgba = vec![0; level_width as usize * level_height as usize * 4];
-        let decoded = decode_texture_level(
+    let mut total_decoded_bytes = 0usize;
+    for _level in 0..mipmap_count.max(1) {
+        let rgba_len = decoded_texture_level_size(level_width, level_height)?;
+        total_decoded_bytes =
+            total_decoded_bytes
+                .checked_add(rgba_len)
+                .ok_or(FormatError::ResourceLimit {
+                    format: FORMAT,
+                    resource: "decoded texture bytes",
+                    requested: usize::MAX,
+                    limit: MAX_TEXTURE_DECODE_BYTES,
+                })?;
+        if total_decoded_bytes > MAX_TEXTURE_DECODE_BYTES {
+            return Err(FormatError::ResourceLimit {
+                format: FORMAT,
+                resource: "decoded texture bytes",
+                requested: total_decoded_bytes,
+                limit: MAX_TEXTURE_DECODE_BYTES,
+            });
+        }
+        let level_size = encoded_texture_level_size(format, level_width, level_height)?;
+        checked_slice(FORMAT, bytes, level_offset, level_size)?;
+        let mut rgba = Vec::new();
+        rgba.try_reserve_exact(rgba_len)
+            .map_err(|error| FormatError::Unsupported {
+                format: FORMAT,
+                message: format!("could not reserve {rgba_len} decoded texture bytes: {error}"),
+            })?;
+        rgba.resize(rgba_len, 0);
+        decode_texture_level(
             bytes,
             level_offset,
             format,
             level_width,
             level_height,
             &mut rgba,
-        );
-        if let Err(err) = decoded {
-            if level == 0 {
-                return Err(err);
-            }
-            break;
-        }
+        )?;
         mips.push(J3dTextureMipPreview {
             width: level_width,
             height: level_height,
             rgba,
         });
 
-        let level_size = encoded_texture_level_size(format, level_width, level_height)?;
         level_offset = level_offset
             .checked_add(level_size)
             .ok_or_else(|| invalid_offset(level_offset, bytes.len()))?;
@@ -67,10 +159,29 @@ pub(super) fn decode_timg(bytes: &[u8], header_offset: usize) -> Result<J3dTextu
         level_width = (level_width / 2).max(1);
         level_height = (level_height / 2).max(1);
     }
-    let rgba = mips
-        .first()
-        .map(|mip| mip.rgba.clone())
-        .unwrap_or_else(|| vec![255, 255, 255, 255]);
+    let base_mip = mips.first().ok_or_else(|| FormatError::Unsupported {
+        format: FORMAT,
+        message: "texture did not contain a decodable image level".to_string(),
+    })?;
+    let actual_retained_bytes =
+        total_decoded_bytes
+            .checked_add(base_mip.rgba.len())
+            .ok_or(FormatError::ResourceLimit {
+                format: FORMAT,
+                resource: "retained decoded texture bytes",
+                requested: usize::MAX,
+                limit: MAX_TEXTURE_DECODE_BYTES,
+            })?;
+    if actual_retained_bytes > MAX_TEXTURE_DECODE_BYTES {
+        return Err(FormatError::ResourceLimit {
+            format: FORMAT,
+            resource: "retained decoded texture bytes",
+            requested: actual_retained_bytes,
+            limit: MAX_TEXTURE_DECODE_BYTES,
+        });
+    }
+    debug_assert_eq!(actual_retained_bytes, retained_bytes);
+    let rgba = base_mip.rgba.clone();
 
     Ok(J3dTexturePreview {
         name: String::new(),
@@ -133,7 +244,40 @@ pub(super) fn encoded_texture_level_size(format: u8, width: u16, height: u16) ->
     };
     let tiles_x = (width as usize).div_ceil(tile_width);
     let tiles_y = (height as usize).div_ceil(tile_height);
-    Ok(tiles_x * tiles_y * tile_bytes)
+    tiles_x
+        .checked_mul(tiles_y)
+        .and_then(|tiles| tiles.checked_mul(tile_bytes))
+        .ok_or(FormatError::ResourceLimit {
+            format: FORMAT,
+            resource: "encoded texture bytes",
+            requested: usize::MAX,
+            limit: bytes_addressable_limit(),
+        })
+}
+
+fn decoded_texture_level_size(width: u16, height: u16) -> Result<usize> {
+    let requested = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or(FormatError::ResourceLimit {
+            format: FORMAT,
+            resource: "decoded texture bytes",
+            requested: usize::MAX,
+            limit: MAX_TEXTURE_DECODE_BYTES,
+        })?;
+    if requested > MAX_TEXTURE_DECODE_BYTES {
+        return Err(FormatError::ResourceLimit {
+            format: FORMAT,
+            resource: "decoded texture bytes",
+            requested,
+            limit: MAX_TEXTURE_DECODE_BYTES,
+        });
+    }
+    Ok(requested)
+}
+
+const fn bytes_addressable_limit() -> usize {
+    isize::MAX as usize
 }
 
 pub(super) fn decode_i4(
@@ -322,7 +466,15 @@ pub(super) fn decode_cmpr(
     let tile_height = 8usize;
     let tiles_x = (width as usize).div_ceil(tile_width);
     let tiles_y = (height as usize).div_ceil(tile_height);
-    let total = tiles_x * tiles_y * 32;
+    let total = tiles_x
+        .checked_mul(tiles_y)
+        .and_then(|tiles| tiles.checked_mul(32))
+        .ok_or(FormatError::ResourceLimit {
+            format: FORMAT,
+            resource: "encoded CMPR bytes",
+            requested: usize::MAX,
+            limit: bytes_addressable_limit(),
+        })?;
     checked_slice(FORMAT, bytes, offset, total)?;
 
     for tile_y in 0..tiles_y {
@@ -370,7 +522,16 @@ pub(super) fn decode_tiled(
 ) -> Result<()> {
     let tiles_x = (width as usize).div_ceil(tile_width);
     let tiles_y = (height as usize).div_ceil(tile_height);
-    checked_slice(FORMAT, bytes, offset, tiles_x * tiles_y * tile_bytes)?;
+    let total = tiles_x
+        .checked_mul(tiles_y)
+        .and_then(|tiles| tiles.checked_mul(tile_bytes))
+        .ok_or(FormatError::ResourceLimit {
+            format: FORMAT,
+            resource: "encoded tiled texture bytes",
+            requested: usize::MAX,
+            limit: bytes_addressable_limit(),
+        })?;
+    checked_slice(FORMAT, bytes, offset, total)?;
     for tile_y in 0..tiles_y {
         for tile_x in 0..tiles_x {
             let tile = checked_slice(
@@ -456,4 +617,35 @@ pub(super) fn cmpr_palette(color0: u16, color1: u16) -> [[u8; 4]; 4] {
 
 pub(super) fn expand_bits(value: u16, bits: u8) -> u8 {
     ((value * 255) / ((1u16 << bits) - 1)) as u8
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_unreasonable_texture_dimensions_before_allocating() {
+        let mut bytes = vec![0; 0x20];
+        bytes[0x02..0x04].copy_from_slice(&u16::MAX.to_be_bytes());
+        bytes[0x04..0x06].copy_from_slice(&u16::MAX.to_be_bytes());
+
+        assert!(matches!(
+            decode_timg(&bytes, 0),
+            Err(FormatError::ResourceLimit { .. })
+        ));
+    }
+
+    #[test]
+    fn truncated_non_base_mip_is_a_structural_error() {
+        let mut bytes = vec![0; 0x40];
+        bytes[0x02..0x04].copy_from_slice(&8u16.to_be_bytes());
+        bytes[0x04..0x06].copy_from_slice(&8u16.to_be_bytes());
+        bytes[0x10] = 1;
+        bytes[0x18] = 2;
+
+        assert!(matches!(
+            decode_timg(&bytes, 0),
+            Err(FormatError::InvalidOffset { .. })
+        ));
+    }
 }

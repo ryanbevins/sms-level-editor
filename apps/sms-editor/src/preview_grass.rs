@@ -167,11 +167,11 @@ pub(super) fn build_procedural_grass_preview(
 }
 
 fn is_map_obj_grass_group(object: &SceneObject) -> bool {
-    object.factory_name.eq_ignore_ascii_case("MapObjGrassGroup")
+    object.factory_name == "MapObjGrassGroup"
         || object
             .class_name
             .as_deref()
-            .is_some_and(|name| name.eq_ignore_ascii_case("MapObjGrassGroup"))
+            .is_some_and(|name| name == "MapObjGrassGroup")
 }
 
 struct SmsRand {
@@ -205,13 +205,14 @@ mod tests {
             load_issues: Vec::new(),
             lighting: Default::default(),
             actor_previews: BTreeMap::new(),
+            loaded_project: None,
         };
         let mut grass = SceneObject::new("grass-0", "MapObjGrassGroup");
         grass.transform.translation = [100.0, 20.0, -50.0];
         grass.transform.scale = [2.0, 1.5, 3.0];
         grass
             .raw_params
-            .insert("grass_blade_count".to_string(), "3".to_string());
+            .insert("grass_blade_count".to_string(), "3".to_string().into());
         document.objects.push(grass);
 
         let preview = build_procedural_grass_preview(&document, 7, 11);
@@ -242,10 +243,22 @@ mod tests {
     }
 
     #[test]
+    fn grass_preview_identity_is_case_sensitive() {
+        assert!(is_map_obj_grass_group(&SceneObject::new(
+            "exact",
+            "MapObjGrassGroup"
+        )));
+        assert!(!is_map_obj_grass_group(&SceneObject::new(
+            "wrong-case",
+            "mapobjgrassgroup"
+        )));
+    }
+
+    #[test]
+    #[ignore = "requires SMS_GRASS_TEST_BASE_ROOT with extracted retail assets"]
     fn dolpic_ex3_builds_all_retail_grass_when_assets_are_available() {
-        let Ok(base_root) = std::env::var("SMS_GRASS_TEST_BASE_ROOT") else {
-            return;
-        };
+        let base_root = std::env::var("SMS_GRASS_TEST_BASE_ROOT")
+            .expect("set SMS_GRASS_TEST_BASE_ROOT to an extracted retail base root");
         let document = StageDocument::open(base_root, "dolpic_ex3").unwrap();
 
         let preview = SmsEditorApp::build_model_preview(

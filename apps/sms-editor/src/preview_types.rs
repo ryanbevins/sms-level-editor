@@ -15,10 +15,13 @@ pub(super) struct ModelPreview {
     pub(super) camera_bounds_max: [f32; 3],
     pub(super) loaded_models: usize,
     pub(super) failed_models: usize,
+    pub(super) model_failures: Vec<PreviewModelFailure>,
     pub(super) source_vertices: usize,
     pub(super) source_triangles: usize,
     pub(super) source_textures: usize,
     pub(super) object_model_indices: BTreeMap<String, usize>,
+    pub(super) mirror_cubes: Vec<PreviewMirrorCube>,
+    pub(super) mirror_model_slots: BTreeMap<usize, usize>,
     pub(super) animated_models: Vec<AnimatedModelPreview>,
     pub(super) animated_flags: Vec<AnimatedFlagPreview>,
     pub(super) rotating_models: Vec<RuntimeRotatingModelPreview>,
@@ -27,6 +30,12 @@ pub(super) struct ModelPreview {
     pub(super) actor_particles: Vec<LevelTransformParticlePreview>,
     pub(super) level_transform_duration_frames: f32,
     pub(super) level_transform_particle_end_frames: f32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct PreviewModelFailure {
+    pub(super) asset_path: String,
+    pub(super) error: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -69,6 +78,79 @@ impl ModelPreview {
         let dy = self.camera_bounds_max[1] - self.camera_bounds_min[1];
         let dz = self.camera_bounds_max[2] - self.camera_bounds_min[2];
         ((dx * dx + dy * dy + dz * dz).sqrt() * 0.5).max(1000.0)
+    }
+
+    pub(super) fn active_mirror_slot(&self, position: [f32; 3]) -> Option<usize> {
+        self.mirror_cubes
+            .iter()
+            .find(|cube| cube.contains(position))
+            .map(|cube| cube.model_slot)
+    }
+
+    pub(super) fn mirror_surface_model_is_visible(
+        &self,
+        model_index: usize,
+        position: [f32; 3],
+    ) -> bool {
+        let active_slot = self.active_mirror_slot(position);
+        self.mirror_model_slots
+            .get(&model_index)
+            .is_some_and(|slot| Some(*slot) == active_slot)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct PreviewMirrorCube {
+    pub(super) center: [f32; 3],
+    pub(super) rotation_degrees: [f32; 3],
+    pub(super) dimensions: [f32; 3],
+    pub(super) model_slot: usize,
+}
+
+impl PreviewMirrorCube {
+    pub(super) fn contains(&self, position: [f32; 3]) -> bool {
+        if !position
+            .iter()
+            .chain(self.center.iter())
+            .chain(self.rotation_degrees.iter())
+            .chain(self.dimensions.iter())
+            .all(|value| value.is_finite())
+            || self.dimensions.iter().any(|dimension| *dimension <= 0.0)
+        {
+            return false;
+        }
+
+        let [mut dx, mut dy, mut dz] = [
+            position[0] - self.center[0],
+            position[1] - self.center[1],
+            position[2] - self.center[2],
+        ];
+
+        if self.rotation_degrees[2] != 0.0 {
+            let (sin, cos) = (-self.rotation_degrees[2]).to_radians().sin_cos();
+            let dy_sin = dy * sin;
+            dy = dx * sin + dy * cos;
+            dx = dx * cos - dy_sin;
+        }
+        if self.rotation_degrees[1] != 0.0 {
+            let (sin, cos) = (-self.rotation_degrees[1]).to_radians().sin_cos();
+            let dz_sin = dz * sin;
+            dz = -dx * sin + dz * cos;
+            dx = dx * cos + dz_sin;
+        }
+        if self.rotation_degrees[0] != 0.0 {
+            let (sin, cos) = (-self.rotation_degrees[0]).to_radians().sin_cos();
+            let dz_sin = dz * sin;
+            dz = dy * sin + dz * cos;
+            dy = dy * cos - dz_sin;
+        }
+
+        -self.dimensions[0] * 0.5 < dx
+            && dx < self.dimensions[0] * 0.5
+            && 0.0 < dy
+            && dy < self.dimensions[1]
+            && -self.dimensions[2] * 0.5 < dz
+            && dz < self.dimensions[2] * 0.5
     }
 }
 

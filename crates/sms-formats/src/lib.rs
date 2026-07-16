@@ -37,7 +37,7 @@ pub use jdrama::{
 };
 pub use jpa::{
     JpaBaseShape, JpaChildShape, JpaColorAnimation, JpaColorKey, JpaEffect, JpaEmitter,
-    JpaExtraShape, JpaField, JpaKeyframeCurve,
+    JpaExtraShape, JpaField, JpaKeyframeCurve, JpaRawBlock,
 };
 pub use rarc::{RarcArchive, RarcFileEntry, RarcHeader};
 pub use raw::{RawFile, RawFormat};
@@ -71,6 +71,15 @@ pub enum FormatError {
         format: &'static str,
         offset: usize,
         len: usize,
+    },
+    #[error(
+        "resource limit exceeded while parsing {format}: {resource} requested {requested} bytes/items, limit is {limit}"
+    )]
+    ResourceLimit {
+        format: &'static str,
+        resource: &'static str,
+        requested: usize,
+        limit: usize,
     },
     #[error("unsupported {format} feature: {message}")]
     Unsupported {

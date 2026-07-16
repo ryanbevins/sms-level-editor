@@ -233,21 +233,23 @@ fn main() -> Result<()> {
                         .map(|kind| format!("{:?}", asset.kind).to_ascii_lowercase() == *kind)
                         .unwrap_or(true)
                 })
-                .map(|asset| {
-                    let bytes = read_stage_asset_bytes(&asset.path).unwrap_or_default();
+                .map(|asset| -> Result<_> {
+                    let bytes = read_stage_asset_bytes(&asset.path).with_context(|| {
+                        format!("failed to read stage asset {}", asset.path.display())
+                    })?;
                     let header: Vec<String> = bytes
                         .iter()
                         .take(16)
                         .map(|byte| format!("{byte:02X}"))
                         .collect();
-                    serde_json::json!({
+                    Ok(serde_json::json!({
                         "kind": format!("{:?}", asset.kind),
                         "path": asset.path,
                         "size": bytes.len(),
                         "header": header,
-                    })
+                    }))
                 })
-                .collect();
+                .collect::<Result<_>>()?;
             println!("{}", serde_json::to_string_pretty(&assets)?);
             Ok(())
         }
@@ -266,7 +268,7 @@ fn main() -> Result<()> {
         } => {
             let registry = SchemaGenerator::new(repo_root).generate()?;
             let document = StageDocument::open(base_root, stage)?.with_registry(registry);
-            let preview = model_preview_summary(&document);
+            let preview = model_preview_summary(&document)?;
             println!(
                 "{}",
                 serde_json::json!({
@@ -318,7 +320,7 @@ fn main() -> Result<()> {
             materials,
         } => {
             let document = StageDocument::open(base_root, stage)?;
-            let stats = preview_stats(&document, filter.as_deref(), map_only, materials);
+            let stats = preview_stats(&document, filter.as_deref(), map_only, materials)?;
             println!("{}", serde_json::to_string_pretty(&stats)?);
             Ok(())
         }
@@ -345,9 +347,16 @@ fn main() -> Result<()> {
             project_root,
         } => {
             let mut document = StageDocument::open(base_root, stage)?;
-            document.queue_editor_overlay_change()?;
-            let manifest = document.save_project_folder(project_root)?;
-            println!("{}", serde_json::to_string_pretty(&manifest)?);
+            document.load_project_folder(&project_root)?;
+            let outcome = document.save_project_folder(project_root)?;
+            for warning in &outcome.warnings {
+                eprintln!(
+                    "save warning (recovery path {}): {}",
+                    warning.recovery_path.display(),
+                    warning.message
+                );
+            }
+            println!("{}", serde_json::to_string_pretty(&outcome.manifest)?);
             Ok(())
         }
         Commands::LaunchDolphin {
@@ -367,7 +376,7 @@ fn count_assets(document: &StageDocument, kind: StageAssetKind) -> usize {
         .count()
 }
 
-fn model_preview_summary(document: &StageDocument) -> (usize, usize, usize, usize, usize) {
+fn model_preview_summary(document: &StageDocument) -> Result<(usize, usize, usize, usize, usize)> {
     let mut model_count = 0;
     let mut vertex_count = 0;
     let mut triangle_count = 0;
@@ -378,37 +387,44 @@ fn model_preview_summary(document: &StageDocument) -> (usize, usize, usize, usiz
             continue;
         }
 
-        let Ok(bytes) = read_stage_asset_bytes(&asset.path) else {
-            continue;
-        };
-        let Ok(file) = J3dFile::parse(&bytes) else {
-            continue;
-        };
-        if let Ok(preview) = file.geometry_preview() {
-            model_count += 1;
-            vertex_count += preview.positions.len();
-            triangle_count += preview.triangles.len();
-            texture_count += preview.textures.len();
-            textured_triangle_count += preview
-                .triangles
-                .iter()
-                .filter(|triangle| {
-                    triangle.texture_index.is_some() && triangle.tex_coords.is_some()
-                })
-                .count();
-        } else if let Ok(preview) = file.vertex_preview() {
-            model_count += 1;
-            vertex_count += preview.positions.len();
+        let bytes = read_stage_asset_bytes(&asset.path)
+            .with_context(|| format!("failed to read model asset {}", asset.path.display()))?;
+        let file = J3dFile::parse(&bytes)
+            .with_context(|| format!("failed to parse model asset {}", asset.path.display()))?;
+        match file.geometry_preview() {
+            Ok(preview) => {
+                model_count += 1;
+                vertex_count += preview.positions.len();
+                triangle_count += preview.triangles.len();
+                texture_count += preview.textures.len();
+                textured_triangle_count += preview
+                    .triangles
+                    .iter()
+                    .filter(|triangle| {
+                        triangle.texture_index.is_some() && triangle.tex_coords.is_some()
+                    })
+                    .count();
+            }
+            Err(geometry_error) => {
+                let preview = file.vertex_preview().with_context(|| {
+                    format!(
+                        "failed to build preview for {} (geometry preview error: {geometry_error})",
+                        asset.path.display()
+                    )
+                })?;
+                model_count += 1;
+                vertex_count += preview.positions.len();
+            }
         }
     }
 
-    (
+    Ok((
         model_count,
         vertex_count,
         triangle_count,
         texture_count,
         textured_triangle_count,
-    )
+    ))
 }
 
 fn preview_stats(
@@ -416,7 +432,7 @@ fn preview_stats(
     filter: Option<&str>,
     map_only: bool,
     include_materials: bool,
-) -> serde_json::Value {
+) -> Result<serde_json::Value> {
     let filter = filter.map(|filter| filter.to_ascii_lowercase());
     let mut models = Vec::new();
     for asset in &document.assets {
@@ -433,15 +449,16 @@ fn preview_stats(
             continue;
         }
 
-        let Ok(bytes) = read_stage_asset_bytes(&asset.path) else {
-            continue;
-        };
-        let Ok(file) = J3dFile::parse(&bytes) else {
-            continue;
-        };
-        let Ok(preview) = file.geometry_preview() else {
-            continue;
-        };
+        let bytes = read_stage_asset_bytes(&asset.path)
+            .with_context(|| format!("failed to read model asset {}", asset.path.display()))?;
+        let file = J3dFile::parse(&bytes)
+            .with_context(|| format!("failed to parse model asset {}", asset.path.display()))?;
+        let preview = file.geometry_preview().with_context(|| {
+            format!(
+                "failed to build geometry preview for {}",
+                asset.path.display()
+            )
+        })?;
 
         let mut uv_min = [f32::INFINITY; 2];
         let mut uv_max = [f32::NEG_INFINITY; 2];
@@ -622,19 +639,29 @@ fn preview_stats(
         });
         if include_materials {
             model["materials"] =
-                serde_json::to_value(file.material_diagnostics().unwrap_or_default())
-                    .unwrap_or(serde_json::Value::Null);
+                serde_json::to_value(file.material_diagnostics().with_context(|| {
+                    format!(
+                        "failed to inspect materials for model asset {}",
+                        asset.path.display()
+                    )
+                })?)
+                .with_context(|| {
+                    format!(
+                        "failed to serialize material diagnostics for {}",
+                        asset.path.display()
+                    )
+                })?;
         }
         models.push(model);
     }
 
-    serde_json::json!({
+    Ok(serde_json::json!({
         "stage": document.stage_id,
         "filter": filter,
         "map_only": map_only,
         "model_count": models.len(),
         "models": models,
-    })
+    }))
 }
 
 fn average_usize(sum: usize, count: usize) -> Option<f32> {

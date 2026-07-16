@@ -948,6 +948,18 @@ fn apply_fog(color: vec4<f32>, depth: f32) -> vec4<f32> {
     return vec4<f32>(mix(color.rgb, material.fog_color.rgb, clamp(fog_amount, 0.0, 1.0)), color.a);
 }
 
+fn apply_source_independent_logic(color: vec4<f32>) -> vec4<f32> {
+    if (u32(material.runtime_parameters.y) != 2u) {
+        return color;
+    }
+    switch u32(material.runtime_parameters.z) {
+        case 0u: { return vec4<f32>(0.0); }       // GX_LO_CLEAR
+        case 12u: { return vec4<f32>(1.0) - color; } // GX_LO_INVCOPY
+        case 15u: { return vec4<f32>(1.0); }      // GX_LO_SET
+        default: { return color; }                 // COPY, NOOP, or warned fallback
+    }
+}
+
 @fragment
 fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     if (input.coordinate_space == 7u) {
@@ -972,7 +984,9 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
             screen_uv + displacement,
             screen_uv,
         );
-        return vec4<f32>(scene.rgb, mask.a * input.color0.a);
+        return apply_source_independent_logic(
+            vec4<f32>(scene.rgb, mask.a * input.color0.a),
+        );
     }
     var previous = vec4<f32>(0.0);
     var reg0 = material.tev_colors[0];
@@ -1068,7 +1082,9 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     if (!alpha_compare_passes(output.a)) {
         discard;
     }
-    return clamp(apply_fog(output, input.view_depth), vec4<f32>(0.0), vec4<f32>(1.0));
+    return apply_source_independent_logic(
+        clamp(apply_fog(output, input.view_depth), vec4<f32>(0.0), vec4<f32>(1.0)),
+    );
 }
 
 @fragment

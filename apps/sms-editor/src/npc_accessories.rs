@@ -6,35 +6,16 @@ pub(super) fn apply_npc_accessory_material_color(
     spec: &NpcAccessorySpec,
 ) {
     let color_index = npc_parts_color_index(object, usize::from(spec.color_index_channel));
+    let material_name = material.name.clone();
     for change in spec
         .color_changes
         .iter()
-        .filter(|change| material.name.eq_ignore_ascii_case(&change.material_name))
+        .filter(|change| material_name.eq_ignore_ascii_case(&change.material_name))
     {
         let Some(index) = color_index else {
             continue;
         };
-        match change.mode {
-            0 => {
-                if let Some(color) = change.colors0.get(index) {
-                    material.material_colors[0] = color.map(|value| value as u8);
-                }
-            }
-            1 => {
-                if let Some(color) = change.colors0.get(index) {
-                    material.tev_colors[0] = *color;
-                }
-            }
-            2 => {
-                if let Some(color) = change.colors0.get(index) {
-                    material.tev_colors[1] = *color;
-                }
-                if let Some(color) = change.colors1.get(index) {
-                    material.tev_colors[2] = *color;
-                }
-            }
-            _ => {}
-        }
+        apply_npc_color_change(material, change, index);
     }
 
     if spec.uses_pollution {

@@ -1,4 +1,4 @@
-use crate::{decode_bti_texture, FormatError, J3dTexturePreview, Result};
+use crate::{decode_bti_texture, FormatError, J3dTexturePreview, PreserveBytes, Result};
 
 const FORMAT: &str = "JPA1 particle effect";
 
@@ -14,6 +14,16 @@ pub struct JpaEffect {
     pub textures: Vec<J3dTexturePreview>,
     pub uses_screen_texture: bool,
     pub indirect_texture_index: Option<u8>,
+    /// Blocks that this parser does not understand yet, retained verbatim.
+    pub unknown_blocks: Vec<JpaRawBlock>,
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JpaRawBlock {
+    pub tag: [u8; 4],
+    pub offset: usize,
+    pub bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -190,6 +200,7 @@ impl JpaEffect {
         let mut textures = Vec::new();
         let mut uses_screen_texture = false;
         let mut indirect_texture_index = None;
+        let mut unknown_blocks = Vec::new();
         let mut offset = 0x20usize;
 
         for _ in 0..block_count {
@@ -234,7 +245,11 @@ impl JpaEffect {
                         .unwrap_or_default();
                     textures.push(texture);
                 }
-                _ => {}
+                _ => unknown_blocks.push(JpaRawBlock {
+                    tag: header[..4].try_into().unwrap(),
+                    offset,
+                    bytes: block.to_vec(),
+                }),
             }
             offset += size;
         }
@@ -247,19 +262,17 @@ impl JpaEffect {
             format: FORMAT,
             message: "missing BSP1 base-shape block".to_string(),
         })?;
-        let parameter_indices = emitter.keyframe_mask.trailing_zeros();
         let mut remaining_mask = emitter.keyframe_mask;
-        let mut next_parameter = parameter_indices as u8;
         for curve in &mut raw_curves {
-            while remaining_mask & 1 == 0 && remaining_mask != 0 {
-                remaining_mask >>= 1;
-                next_parameter = next_parameter.saturating_add(1);
+            if remaining_mask == 0 {
+                return Err(FormatError::Unsupported {
+                    format: FORMAT,
+                    message: "more KFA1 curves than enabled BEM1 keyframe-mask parameters"
+                        .to_string(),
+                });
             }
-            curve.parameter_index = next_parameter;
-            if remaining_mask != 0 {
-                remaining_mask >>= 1;
-                next_parameter = next_parameter.saturating_add(1);
-            }
+            curve.parameter_index = remaining_mask.trailing_zeros() as u8;
+            remaining_mask &= remaining_mask - 1;
         }
 
         Ok(Self {
@@ -273,7 +286,15 @@ impl JpaEffect {
             textures,
             uses_screen_texture,
             indirect_texture_index,
+            unknown_blocks,
+            bytes: bytes.to_vec(),
         })
+    }
+}
+
+impl PreserveBytes for JpaEffect {
+    fn source_bytes(&self) -> &[u8] {
+        &self.bytes
     }
 }
 
@@ -586,6 +607,34 @@ fn vec3(bytes: &[u8], offset: usize) -> Result<[f32; 3]> {
 mod tests {
     use super::*;
 
+    fn effect_with_keyframe_mask(mask: u32) -> Vec<u8> {
+        let declared_size = 0x20 + 0x90 + 0x98 + 0x30 + 8;
+        let mut bytes = vec![0; declared_size];
+        bytes[..8].copy_from_slice(b"JEFFjpa1");
+        bytes[8..12].copy_from_slice(&(declared_size as u32).to_be_bytes());
+        bytes[12..16].copy_from_slice(&4u32.to_be_bytes());
+
+        let emitter = 0x20;
+        bytes[emitter..emitter + 4].copy_from_slice(b"BEM1");
+        bytes[emitter + 4..emitter + 8].copy_from_slice(&0x90u32.to_be_bytes());
+        bytes[emitter + 0x70..emitter + 0x74].copy_from_slice(&mask.to_be_bytes());
+
+        let base_shape = emitter + 0x90;
+        bytes[base_shape..base_shape + 4].copy_from_slice(b"BSP1");
+        bytes[base_shape + 4..base_shape + 8].copy_from_slice(&0x98u32.to_be_bytes());
+
+        let keyframes = base_shape + 0x98;
+        bytes[keyframes..keyframes + 4].copy_from_slice(b"KFA1");
+        bytes[keyframes + 4..keyframes + 8].copy_from_slice(&0x30u32.to_be_bytes());
+        bytes[keyframes + 0x10] = 1;
+        bytes[keyframes + 0x20..keyframes + 0x24].copy_from_slice(&1.0f32.to_be_bytes());
+
+        let unknown = keyframes + 0x30;
+        bytes[unknown..unknown + 4].copy_from_slice(b"NEW1");
+        bytes[unknown + 4..unknown + 8].copy_from_slice(&8u32.to_be_bytes());
+        bytes
+    }
+
     #[test]
     fn hermite_keyframes_match_endpoints_and_midpoint() {
         let curve = JpaKeyframeCurve {
@@ -611,6 +660,46 @@ mod tests {
             JpaEffect::parse(&bytes),
             Err(FormatError::InvalidOffset { .. })
         ));
+    }
+
+    #[test]
+    fn sparse_keyframe_mask_uses_the_set_bit_index_and_preserves_unknown_data() {
+        let mut bytes = effect_with_keyframe_mask(0b1000);
+        bytes.extend_from_slice(b"trailing bytes");
+
+        let effect = JpaEffect::parse(&bytes).unwrap();
+        assert_eq!(effect.keyframes[0].parameter_index, 3);
+        assert_eq!(effect.unknown_blocks.len(), 1);
+        assert_eq!(effect.unknown_blocks[0].tag, *b"NEW1");
+        assert_eq!(effect.unknown_blocks[0].bytes, b"NEW1\0\0\0\x08");
+        assert_eq!(effect.to_bytes(), bytes);
+    }
+
+    #[test]
+    fn keyframe_curve_without_a_mask_bit_is_rejected() {
+        assert!(matches!(
+            JpaEffect::parse(effect_with_keyframe_mask(0)),
+            Err(FormatError::Unsupported { .. })
+        ));
+    }
+
+    #[test]
+    fn every_singleton_keyframe_mask_maps_to_its_exact_parameter_bit() {
+        for parameter in 0..u32::BITS {
+            let effect = JpaEffect::parse(effect_with_keyframe_mask(1 << parameter)).unwrap();
+            assert_eq!(effect.keyframes[0].parameter_index, parameter as u8);
+        }
+    }
+
+    #[test]
+    fn every_truncated_effect_prefix_is_rejected_without_panicking() {
+        let bytes = effect_with_keyframe_mask(1);
+        for length in 0..bytes.len() {
+            assert!(
+                JpaEffect::parse(&bytes[..length]).is_err(),
+                "truncated prefix of {length} bytes was accepted"
+            );
+        }
     }
 
     #[test]

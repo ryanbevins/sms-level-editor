@@ -1,13 +1,29 @@
 //! Decomp-derived object and parameter registry generation.
 
-use std::collections::BTreeMap;
+mod factory_extractor;
+mod map_obj_ball_extractor;
+mod map_obj_resource_extractor;
+mod map_obj_shared_model_extractor;
+mod map_obj_string_tev_extractor;
+mod source_inventory;
+
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use walkdir::WalkDir;
+
+use factory_extractor::{extract_factory_candidates, FactoryEvidence};
+use map_obj_ball_extractor::extract_map_obj_ball_transforms;
+use map_obj_resource_extractor::{extract_map_obj_resources, has_null_animation_model_fallback};
+use map_obj_shared_model_extractor::{
+    extract_direct_make_mactors_overrides, extract_map_obj_shared_models,
+    extract_shared_model_loaders,
+};
+use map_obj_string_tev_extractor::extract_nozzle_box_tev_program;
+use source_inventory::SourceInventory;
 
 #[derive(Debug, Error)]
 pub enum SchemaError {
@@ -17,23 +33,112 @@ pub enum SchemaError {
     Toml(#[from] toml::de::Error),
     #[error("schema source is missing: {0}")]
     MissingSource(PathBuf),
+    #[error("failed to traverse schema source tree {root}: {source}")]
+    SourceTraversal {
+        root: PathBuf,
+        #[source]
+        source: walkdir::Error,
+    },
+    #[error("failed to read schema source {path}: {source}")]
+    SourceRead {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("schema source inventory contains no C/C++ files: {0}")]
+    EmptySourceInventory(PathBuf),
+    #[error("{extractor} extraction produced no {expected} from required source {source_path}")]
+    ExtractionDrift {
+        extractor: SchemaExtractor,
+        source_path: PathBuf,
+        expected: &'static str,
+    },
+    #[error("generated registry violates invariant: {detail}")]
+    RegistryInvariant { detail: String },
 }
 
 pub type Result<T> = std::result::Result<T, SchemaError>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaExtractor {
+    FactoryRegistration,
+    ModelLoaderFlags,
+    EnemyModelData,
+    Params,
+    AssetHints,
+    MapStaticModels,
+    MapObjResources,
+    MapObjBallTransforms,
+    MapObjModelOverrides,
+    MapObjStringTevPrograms,
+    MapObjFactoryTypes,
+    MapObjFlag,
+    ParticleResources,
+    ParticleBindings,
+    NpcResources,
+    NpcInitData,
+    NpcRootColors,
+}
+
+impl std::fmt::Display for SchemaExtractor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::FactoryRegistration => "factory registration",
+            Self::ModelLoaderFlags => "model loader flags",
+            Self::EnemyModelData => "enemy model data",
+            Self::Params => "parameter metadata",
+            Self::AssetHints => "asset hint",
+            Self::MapStaticModels => "map-static model",
+            Self::MapObjResources => "map-object resource",
+            Self::MapObjBallTransforms => "map-object ball transform",
+            Self::MapObjModelOverrides => "map-object model override",
+            Self::MapObjStringTevPrograms => "map-object string TEV program",
+            Self::MapObjFactoryTypes => "map-object factory type",
+            Self::MapObjFlag => "map-object flag",
+            Self::ParticleResources => "particle resource",
+            Self::ParticleBindings => "particle binding",
+            Self::NpcResources => "NPC model resource",
+            Self::NpcInitData => "NPC initialization",
+            Self::NpcRootColors => "NPC root color",
+        };
+        formatter.write_str(name)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ObjectRegistry {
     pub objects: Vec<ObjectDefinition>,
     pub params: Vec<ParamDefinition>,
     pub asset_hints: Vec<AssetHint>,
+    /// Decomp-derived primary model resources for actor factory names.
+    #[serde(default)]
+    pub object_resources: Vec<ObjectResourceBinding>,
     #[serde(default)]
     pub map_static_models: Vec<MapStaticModelDefinition>,
+    /// Models selected by the exact resource identity stored in `TMapObjData::unk0`.
+    #[serde(default)]
+    pub map_obj_resources: Vec<MapObjResourceDefinition>,
+    /// Runtime shared-model overrides selected by exact resource and actor class.
+    #[serde(default)]
+    pub map_obj_model_overrides: Vec<MapObjModelOverrideDefinition>,
+    /// Runtime string-selected material-color programs for typed map objects.
+    #[serde(default)]
+    pub map_obj_string_tev_programs: Vec<MapObjStringTevProgramDefinition>,
+    /// Runtime body-radius and model-matrix corrections selected by exact actor type.
+    #[serde(default)]
+    pub map_obj_ball_transforms: Vec<MapObjBallTransformDefinition>,
+    /// Exact registered factories whose decomp classes inherit `TMapObjBase`.
+    #[serde(default)]
+    pub map_obj_factories: Vec<String>,
     #[serde(default)]
     pub particle_resources: Vec<ParticleResourceDefinition>,
     #[serde(default)]
     pub actor_particle_bindings: Vec<ActorParticleBinding>,
     #[serde(default)]
     pub npc_actors: Vec<NpcActorDefinition>,
+    /// Root-model color programs selected by NPC instance body/cloth indices.
+    #[serde(default)]
+    pub npc_material_colors: Vec<NpcMaterialColorDefinition>,
     #[serde(default)]
     pub enemy_managers: Vec<EnemyManagerDefinition>,
     #[serde(default)]
@@ -52,29 +157,94 @@ impl ObjectRegistry {
     }
 
     pub fn find_npc_actor(&self, factory_name: &str) -> Option<&NpcActorDefinition> {
-        let actor_key = factory_name
-            .strip_prefix("NPC")
-            .or_else(|| factory_name.strip_prefix("npc"))?;
+        let actor_key = factory_name.strip_prefix("NPC")?;
         self.npc_actors
             .iter()
-            .filter(|definition| {
-                actor_key
-                    .to_ascii_lowercase()
-                    .starts_with(&definition.actor_key.to_ascii_lowercase())
-            })
+            .filter(|definition| actor_key.starts_with(&definition.actor_key))
             .max_by_key(|definition| definition.actor_key.len())
     }
 
     pub fn find_enemy_manager(&self, factory_name: &str) -> Option<&EnemyManagerDefinition> {
         self.enemy_managers
             .iter()
-            .find(|definition| definition.factory_name.eq_ignore_ascii_case(factory_name))
+            .find(|definition| definition.factory_name == factory_name)
     }
 
     pub fn find_enemy_actor(&self, factory_name: &str) -> Option<&EnemyActorDefinition> {
         self.enemy_actors
             .iter()
-            .find(|definition| definition.factory_name.eq_ignore_ascii_case(factory_name))
+            .find(|definition| definition.factory_name == factory_name)
+    }
+
+    pub fn object_resources_for<'a>(
+        &'a self,
+        factory_name: &str,
+    ) -> impl Iterator<Item = &'a ObjectResourceBinding> + 'a {
+        let factory_name = factory_name.to_string();
+        self.object_resources
+            .iter()
+            .filter(move |definition| definition.factory_name == factory_name)
+    }
+
+    pub fn primary_object_resource(&self, factory_name: &str) -> Option<&ObjectResourceBinding> {
+        self.object_resources_for(factory_name)
+            .find(|definition| definition.role == ObjectResourceRole::Primary)
+    }
+
+    /// Looks up a map-object resource using the case-sensitive identity consumed by retail.
+    pub fn find_map_obj_resource(&self, resource_name: &str) -> Option<&MapObjResourceDefinition> {
+        self.map_obj_resources
+            .iter()
+            .find(|definition| definition.resource_name == resource_name)
+    }
+
+    pub fn is_map_obj_factory(&self, factory_name: &str) -> bool {
+        self.map_obj_factories
+            .iter()
+            .any(|candidate| candidate == factory_name)
+    }
+
+    pub fn find_map_obj_model_override(
+        &self,
+        factory_name: &str,
+        resource_name: &str,
+    ) -> Option<&MapObjModelOverrideDefinition> {
+        let class_name = &self.find_object(factory_name)?.class_name;
+        self.map_obj_model_overrides.iter().find(|definition| {
+            definition.resource_name == resource_name && definition.class_name == *class_name
+        })
+    }
+
+    pub fn find_map_obj_string_tev_program(
+        &self,
+        factory_name: &str,
+        resource_name: &str,
+    ) -> Option<&MapObjStringTevProgramDefinition> {
+        let class_name = &self.find_object(factory_name)?.class_name;
+        self.map_obj_string_tev_programs.iter().find(|definition| {
+            definition.resource_name == resource_name && definition.class_name == *class_name
+        })
+    }
+
+    pub fn find_map_obj_ball_transform(
+        &self,
+        actor_type: u32,
+    ) -> Option<&MapObjBallTransformDefinition> {
+        self.map_obj_ball_transforms
+            .iter()
+            .find(|definition| definition.actor_type == actor_type)
+    }
+
+    pub fn npc_material_colors_for<'a>(
+        &'a self,
+        factory_name: &str,
+    ) -> impl Iterator<Item = &'a NpcMaterialColorDefinition> + 'a {
+        let actor_key = self
+            .find_npc_actor(factory_name)
+            .map(|definition| definition.actor_key.as_str());
+        self.npc_material_colors.iter().filter(move |definition| {
+            actor_key.is_some_and(|actor_key| definition.actor_key == actor_key)
+        })
     }
 
     pub fn apply_overlay(&mut self, overlay: SchemaOverlay) {
@@ -86,6 +256,9 @@ impl ObjectRegistry {
 
         for object in &mut self.objects {
             if let Some(overlay) = by_name.remove(&object.factory_name) {
+                if let Some(class_name) = overlay.class_name {
+                    object.class_name = class_name;
+                }
                 if let Some(category) = overlay.category {
                     object.category = category;
                 }
@@ -147,14 +320,104 @@ pub struct AssetHint {
     pub source_file: String,
 }
 
+/// A model resource selected by a factory/manager pair in the decompilation.
+///
+/// `resource_base` is present when `createModelDataArrayBase` supplies an
+/// explicit archive directory. When absent, consumers should resolve the
+/// decomp-authored filename against the stage resource index rather than
+/// inventing a factory-name alias.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectResourceBinding {
+    pub factory_name: String,
+    pub model_index: usize,
+    pub role: ObjectResourceRole,
+    pub model_name: String,
+    pub resource_base: Option<String>,
+    pub load_flags: u32,
+    pub source_file: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ObjectResourceRole {
+    /// Root actor model selected by the manager for normal rendering.
+    Primary,
+    /// Additional manager model data retained for explicit indexed consumers.
+    Secondary,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MapStaticModelDefinition {
     pub actor_name: String,
-    pub model_path: String,
+    /// Primary model passed to `TMapStaticObj::initModel`, if this table row creates one.
+    #[serde(default)]
+    pub model_path: Option<String>,
     pub load_flags: u32,
     pub source_file: String,
     #[serde(default)]
     pub stage_bootstrap_created: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MapObjResourceDefinition {
+    /// Exact `TMapObjData::unk0` identity read from the placement stream.
+    pub resource_name: String,
+    /// Exact runtime actor type stored in `TMapObjData::unk4`.
+    #[serde(default)]
+    pub actor_type: u32,
+    /// Primary BMD passed to `TMapObjBase::initMActor`, or `None` when actor count is zero.
+    pub primary_model: Option<String>,
+    /// Effective `TMActorKeeper::mModelLoaderFlags` selected from `TMapObjData::unk34`.
+    ///
+    /// The default preserves registries serialized before this field was exposed.
+    #[serde(default = "default_map_obj_model_load_flags")]
+    pub load_flags: u32,
+    pub source_file: String,
+}
+
+fn default_map_obj_model_load_flags() -> u32 {
+    0x1022_0000
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MapObjModelOverrideDefinition {
+    pub resource_name: String,
+    pub class_name: String,
+    pub model_path: String,
+    pub load_flags: u32,
+    pub tev_color: Option<MapObjTevColorDefinition>,
+    pub binding_source_file: String,
+    pub model_source_file: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MapObjTevColorDefinition {
+    pub register: u8,
+    pub color: [i16; 4],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MapObjStringTevProgramDefinition {
+    pub resource_name: String,
+    pub class_name: String,
+    pub tev_register: u8,
+    pub default_color: [i16; 4],
+    pub variants: Vec<MapObjStringTevVariantDefinition>,
+    pub source_file: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MapObjStringTevVariantDefinition {
+    pub selector_value: String,
+    pub color: [i16; 4],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MapObjBallTransformDefinition {
+    pub actor_type: u32,
+    pub body_radius: u16,
+    pub positive_y_axis_subtract: Option<u16>,
+    pub one_minus_y_axis_subtract: Option<u16>,
+    pub source_file: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -200,6 +463,18 @@ pub struct NpcActorDefinition {
     pub actor_key: String,
     pub source_file: String,
     pub parts: Vec<NpcPartDefinition>,
+}
+
+/// A root NPC model color change selected from `TNpcInitInfo::unk34`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NpcMaterialColorDefinition {
+    pub actor_key: String,
+    /// Index into the manager's root model-data array.
+    pub model_index: u8,
+    /// Index into the instance color tuple (`0` body, `1` cloth in retail).
+    pub color_index_channel: u8,
+    pub change: NpcColorChangeDefinition,
+    pub source_file: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -329,16 +604,24 @@ impl SchemaGenerator {
     }
 
     pub fn generate(&self) -> Result<ObjectRegistry> {
+        let sources = SourceInventory::build(&self.repo_root)?;
         let mut registry = ObjectRegistry::default();
-        self.scan_mar_name_ref_gen(&mut registry)?;
-        self.scan_enemy_model_data(&mut registry)?;
-        self.scan_map_obj_manager(&mut registry)?;
-        self.scan_params_and_assets(&mut registry)?;
-        self.scan_map_static_models(&mut registry)?;
-        self.scan_map_obj_flags(&mut registry)?;
-        self.scan_particle_bindings(&mut registry)?;
-        self.scan_npc_init_data(&mut registry)?;
-        dedup_registry(&mut registry);
+        self.scan_mar_name_ref_gen(&sources, &mut registry)?;
+        self.scan_enemy_model_data(&sources, &mut registry)?;
+        self.scan_map_obj_manager(&sources, &mut registry)?;
+        self.scan_map_obj_resources(&sources, &mut registry)?;
+        self.scan_map_obj_ball_transforms(&sources, &mut registry)?;
+        self.scan_map_obj_model_overrides(&sources, &mut registry)?;
+        self.scan_map_obj_string_tev_programs(&sources, &mut registry)?;
+        self.scan_params_and_assets(&sources, &mut registry)?;
+        self.scan_map_static_models(&sources, &mut registry)?;
+        self.scan_map_obj_flags(&sources, &mut registry)?;
+        self.scan_particle_bindings(&sources, &mut registry)?;
+        self.scan_npc_resource_bindings(&sources, &mut registry)?;
+        self.scan_npc_init_data(&sources, &mut registry)?;
+        self.scan_map_obj_factory_types(&sources, &mut registry)?;
+        dedup_registry(&mut registry)?;
+        validate_registry(&registry)?;
         Ok(registry)
     }
 
@@ -347,23 +630,52 @@ impl SchemaGenerator {
         Ok(toml::from_str(&text)?)
     }
 
-    fn scan_mar_name_ref_gen(&self, registry: &mut ObjectRegistry) -> Result<()> {
-        for (file_name, category) in [
-            ("MarNameRefGen.cpp", "System"),
-            ("MarNameRefGen_Enemy.cpp", "Enemy"),
-            ("MarNameRefGen_BossEnemy.cpp", "Boss"),
+    fn scan_mar_name_ref_gen(
+        &self,
+        sources: &SourceInventory,
+        registry: &mut ObjectRegistry,
+    ) -> Result<()> {
+        for (file_name, category, has_enemy_variants) in [
+            ("MarNameRefGen.cpp", "System", false),
+            ("MarNameRefGen_Map.cpp", "Map", false),
+            ("MarNameRefGen_MapObj.cpp", "MapObj", false),
+            ("MarNameRefGen_Enemy.cpp", "Enemy", true),
+            ("MarNameRefGen_BossEnemy.cpp", "Boss", true),
         ] {
-            let path = self.repo_root.join("src/System").join(file_name);
-            let text = read_required(&path)?;
-            extract_string_factory_returns(&text, category, SchemaSource::MarNameRefGen, registry);
-            if category != "System" {
-                extract_enemy_factory_variants(&text, registry);
+            let relative_path = format!("src/System/{file_name}");
+            let source_file = sources.required(&relative_path)?;
+            let object_count = registry.objects.len();
+            extract_string_factory_returns(
+                source_file.text(),
+                category,
+                SchemaSource::MarNameRefGen,
+                registry,
+            );
+            ensure_extracted(
+                SchemaExtractor::FactoryRegistration,
+                self.repo_root.join(&relative_path),
+                registry.objects.len() - object_count,
+                "factory-controlled object names",
+            )?;
+            if has_enemy_variants {
+                let variant_count = registry.enemy_actors.len() + registry.enemy_managers.len();
+                extract_enemy_factory_variants(source_file.text(), registry);
+                ensure_extracted(
+                    SchemaExtractor::FactoryRegistration,
+                    self.repo_root.join(&relative_path),
+                    registry.enemy_actors.len() + registry.enemy_managers.len() - variant_count,
+                    "enemy actor or manager registrations",
+                )?;
             }
         }
         Ok(())
     }
 
-    fn scan_enemy_model_data(&self, registry: &mut ObjectRegistry) -> Result<()> {
+    fn scan_enemy_model_data(
+        &self,
+        sources: &SourceInventory,
+        registry: &mut ObjectRegistry,
+    ) -> Result<()> {
         let mut class_models = BTreeMap::<String, Vec<EnemyModelDefinition>>::new();
         let mut actor_models = BTreeMap::<String, Vec<EnemyModelDefinition>>::new();
         let mut actor_primary_models = BTreeMap::<String, String>::new();
@@ -376,81 +688,89 @@ impl SchemaGenerator {
         let mut inheritance = BTreeMap::<String, String>::new();
         let mut tev_color_bindings = Vec::new();
         let mut init_tev_colors = BTreeMap::new();
-        let flag_symbols = extract_cpp_u32_constants(&read_required(
-            &self
-                .repo_root
-                .join("include/JSystem/J3D/J3DGraphLoader/J3DModelLoaderFlags.hpp"),
-        )?);
+        let loader_flags_path = "include/JSystem/J3D/J3DGraphLoader/J3DModelLoaderFlags.hpp";
+        let flag_symbols = extract_cpp_u32_constants(sources.required(loader_flags_path)?.text());
+        ensure_extracted(
+            SchemaExtractor::ModelLoaderFlags,
+            self.repo_root.join(loader_flags_path),
+            flag_symbols.len(),
+            "numeric J3D loader flag constants",
+        )?;
 
-        for entry in WalkDir::new(self.repo_root.join("src/Enemy"))
-            .into_iter()
-            .chain(WalkDir::new(self.repo_root.join("src/Animal")))
-            .chain(WalkDir::new(self.repo_root.join("src/Strategic")))
-            .chain(WalkDir::new(self.repo_root.join("include/Enemy")))
-            .chain(WalkDir::new(self.repo_root.join("include/Animal")))
-            .chain(WalkDir::new(self.repo_root.join("include/Strategic")))
-            .filter_map(std::result::Result::ok)
-            .filter(|entry| entry.file_type().is_file())
-        {
-            let path = entry.path();
-            let extension = path.extension().and_then(|extension| extension.to_str());
-            if !matches!(extension, Some("cpp" | "hpp" | "h")) {
+        let mut enemy_source_count = 0usize;
+        for file in sources.files_under_any(&[
+            "src/Enemy/",
+            "src/Animal/",
+            "src/Strategic/",
+            "include/Enemy/",
+            "include/Animal/",
+            "include/Strategic/",
+        ]) {
+            if !matches!(file.extension(), "cpp" | "hpp" | "h") {
                 continue;
             }
-            let text = fs::read_to_string(path)?;
-            extract_class_inheritance(&text, &mut inheritance);
-            if extension == Some("cpp") {
-                let source_file = normalize_source_path(&self.repo_root, path);
+            enemy_source_count += 1;
+            let text = file.text();
+            extract_class_inheritance(text, &mut inheritance);
+            if file.extension() == "cpp" {
+                let source_file = file.relative_path().to_string();
                 for (class_name, models) in
-                    extract_enemy_manager_models(&text, &source_file, &flag_symbols)
+                    extract_enemy_manager_models(text, &source_file, &flag_symbols)
                 {
                     class_models.entry(class_name).or_default().extend(models);
                 }
-                for (class_name, models) in extract_enemy_actor_fallback_models(&text, &source_file)
+                for (class_name, models) in extract_enemy_actor_fallback_models(text, &source_file)
                 {
                     actor_models.entry(class_name).or_default().extend(models);
                 }
-                for (class_name, model_name) in extract_enemy_actor_primary_models(&text) {
+                for (class_name, model_name) in extract_enemy_actor_primary_models(text) {
                     actor_primary_models.entry(class_name).or_insert(model_name);
                 }
-                for (class_name, models) in extract_enemy_named_models(&text, &source_file) {
+                for (class_name, models) in extract_enemy_named_models(text, &source_file) {
                     actor_named_models
                         .entry(class_name)
                         .or_default()
                         .extend(models);
                 }
-                for (class_name, models) in extract_enemy_indexed_models(&text, &source_file) {
+                for (class_name, models) in extract_enemy_indexed_models(text, &source_file) {
                     actor_indexed_models
                         .entry(class_name)
                         .or_default()
                         .extend(models);
                 }
-                extract_owned_actor_classes(&text, &mut owned_actor_classes);
-                extract_actor_root_parts(&text, &mut actor_root_parts);
-                extract_part_model_indices(&text, &mut part_model_indices);
-                extract_enemy_manager_actor_classes(&text, &mut manager_actor_classes);
-                tev_color_bindings.extend(extract_enemy_tev_color_bindings(&text, &source_file));
-                extract_enemy_init_tev_colors(&text, &mut init_tev_colors);
+                extract_owned_actor_classes(text, &mut owned_actor_classes);
+                extract_actor_root_parts(text, &mut actor_root_parts);
+                extract_part_model_indices(text, &mut part_model_indices);
+                extract_enemy_manager_actor_classes(text, &mut manager_actor_classes);
+                tev_color_bindings.extend(extract_enemy_tev_color_bindings(text, &source_file));
+                extract_enemy_init_tev_colors(text, &mut init_tev_colors);
             }
         }
+        ensure_extracted(
+            SchemaExtractor::EnemyModelData,
+            self.repo_root.join("src/Enemy"),
+            enemy_source_count,
+            "enemy/animal/strategic C++ sources",
+        )?;
 
         // A few retail-only manager subclasses are declared beside their
         // factory registrations rather than in public headers.
         for file_name in ["MarNameRefGen_Enemy.cpp", "MarNameRefGen_BossEnemy.cpp"] {
-            let text = read_required(&self.repo_root.join("src/System").join(file_name))?;
+            let relative_path = format!("src/System/{file_name}");
+            let text = sources.required(&relative_path)?.text();
             let mut supplemental = BTreeMap::new();
-            extract_class_inheritance(&text, &mut supplemental);
+            extract_class_inheritance(text, &mut supplemental);
             for (class_name, parent) in supplemental {
                 inheritance.entry(class_name).or_insert(parent);
             }
         }
 
         for definition in &mut registry.enemy_actors {
-            let Some(object) = registry.objects.iter().find(|object| {
-                object
-                    .factory_name
-                    .eq_ignore_ascii_case(&definition.factory_name)
-            }) else {
+            let Some(object) = registry
+                .objects
+                .iter()
+                .find(|object| object.factory_name == definition.factory_name)
+            else {
                 continue;
             };
             definition.class_name.clone_from(&object.class_name);
@@ -509,17 +829,11 @@ impl SchemaGenerator {
             let model_index = registry
                 .enemy_managers
                 .iter()
-                .find(|definition| {
-                    definition
-                        .factory_name
-                        .eq_ignore_ascii_case(&object.factory_name)
-                })
+                .find(|definition| definition.factory_name == object.factory_name)
                 .and_then(|definition| definition.model_index);
-            registry.enemy_managers.retain(|definition| {
-                !definition
-                    .factory_name
-                    .eq_ignore_ascii_case(&object.factory_name)
-            });
+            registry
+                .enemy_managers
+                .retain(|definition| definition.factory_name != object.factory_name);
             registry.enemy_managers.push(EnemyManagerDefinition {
                 factory_name: object.factory_name,
                 spawned_actor_class: inherited_actor_class(
@@ -548,40 +862,226 @@ impl SchemaGenerator {
         Ok(())
     }
 
-    fn scan_map_obj_manager(&self, registry: &mut ObjectRegistry) -> Result<()> {
-        let path = self.repo_root.join("src/MoveBG/MapObjManager.cpp");
-        let text = read_required(&path)?;
-        extract_string_factory_returns(&text, "MapObj", SchemaSource::MapObjManager, registry);
+    fn scan_map_obj_manager(
+        &self,
+        sources: &SourceInventory,
+        registry: &mut ObjectRegistry,
+    ) -> Result<()> {
+        let relative_path = "src/MoveBG/MapObjManager.cpp";
+        let text = sources.required(relative_path)?.text();
+        let before = registry.objects.len();
+        extract_string_factory_returns(text, "MapObj", SchemaSource::MapObjManager, registry);
+        ensure_extracted(
+            SchemaExtractor::FactoryRegistration,
+            self.repo_root.join(relative_path),
+            registry.objects.len() - before,
+            "map-object factory-controlled names",
+        )?;
         Ok(())
     }
 
-    fn scan_params_and_assets(&self, registry: &mut ObjectRegistry) -> Result<()> {
+    fn scan_map_obj_resources(
+        &self,
+        sources: &SourceInventory,
+        registry: &mut ObjectRegistry,
+    ) -> Result<()> {
+        let relative_path = "src/MoveBG/MapObjInit.cpp";
+        let text = sources.required(relative_path)?.text();
+        // A null animation table is not model-less: this is the retail fallback that
+        // turns the exact resource identity into its primary BMD name.
+        if !has_null_animation_model_fallback(text) {
+            return Err(SchemaError::ExtractionDrift {
+                extractor: SchemaExtractor::MapObjResources,
+                source_path: self.repo_root.join(relative_path),
+                expected: "TMapObjBase null-animation primary-model fallback",
+            });
+        }
+        registry.map_obj_resources =
+            extract_map_obj_resources(text, relative_path).map_err(|detail| {
+                SchemaError::RegistryInvariant {
+                    detail: format!("failed to extract map-object resources: {detail}"),
+                }
+            })?;
+        ensure_extracted(
+            SchemaExtractor::MapObjResources,
+            self.repo_root.join(relative_path),
+            registry.map_obj_resources.len(),
+            "TMapObjData resource identities",
+        )?;
+        Ok(())
+    }
+
+    fn scan_map_obj_factory_types(
+        &self,
+        sources: &SourceInventory,
+        registry: &mut ObjectRegistry,
+    ) -> Result<()> {
+        let mut inheritance = BTreeMap::new();
+        for file in sources.files_under_any(&["include/", "src/"]) {
+            if matches!(file.extension(), "h" | "hpp" | "cpp") {
+                extract_class_inheritance(file.text(), &mut inheritance);
+            }
+        }
+        registry.map_obj_factories = registry
+            .objects
+            .iter()
+            .filter(|object| class_is_or_inherits(&object.class_name, "TMapObjBase", &inheritance))
+            .map(|object| object.factory_name.clone())
+            .collect();
+        ensure_extracted(
+            SchemaExtractor::MapObjFactoryTypes,
+            self.repo_root.join("include"),
+            registry.map_obj_factories.len(),
+            "registered factories inheriting TMapObjBase",
+        )?;
+        Ok(())
+    }
+
+    fn scan_map_obj_ball_transforms(
+        &self,
+        sources: &SourceInventory,
+        registry: &mut ObjectRegistry,
+    ) -> Result<()> {
+        let source_path = "src/MoveBG/MapObjBall.cpp";
+        registry.map_obj_ball_transforms =
+            extract_map_obj_ball_transforms(sources.required(source_path)?.text(), source_path)
+                .map_err(|detail| SchemaError::RegistryInvariant {
+                    detail: format!("failed to extract map-object ball transforms: {detail}"),
+                })?;
+        ensure_extracted(
+            SchemaExtractor::MapObjBallTransforms,
+            self.repo_root.join(source_path),
+            registry.map_obj_ball_transforms.len(),
+            "actor-type body-radius transforms",
+        )?;
+        Ok(())
+    }
+
+    fn scan_map_obj_string_tev_programs(
+        &self,
+        sources: &SourceInventory,
+        registry: &mut ObjectRegistry,
+    ) -> Result<()> {
+        let source_path = "src/MoveBG/Item.cpp";
+        let header_path = "include/MoveBG/Item.hpp";
+        let definition = extract_nozzle_box_tev_program(
+            sources.required(source_path)?.text(),
+            sources.required(header_path)?.text(),
+            source_path,
+        )
+        .map_err(|detail| SchemaError::RegistryInvariant {
+            detail: format!("failed to extract map-object string TEV program: {detail}"),
+        })?;
+        registry.map_obj_string_tev_programs = vec![definition];
+        ensure_extracted(
+            SchemaExtractor::MapObjStringTevPrograms,
+            self.repo_root.join(source_path),
+            registry.map_obj_string_tev_programs.len(),
+            "typed string-selected material color programs",
+        )?;
+        Ok(())
+    }
+
+    fn scan_map_obj_model_overrides(
+        &self,
+        sources: &SourceInventory,
+        registry: &mut ObjectRegistry,
+    ) -> Result<()> {
+        let manager_path = "src/MoveBG/MapObjManager.cpp";
+        let loaders = extract_shared_model_loaders(sources.required(manager_path)?.text());
+        let mut definitions = Vec::new();
+        let mut direct_overrides = Vec::new();
+        for file in sources.files_under_any(&["src/MoveBG/"]) {
+            if file.extension() != "cpp" {
+                continue;
+            }
+            definitions.extend(
+                extract_map_obj_shared_models(
+                    file.text(),
+                    file.relative_path(),
+                    manager_path,
+                    &loaders,
+                )
+                .map_err(|detail| SchemaError::RegistryInvariant {
+                    detail: format!("failed to extract map-object shared models: {detail}"),
+                })?,
+            );
+            direct_overrides.extend(
+                extract_direct_make_mactors_overrides(file.text(), file.relative_path()).map_err(
+                    |detail| SchemaError::RegistryInvariant {
+                        detail: format!("failed to extract direct map-object models: {detail}"),
+                    },
+                )?,
+            );
+        }
+        for direct in direct_overrides {
+            let factories = registry
+                .objects
+                .iter()
+                .filter(|object| object.class_name == direct.class_name)
+                .collect::<Vec<_>>();
+            for factory in factories {
+                let resources = registry
+                    .map_obj_resources
+                    .iter()
+                    .filter(|resource| resource.primary_model.is_none())
+                    .filter(|resource| {
+                        resource
+                            .resource_name
+                            .eq_ignore_ascii_case(&factory.factory_name)
+                    })
+                    .collect::<Vec<_>>();
+                if resources.len() != 1 {
+                    return Err(SchemaError::RegistryInvariant {
+                        detail: format!(
+                            "direct model override {} for factory {} matched {} zero-primary resources",
+                            direct.class_name,
+                            factory.factory_name,
+                            resources.len()
+                        ),
+                    });
+                }
+                definitions.push(MapObjModelOverrideDefinition {
+                    resource_name: resources[0].resource_name.clone(),
+                    class_name: direct.class_name.clone(),
+                    model_path: direct.model_path.clone(),
+                    load_flags: direct.load_flags,
+                    tev_color: None,
+                    binding_source_file: direct.source_file.clone(),
+                    model_source_file: direct.source_file.clone(),
+                });
+            }
+        }
+        registry.map_obj_model_overrides = definitions;
+        ensure_extracted(
+            SchemaExtractor::MapObjModelOverrides,
+            self.repo_root.join("src/MoveBG"),
+            registry.map_obj_model_overrides.len(),
+            "resource-selected custom or shared models",
+        )?;
+        Ok(())
+    }
+
+    fn scan_params_and_assets(
+        &self,
+        sources: &SourceInventory,
+        registry: &mut ObjectRegistry,
+    ) -> Result<()> {
         let param_re = Regex::new(r"PARAM_INIT\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*,\s*([^)]+)\)")
             .expect("valid param regex");
         let asset_re =
             Regex::new(r#""(/(?:scene|common|select|game_6|guide|option|subtitle)[^"]+)""#)
                 .expect("valid asset regex");
 
-        for entry in WalkDir::new(self.repo_root.join("src"))
-            .into_iter()
-            .chain(WalkDir::new(self.repo_root.join("include")))
-            .filter_map(std::result::Result::ok)
-            .filter(|entry| entry.file_type().is_file())
-        {
-            let path = entry.path();
-            let extension = path.extension().and_then(|ext| ext.to_str());
-            if !matches!(extension, Some("cpp" | "hpp" | "c" | "h")) {
-                continue;
-            }
-
-            let text = fs::read_to_string(path)?;
-            let source_file = normalize_source_path(&self.repo_root, path);
-            let owner_hint = path
+        for file in sources.files() {
+            let text = file.text();
+            let source_file = file.relative_path().to_string();
+            let owner_hint = Path::new(file.relative_path())
                 .file_stem()
                 .and_then(|stem| stem.to_str())
                 .map(|stem| stem.to_string());
 
-            for cap in param_re.captures_iter(&text) {
+            for cap in param_re.captures_iter(text) {
                 registry.params.push(ParamDefinition {
                     owner_hint: owner_hint.clone(),
                     member_name: cap[1].to_string(),
@@ -590,7 +1090,7 @@ impl SchemaGenerator {
                 });
             }
 
-            for cap in asset_re.captures_iter(&text) {
+            for cap in asset_re.captures_iter(text) {
                 registry.asset_hints.push(AssetHint {
                     path: cap[1].to_string(),
                     source_file: source_file.clone(),
@@ -598,80 +1098,216 @@ impl SchemaGenerator {
             }
         }
 
+        ensure_extracted(
+            SchemaExtractor::Params,
+            self.repo_root.join("src"),
+            registry.params.len(),
+            "PARAM_INIT declarations",
+        )?;
+        ensure_extracted(
+            SchemaExtractor::AssetHints,
+            self.repo_root.join("src"),
+            registry.asset_hints.len(),
+            "decomp resource paths",
+        )?;
+
         Ok(())
     }
 
-    fn scan_particle_bindings(&self, registry: &mut ObjectRegistry) -> Result<()> {
-        for entry in WalkDir::new(self.repo_root.join("src"))
-            .into_iter()
-            .filter_map(std::result::Result::ok)
-            .filter(|entry| entry.file_type().is_file())
-        {
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("cpp") {
+    fn scan_particle_bindings(
+        &self,
+        sources: &SourceInventory,
+        registry: &mut ObjectRegistry,
+    ) -> Result<()> {
+        for file in sources.files_under_any(&["src/"]) {
+            if file.extension() != "cpp" {
                 continue;
             }
-            let text = fs::read_to_string(path)?;
-            let source_file = normalize_source_path(&self.repo_root, path);
-            extract_particle_resources(&text, &source_file, registry);
-            extract_calc_particle_bindings(&text, &source_file, registry);
+            let source_file = file.relative_path().to_string();
+            extract_particle_resources(file.text(), &source_file, registry);
+            extract_calc_particle_bindings(file.text(), &source_file, registry);
         }
+        ensure_extracted(
+            SchemaExtractor::ParticleResources,
+            self.repo_root.join("src"),
+            registry.particle_resources.len(),
+            "loaded JPA resources",
+        )?;
+        ensure_extracted(
+            SchemaExtractor::ParticleBindings,
+            self.repo_root.join("src"),
+            registry.actor_particle_bindings.len(),
+            "persistent actor particle bindings",
+        )?;
         Ok(())
     }
 
-    fn scan_map_static_models(&self, registry: &mut ObjectRegistry) -> Result<()> {
-        let path = self.repo_root.join("src/Map/MapStaticObject.cpp");
-        let text = read_required(&path)?;
-        let source_file = normalize_source_path(&self.repo_root, &path);
-        let map_path = self.repo_root.join("src/Map/Map.cpp");
+    fn scan_map_static_models(
+        &self,
+        sources: &SourceInventory,
+        registry: &mut ObjectRegistry,
+    ) -> Result<()> {
+        let relative_path = "src/Map/MapStaticObject.cpp";
+        let text = sources.required(relative_path)?.text();
+        let map_path = "src/Map/Map.cpp";
         let stage_bootstrap_actors =
-            extract_stage_bootstrap_map_static_actors(&read_required(&map_path)?);
-        registry.map_static_models = extract_map_static_models(&text, &source_file);
+            extract_stage_bootstrap_map_static_actors(sources.required(map_path)?.text());
+        registry.map_static_models = extract_map_static_models(text, relative_path);
+        ensure_extracted(
+            SchemaExtractor::MapStaticModels,
+            self.repo_root.join(relative_path),
+            registry.map_static_models.len(),
+            "map-static actor/model table entries",
+        )?;
         for model in &mut registry.map_static_models {
             model.stage_bootstrap_created = stage_bootstrap_actors
                 .iter()
-                .any(|actor| actor.eq_ignore_ascii_case(&model.actor_name));
+                .any(|actor| actor == &model.actor_name);
         }
         Ok(())
     }
 
-    fn scan_map_obj_flags(&self, registry: &mut ObjectRegistry) -> Result<()> {
-        let source_path = self.repo_root.join("src/MoveBG/MapObjFlag.cpp");
-        let source = read_required(&source_path)?;
-        let factory_path = self.repo_root.join("src/System/MarNameRefGen_MapObj.cpp");
-        let factories = read_required(&factory_path)?;
-        let application_path = self.repo_root.join("src/System/Application.cpp");
-        let application = read_required(&application_path)?;
-        let source_file = normalize_source_path(&self.repo_root, &source_path);
-        if let Some(definition) =
-            extract_map_obj_flag_definition(&source, &factories, &application, &source_file)
+    fn scan_map_obj_flags(
+        &self,
+        sources: &SourceInventory,
+        registry: &mut ObjectRegistry,
+    ) -> Result<()> {
+        let source_path = "src/MoveBG/MapObjFlag.cpp";
+        let source = sources.required(source_path)?.text();
+        let factories = sources
+            .required("src/System/MarNameRefGen_MapObj.cpp")?
+            .text();
+        let application = sources.required("src/System/Application.cpp")?.text();
+        let Some(definition) =
+            extract_map_obj_flag_definition(source, factories, application, source_path)
+        else {
+            return Err(SchemaError::ExtractionDrift {
+                extractor: SchemaExtractor::MapObjFlag,
+                source_path: self.repo_root.join(source_path),
+                expected: "complete procedural flag metadata",
+            });
+        };
+        if !registry
+            .objects
+            .iter()
+            .any(|object| object.factory_name == definition.factory_name)
         {
-            if !registry.objects.iter().any(|object| {
-                object
-                    .factory_name
-                    .eq_ignore_ascii_case(&definition.factory_name)
-            }) {
-                registry.objects.push(ObjectDefinition {
-                    factory_name: definition.factory_name.clone(),
-                    class_name: definition.class_name.clone(),
-                    category: "MapObj".to_string(),
-                    source: SchemaSource::MarNameRefGen,
-                    display_name: None,
-                    preview_model: None,
-                    hidden: false,
-                    unsafe_to_edit: false,
-                });
-            }
-            registry.map_obj_flags.push(definition);
+            registry.objects.push(ObjectDefinition {
+                factory_name: definition.factory_name.clone(),
+                class_name: definition.class_name.clone(),
+                category: "MapObj".to_string(),
+                source: SchemaSource::MarNameRefGen,
+                display_name: None,
+                preview_model: None,
+                hidden: false,
+                unsafe_to_edit: false,
+            });
         }
+        registry.map_obj_flags.push(definition);
         Ok(())
     }
 
-    fn scan_npc_init_data(&self, registry: &mut ObjectRegistry) -> Result<()> {
-        let path = self.repo_root.join("src/NPC/NpcInitData.cpp");
-        let text = read_required(&path)?;
-        let source_file = normalize_source_path(&self.repo_root, &path);
-        registry.npc_actors = extract_npc_actor_definitions(&text, &source_file);
+    fn scan_npc_init_data(
+        &self,
+        sources: &SourceInventory,
+        registry: &mut ObjectRegistry,
+    ) -> Result<()> {
+        let relative_path = "src/NPC/NpcInitData.cpp";
+        let text = sources.required(relative_path)?.text();
+        registry.npc_actors = extract_npc_actor_definitions(text, relative_path);
+        registry.npc_material_colors = extract_npc_material_color_definitions(text, relative_path);
+        ensure_extracted(
+            SchemaExtractor::NpcInitData,
+            self.repo_root.join(relative_path),
+            registry.npc_actors.len(),
+            "TNpcInitInfo actor definitions",
+        )?;
+        ensure_extracted(
+            SchemaExtractor::NpcRootColors,
+            self.repo_root.join(relative_path),
+            registry.npc_material_colors.len(),
+            "TNpcInitInfo root-model color bindings",
+        )?;
+        Ok(())
+    }
+
+    fn scan_npc_resource_bindings(
+        &self,
+        sources: &SourceInventory,
+        registry: &mut ObjectRegistry,
+    ) -> Result<()> {
+        let factory_path = "src/System/MarNameRefGen_NPC.cpp";
+        let factory_text = sources.required(factory_path)?.text();
+        let before = registry.objects.len();
+        extract_string_factory_returns(factory_text, "NPC", SchemaSource::MarNameRefGen, registry);
+        ensure_extracted(
+            SchemaExtractor::FactoryRegistration,
+            self.repo_root.join(factory_path),
+            registry.objects.len() - before,
+            "NPC actor and manager registrations",
+        )?;
+
+        let manager_path = "src/NPC/NpcManager.cpp";
+        let manager_text = sources.required(manager_path)?.text();
+        let loader_flags_path = "include/JSystem/J3D/J3DGraphLoader/J3DModelLoaderFlags.hpp";
+        let flag_symbols = extract_cpp_u32_constants(sources.required(loader_flags_path)?.text());
+        let manager_models =
+            extract_enemy_manager_models(manager_text, manager_path, &flag_symbols)
+                .into_iter()
+                .collect::<BTreeMap<_, _>>();
+        let resource_bases = extract_npc_manager_resource_bases(manager_text);
+
+        let mut inheritance = BTreeMap::new();
+        for file in sources.files_under_any(&["src/NPC/", "include/NPC/"]) {
+            extract_class_inheritance(file.text(), &mut inheritance);
+        }
+        let factory_classes = extract_factory_candidates(factory_text)
+            .into_iter()
+            .filter_map(|candidate| Some((candidate.factory_name, candidate.class_name?)))
+            .collect::<BTreeMap<_, _>>();
+
+        for (factory_name, _) in factory_classes
+            .iter()
+            .filter(|(factory_name, _)| factory_name.starts_with("NPC"))
+        {
+            let Some(actor_key) = factory_name.strip_prefix("NPC") else {
+                continue;
+            };
+            let manager_factory = format!("{actor_key}Manager");
+            let Some(manager_class) = factory_classes.get(&manager_factory) else {
+                continue;
+            };
+            let Some(models) = inherited_enemy_models(manager_class, &manager_models, &inheritance)
+            else {
+                continue;
+            };
+            let resource_base =
+                inherited_string_value(manager_class, &resource_bases, &inheritance);
+            registry
+                .object_resources
+                .extend(models.into_iter().enumerate().map(|(model_index, model)| {
+                    ObjectResourceBinding {
+                        factory_name: factory_name.clone(),
+                        model_index,
+                        role: if model_index == 0 {
+                            ObjectResourceRole::Primary
+                        } else {
+                            ObjectResourceRole::Secondary
+                        },
+                        model_name: model.model_name,
+                        resource_base: resource_base.clone(),
+                        load_flags: model.load_flags,
+                        source_file: model.source_file,
+                    }
+                }));
+        }
+
+        ensure_extracted(
+            SchemaExtractor::NpcResources,
+            self.repo_root.join(manager_path),
+            registry.object_resources.len(),
+            "NPC factory-to-model bindings",
+        )?;
         Ok(())
     }
 }
@@ -746,6 +1382,71 @@ fn extract_npc_actor_definitions(text: &str, source_file: &str) -> Vec<NpcActorD
         });
     }
     actors
+}
+
+fn extract_npc_material_color_definitions(
+    text: &str,
+    source_file: &str,
+) -> Vec<NpcMaterialColorDefinition> {
+    let color_arrays = extract_npc_color_arrays(text);
+    let color_changes = extract_npc_color_changes(text, &color_arrays);
+    let initializer_re =
+        Regex::new(r"static\s+const\s+TNpcInitInfo\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\{")
+            .expect("valid NPC initializer regex");
+    let reference_re = Regex::new(r"&([A-Za-z_][A-Za-z0-9_]*)|\b(?:nullptr|0)\b")
+        .expect("valid NPC root-color reference regex");
+    let mut definitions = Vec::new();
+
+    for captures in initializer_re.captures_iter(text) {
+        let Some(whole_match) = captures.get(0) else {
+            continue;
+        };
+        let Some(body) = braced_body(text, whole_match.end() - 1) else {
+            continue;
+        };
+        let fields = split_cpp_initializer_fields(body);
+        let Some(root_colors) = fields.get(2) else {
+            continue;
+        };
+        let Some(open_brace) = root_colors.find('{') else {
+            continue;
+        };
+        let Some(root_colors_body) = braced_body(root_colors, open_brace) else {
+            continue;
+        };
+        let actor_key = captures[1]
+            .strip_prefix('s')
+            .and_then(|name| name.strip_suffix("_InitData"))
+            .unwrap_or(&captures[1]);
+
+        for (color_index_channel, slot) in split_cpp_initializer_fields(root_colors_body)
+            .into_iter()
+            .enumerate()
+        {
+            for (model_index, reference) in reference_re.captures_iter(slot).enumerate() {
+                let Some(change_name) = reference.get(1).map(|capture| capture.as_str()) else {
+                    continue;
+                };
+                let Some(change) = color_changes.get(change_name) else {
+                    continue;
+                };
+                let (Ok(color_index_channel), Ok(model_index)) =
+                    (u8::try_from(color_index_channel), u8::try_from(model_index))
+                else {
+                    continue;
+                };
+                definitions.push(NpcMaterialColorDefinition {
+                    actor_key: actor_key.to_string(),
+                    model_index,
+                    color_index_channel,
+                    change: change.clone(),
+                    source_file: source_file.to_string(),
+                });
+            }
+        }
+    }
+
+    definitions
 }
 
 fn extract_npc_color_arrays(text: &str) -> BTreeMap<String, Vec<[i16; 4]>> {
@@ -963,9 +1664,6 @@ fn extract_map_static_models(text: &str, source_file: &str) -> Vec<MapStaticMode
         let Some(actor_name) = parse_cpp_string(fields[0]) else {
             continue;
         };
-        let Some(model_name) = parse_cpp_string(fields[8]) else {
-            continue;
-        };
         let Some(load_flags) = parse_cpp_u32(fields[9]) else {
             continue;
         };
@@ -979,9 +1677,11 @@ fn extract_map_static_models(text: &str, source_file: &str) -> Vec<MapStaticMode
         } else {
             "/scene/map/map"
         };
+        let model_path =
+            parse_cpp_string(fields[8]).map(|model_name| format!("{directory}/{model_name}.bmd"));
         models.push(MapStaticModelDefinition {
             actor_name,
-            model_path: format!("{directory}/{model_name}.bmd"),
+            model_path,
             load_flags,
             source_file: source_file.to_string(),
             stage_bootstrap_created: false,
@@ -1281,8 +1981,8 @@ fn derive_enemy_material_tev_colors(
                 continue;
             };
             let key = (
-                actor.factory_name.to_ascii_lowercase(),
-                binding.material_name.to_ascii_lowercase(),
+                actor.factory_name.clone(),
+                binding.material_name.clone(),
                 binding.tev_register,
             );
             let definition = EnemyMaterialTevColorDefinition {
@@ -1409,8 +2109,8 @@ fn inheritance_distance(
     None
 }
 
-fn factory_without_manager(factory_name: &str) -> String {
-    factory_name.replace("Manager", "")
+fn factory_without_manager(factory_name: &str) -> &str {
+    factory_name.strip_suffix("Manager").unwrap_or(factory_name)
 }
 
 fn compatible_enemy_managers(
@@ -1428,15 +2128,15 @@ fn compatible_enemy_managers(
             {
                 return false;
             }
-            factory_without_manager(&manager.factory_name).eq_ignore_ascii_case(&actor.factory_name)
+            factory_without_manager(&manager.factory_name) == actor.factory_name
                 || manager_actor_class(manager).is_some_and(|spawned_class| {
                     class_is_or_inherits(&actor.class_name, spawned_class, inheritance)
                 })
                 || primary_model_manager == Some(manager.factory_name.as_str())
         })
         .map(|manager| {
-            let exact_factory = factory_without_manager(&manager.factory_name)
-                .eq_ignore_ascii_case(&actor.factory_name);
+            let exact_factory =
+                factory_without_manager(&manager.factory_name) == actor.factory_name;
             let actor_distance = manager_actor_class(manager)
                 .and_then(|spawned_class| {
                     inheritance_distance(&actor.class_name, spawned_class, inheritance)
@@ -1541,6 +2241,46 @@ fn extract_enemy_manager_models(
         }
     }
     managers
+}
+
+fn extract_npc_manager_resource_bases(text: &str) -> BTreeMap<String, String> {
+    let method_re =
+        Regex::new(r"void\s+([A-Za-z_][A-Za-z0-9_]*Manager)::createModelData\s*\([^)]*\)\s*\{")
+            .expect("valid NPC createModelData regex");
+    let base_re =
+        Regex::new(r#"createModelDataArrayBase\s*\(\s*[A-Za-z_][A-Za-z0-9_]*\s*,\s*"([^"]+)""#)
+            .expect("valid NPC resource-base regex");
+    let mut bases = BTreeMap::new();
+
+    for captures in method_re.captures_iter(text) {
+        let Some(method_match) = captures.get(0) else {
+            continue;
+        };
+        let Some(body) = braced_body(text, method_match.end() - 1) else {
+            continue;
+        };
+        if let Some(resource_base) = base_re.captures(body) {
+            bases.insert(captures[1].to_string(), resource_base[1].to_string());
+        }
+    }
+
+    bases
+}
+
+fn inherited_string_value(
+    class_name: &str,
+    values: &BTreeMap<String, String>,
+    inheritance: &BTreeMap<String, String>,
+) -> Option<String> {
+    let mut current = class_name.rsplit("::").next().unwrap_or(class_name);
+    let mut visited = BTreeSet::new();
+    while visited.insert(current.to_string()) {
+        if let Some(value) = values.get(current) {
+            return Some(value.clone());
+        }
+        current = inheritance.get(current)?.rsplit("::").next()?;
+    }
+    None
 }
 
 fn extract_cpp_string_constants(text: &str) -> BTreeMap<String, String> {
@@ -2205,16 +2945,15 @@ fn extract_string_factory_returns(
     source: SchemaSource,
     registry: &mut ObjectRegistry,
 ) {
-    let factory_return_re = Regex::new(
-        r#"strcmp\s*\(\s*name\s*,\s*"([^"]+)"\s*\)\s*==\s*0\s*\)\s*(?:\{[^}]*?)?return\s+(?:[A-Za-z0-9_:]+\s*=\s*)?new\s+([A-Za-z_:][A-Za-z0-9_:]*)"#,
-    )
-    .expect("valid factory regex");
-
-    for cap in factory_return_re.captures_iter(text) {
-        let factory_name = cap[1].to_string();
-        let class_name = cap[2].to_string();
+    for candidate in extract_factory_candidates(text) {
+        let class_name = match candidate.evidence {
+            FactoryEvidence::ConstructedReturn => candidate
+                .class_name
+                .expect("constructed factory candidates always carry a class"),
+            FactoryEvidence::NameComparison => "Unknown".to_string(),
+        };
         registry.objects.push(ObjectDefinition {
-            factory_name,
+            factory_name: candidate.factory_name,
             class_name,
             category: category.to_string(),
             source: source.clone(),
@@ -2224,69 +2963,35 @@ fn extract_string_factory_returns(
             unsafe_to_edit: false,
         });
     }
-
-    let compare_re = Regex::new(r#"strcmp\s*\(\s*name\s*,\s*"([^"]+)"\s*\)\s*==\s*0"#)
-        .expect("valid strcmp regex");
-    for cap in compare_re.captures_iter(text) {
-        let factory_name = cap[1].to_string();
-        if registry
-            .objects
-            .iter()
-            .any(|object| object.factory_name == factory_name)
-        {
-            continue;
-        }
-
-        registry.objects.push(ObjectDefinition {
-            factory_name,
-            class_name: "Unknown".to_string(),
-            category: category.to_string(),
-            source: source.clone(),
-            display_name: None,
-            preview_model: None,
-            hidden: false,
-            unsafe_to_edit: false,
-        });
-    }
-
-    let static_array_re = Regex::new(r#""([A-Za-z0-9_./-]+)""#).expect("valid string regex");
-    for cap in static_array_re.captures_iter(text) {
-        let factory_name = cap[1].to_string();
-        if !looks_like_factory_name(&factory_name)
-            || registry
-                .objects
-                .iter()
-                .any(|object| object.factory_name == factory_name)
-        {
-            continue;
-        }
-
-        registry.objects.push(ObjectDefinition {
-            factory_name,
-            class_name: "Unknown".to_string(),
-            category: category.to_string(),
-            source: source.clone(),
-            display_name: None,
-            preview_model: None,
-            hidden: false,
-            unsafe_to_edit: false,
-        });
-    }
 }
 
-fn looks_like_factory_name(value: &str) -> bool {
-    !value.contains('/')
-        && !value.contains('.')
-        && value
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
-        && value.chars().any(|ch| ch.is_ascii_alphabetic())
-}
-
-fn dedup_registry(registry: &mut ObjectRegistry) {
+fn dedup_registry(registry: &mut ObjectRegistry) -> Result<()> {
     let mut objects = BTreeMap::<String, ObjectDefinition>::new();
     for object in registry.objects.drain(..) {
-        objects.entry(object.factory_name.clone()).or_insert(object);
+        let key = object.factory_name.clone();
+        match objects.get_mut(&key) {
+            None => {
+                objects.insert(key, object);
+            }
+            Some(existing)
+                if existing.class_name == "Unknown" && object.class_name != "Unknown" =>
+            {
+                *existing = object;
+            }
+            Some(existing)
+                if object.class_name != "Unknown"
+                    && existing.class_name != "Unknown"
+                    && existing.class_name != object.class_name =>
+            {
+                return Err(SchemaError::RegistryInvariant {
+                    detail: format!(
+                        "factory {} resolves to conflicting classes {} and {}",
+                        object.factory_name, existing.class_name, object.class_name
+                    ),
+                });
+            }
+            Some(_) => {}
+        }
     }
     registry.objects = objects.into_values().collect();
     registry.objects.sort_by(|a, b| {
@@ -2309,6 +3014,84 @@ fn dedup_registry(registry: &mut ObjectRegistry) {
     });
     registry.asset_hints.dedup();
 
+    registry.object_resources.sort_by(|a, b| {
+        a.factory_name
+            .cmp(&b.factory_name)
+            .then_with(|| a.model_index.cmp(&b.model_index))
+            .then_with(|| a.model_name.cmp(&b.model_name))
+            .then_with(|| a.load_flags.cmp(&b.load_flags))
+            .then_with(|| a.source_file.cmp(&b.source_file))
+    });
+    registry.object_resources.dedup_by(|a, b| {
+        a.factory_name == b.factory_name
+            && a.model_index == b.model_index
+            && a.model_name == b.model_name
+            && a.resource_base == b.resource_base
+            && a.load_flags == b.load_flags
+    });
+
+    // Keep the order of the retail lookup table while enforcing its exact key space.
+    let mut map_obj_resource_names = BTreeSet::new();
+    for resource in &registry.map_obj_resources {
+        if !map_obj_resource_names.insert(resource.resource_name.as_str()) {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!(
+                    "duplicate map-object resource identity {}",
+                    resource.resource_name
+                ),
+            });
+        }
+    }
+    registry.map_obj_model_overrides.sort_by(|a, b| {
+        a.resource_name
+            .cmp(&b.resource_name)
+            .then_with(|| a.class_name.cmp(&b.class_name))
+    });
+    for duplicate in registry.map_obj_model_overrides.windows(2) {
+        if duplicate[0].resource_name == duplicate[1].resource_name
+            && duplicate[0].class_name == duplicate[1].class_name
+        {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!(
+                    "duplicate map-object model override {} for {}",
+                    duplicate[0].resource_name, duplicate[0].class_name
+                ),
+            });
+        }
+    }
+    registry.map_obj_string_tev_programs.sort_by(|a, b| {
+        a.resource_name
+            .cmp(&b.resource_name)
+            .then_with(|| a.class_name.cmp(&b.class_name))
+    });
+    for duplicate in registry.map_obj_string_tev_programs.windows(2) {
+        if duplicate[0].resource_name == duplicate[1].resource_name
+            && duplicate[0].class_name == duplicate[1].class_name
+        {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!(
+                    "duplicate map-object string TEV program {} for {}",
+                    duplicate[0].resource_name, duplicate[0].class_name
+                ),
+            });
+        }
+    }
+    registry
+        .map_obj_ball_transforms
+        .sort_by_key(|definition| definition.actor_type);
+    for duplicate in registry.map_obj_ball_transforms.windows(2) {
+        if duplicate[0].actor_type == duplicate[1].actor_type {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!(
+                    "duplicate map-object ball transform actor type {:#010x}",
+                    duplicate[0].actor_type
+                ),
+            });
+        }
+    }
+    registry.map_obj_factories.sort();
+    registry.map_obj_factories.dedup();
+
     registry.map_static_models.sort_by(|a, b| {
         a.model_path
             .cmp(&b.model_path)
@@ -2324,7 +3107,7 @@ fn dedup_registry(registry: &mut ObjectRegistry) {
     });
     registry
         .map_obj_flags
-        .dedup_by(|a, b| a.factory_name.eq_ignore_ascii_case(&b.factory_name));
+        .dedup_by(|a, b| a.factory_name == b.factory_name);
 
     registry.particle_resources.sort_by(|a, b| {
         a.effect_id
@@ -2348,6 +3131,14 @@ fn dedup_registry(registry: &mut ObjectRegistry) {
     registry
         .npc_actors
         .dedup_by(|a, b| a.actor_key == b.actor_key);
+    registry.npc_material_colors.sort_by(|a, b| {
+        a.actor_key
+            .cmp(&b.actor_key)
+            .then_with(|| a.color_index_channel.cmp(&b.color_index_channel))
+            .then_with(|| a.model_index.cmp(&b.model_index))
+            .then_with(|| a.change.material_name.cmp(&b.change.material_name))
+    });
+    registry.npc_material_colors.dedup();
 
     registry.enemy_managers.sort_by(|a, b| {
         a.factory_name
@@ -2356,7 +3147,7 @@ fn dedup_registry(registry: &mut ObjectRegistry) {
     });
     registry
         .enemy_managers
-        .dedup_by(|a, b| a.factory_name.eq_ignore_ascii_case(&b.factory_name));
+        .dedup_by(|a, b| a.factory_name == b.factory_name);
     registry.enemy_actors.sort_by(|a, b| {
         a.factory_name
             .cmp(&b.factory_name)
@@ -2364,7 +3155,7 @@ fn dedup_registry(registry: &mut ObjectRegistry) {
     });
     registry
         .enemy_actors
-        .dedup_by(|a, b| a.factory_name.eq_ignore_ascii_case(&b.factory_name));
+        .dedup_by(|a, b| a.factory_name == b.factory_name);
     registry.enemy_material_colors.sort_by(|a, b| {
         a.factory_name
             .cmp(&b.factory_name)
@@ -2373,29 +3164,301 @@ fn dedup_registry(registry: &mut ObjectRegistry) {
             .then_with(|| a.source_file.cmp(&b.source_file))
     });
     registry.enemy_material_colors.dedup_by(|a, b| {
-        a.factory_name.eq_ignore_ascii_case(&b.factory_name)
-            && a.material_name.eq_ignore_ascii_case(&b.material_name)
+        a.factory_name == b.factory_name
+            && a.material_name == b.material_name
             && a.tev_register == b.tev_register
     });
+    Ok(())
 }
 
-fn read_required(path: &Path) -> Result<String> {
-    if !path.exists() {
-        return Err(SchemaError::MissingSource(path.to_path_buf()));
+fn ensure_extracted(
+    extractor: SchemaExtractor,
+    source_path: PathBuf,
+    count: usize,
+    expected: &'static str,
+) -> Result<()> {
+    if count == 0 {
+        return Err(SchemaError::ExtractionDrift {
+            extractor,
+            source_path,
+            expected,
+        });
     }
-    Ok(fs::read_to_string(path)?)
+    Ok(())
 }
 
-fn normalize_source_path(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
+fn validate_registry(registry: &ObjectRegistry) -> Result<()> {
+    if registry.objects.is_empty() {
+        return Err(SchemaError::RegistryInvariant {
+            detail: "object registry is empty".to_string(),
+        });
+    }
+
+    let objects = registry
+        .objects
+        .iter()
+        .map(|object| (object.factory_name.as_str(), object))
+        .collect::<BTreeMap<_, _>>();
+    for resource in &registry.object_resources {
+        if !objects.contains_key(resource.factory_name.as_str()) {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!(
+                    "model resource {} has no registered factory {}",
+                    resource.model_name, resource.factory_name
+                ),
+            });
+        }
+        if resource.model_name.is_empty() || resource.source_file.is_empty() {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!(
+                    "factory {} has a model resource without a name or provenance",
+                    resource.factory_name
+                ),
+            });
+        }
+    }
+    for factory_name in registry
+        .object_resources
+        .iter()
+        .map(|resource| resource.factory_name.as_str())
+        .collect::<BTreeSet<_>>()
+    {
+        let primary_count = registry
+            .object_resources
+            .iter()
+            .filter(|resource| {
+                resource.factory_name == factory_name
+                    && resource.role == ObjectResourceRole::Primary
+            })
+            .count();
+        if primary_count != 1 {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!(
+                    "factory {factory_name} has {primary_count} primary model resources; expected exactly one"
+                ),
+            });
+        }
+    }
+
+    let mut map_obj_resource_names = BTreeSet::new();
+    for resource in &registry.map_obj_resources {
+        if resource.resource_name.is_empty() || resource.source_file.is_empty() {
+            return Err(SchemaError::RegistryInvariant {
+                detail: "map-object resource has an empty identity or provenance".to_string(),
+            });
+        }
+        if resource.load_flags == 0 {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!(
+                    "map-object resource {} has zero loader flags",
+                    resource.resource_name
+                ),
+            });
+        }
+        if !map_obj_resource_names.insert(resource.resource_name.as_str()) {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!(
+                    "duplicate map-object resource identity {}",
+                    resource.resource_name
+                ),
+            });
+        }
+        if resource
+            .primary_model
+            .as_ref()
+            .is_some_and(|model| model.is_empty() || !model.to_ascii_lowercase().ends_with(".bmd"))
+        {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!(
+                    "map-object resource {} has invalid primary BMD {:?}",
+                    resource.resource_name, resource.primary_model
+                ),
+            });
+        }
+    }
+    for definition in &registry.map_obj_model_overrides {
+        let resource = registry
+            .find_map_obj_resource(&definition.resource_name)
+            .ok_or_else(|| SchemaError::RegistryInvariant {
+                detail: format!(
+                    "model override references unknown map-object resource {}",
+                    definition.resource_name
+                ),
+            })?;
+        if resource.primary_model.is_some() {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!(
+                    "model override {} is not attached to a zero-primary resource",
+                    definition.resource_name
+                ),
+            });
+        }
+        let matching_factory = registry.objects.iter().find(|object| {
+            object.class_name == definition.class_name
+                && object
+                    .factory_name
+                    .eq_ignore_ascii_case(&definition.resource_name)
+        });
+        if matching_factory.is_none_or(|object| !registry.is_map_obj_factory(&object.factory_name))
+        {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!(
+                    "model override {} / {} has no TMapObjBase-derived factory",
+                    definition.resource_name, definition.class_name
+                ),
+            });
+        }
+        if definition.model_path.is_empty()
+            || !definition.model_path.to_ascii_lowercase().ends_with(".bmd")
+            || definition.load_flags == 0
+            || definition.binding_source_file.is_empty()
+            || definition.model_source_file.is_empty()
+            || definition
+                .tev_color
+                .is_some_and(|color| color.register >= 4)
+        {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!(
+                    "map-object model override {} has invalid model, color, flags, or provenance",
+                    definition.resource_name
+                ),
+            });
+        }
+    }
+    for definition in &registry.map_obj_string_tev_programs {
+        if registry
+            .find_map_obj_resource(&definition.resource_name)
+            .is_none()
+            || !registry.objects.iter().any(|object| {
+                object.factory_name == definition.resource_name
+                    && object.class_name == definition.class_name
+            })
+            || definition.tev_register >= 4
+            || definition.source_file.is_empty()
+            || definition.variants.is_empty()
+        {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!(
+                    "map-object string TEV program {} / {} has invalid binding, register, variants, or provenance",
+                    definition.resource_name, definition.class_name
+                ),
+            });
+        }
+        let mut selectors = BTreeSet::new();
+        for variant in &definition.variants {
+            if variant.selector_value.is_empty() || !selectors.insert(&variant.selector_value) {
+                return Err(SchemaError::RegistryInvariant {
+                    detail: format!(
+                        "map-object string TEV program {} has an empty or duplicate selector",
+                        definition.resource_name
+                    ),
+                });
+            }
+        }
+    }
+    for definition in &registry.map_obj_ball_transforms {
+        if definition.actor_type == 0
+            || definition.body_radius == 0
+            || definition.source_file.is_empty()
+            || (definition.positive_y_axis_subtract.is_some()
+                && definition.one_minus_y_axis_subtract.is_some())
+        {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!(
+                    "map-object ball transform {:#010x} has invalid radius, correction, or provenance",
+                    definition.actor_type
+                ),
+            });
+        }
+    }
+    for factory_name in &registry.map_obj_factories {
+        if !objects.contains_key(factory_name.as_str()) {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!(
+                    "map-object factory type references unknown factory {factory_name}"
+                ),
+            });
+        }
+    }
+
+    let npc_keys = registry
+        .npc_actors
+        .iter()
+        .map(|actor| actor.actor_key.as_str())
+        .collect::<BTreeSet<_>>();
+    for color in &registry.npc_material_colors {
+        if !npc_keys.contains(color.actor_key.as_str()) {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!(
+                    "NPC root color references unknown actor key {}",
+                    color.actor_key
+                ),
+            });
+        }
+        if color.change.material_name.is_empty() || color.source_file.is_empty() {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!(
+                    "NPC {} has root color metadata without material/provenance",
+                    color.actor_key
+                ),
+            });
+        }
+    }
+
+    for flag in &registry.map_obj_flags {
+        let Some(object) = objects.get(flag.factory_name.as_str()) else {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!("map-object flag {} is not registered", flag.factory_name),
+            });
+        };
+        if object.class_name != flag.class_name {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!(
+                    "map-object flag {} has class {}, registry has {}",
+                    flag.factory_name, flag.class_name, object.class_name
+                ),
+            });
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
+
+    static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
+
+    struct SchemaFixture {
+        root: PathBuf,
+    }
+
+    impl SchemaFixture {
+        fn new(label: &str) -> Self {
+            Self {
+                root: std::env::temp_dir().join(format!(
+                    "sms-schema-generator-{label}-{}-{}",
+                    std::process::id(),
+                    NEXT_FIXTURE_ID.fetch_add(1, Ordering::Relaxed)
+                )),
+            }
+        }
+
+        fn write(&self, relative_path: &str, text: &str) {
+            let path = self.root.join(relative_path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        }
+    }
+
+    impl Drop for SchemaFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
 
     #[test]
     fn extracts_procedural_flag_resources_and_geometry_from_decomp() {
@@ -2721,6 +3784,91 @@ mod tests {
     }
 
     #[test]
+    fn manager_factory_stem_matching_and_ranking_are_case_sensitive() {
+        let actor = EnemyActorDefinition {
+            factory_name: "Fishoid".to_string(),
+            class_name: "TFishoid".to_string(),
+            model_index: None,
+            fallback_models: Vec::new(),
+            primary_model: None,
+            named_models: Vec::new(),
+            indexed_models: Vec::new(),
+            manager_factories: Vec::new(),
+        };
+        let exact = EnemyManagerDefinition {
+            factory_name: "FishoidManager".to_string(),
+            class_name: "TUnrelatedManager".to_string(),
+            model_index: None,
+            spawned_actor_class: None,
+            models: Vec::new(),
+        };
+        let wrong_case = EnemyManagerDefinition {
+            factory_name: "fishoidManager".to_string(),
+            class_name: "TWrongManager".to_string(),
+            model_index: None,
+            spawned_actor_class: None,
+            models: Vec::new(),
+        };
+
+        assert_eq!(
+            compatible_enemy_managers(&actor, std::slice::from_ref(&exact), &BTreeMap::new()),
+            ["FishoidManager"]
+        );
+        assert!(compatible_enemy_managers(
+            &actor,
+            std::slice::from_ref(&wrong_case),
+            &BTreeMap::new()
+        )
+        .is_empty());
+
+        let mut class_confirmed_wrong_case = wrong_case;
+        class_confirmed_wrong_case.spawned_actor_class = Some("TFishoid".to_string());
+        assert_eq!(
+            compatible_enemy_managers(
+                &actor,
+                &[class_confirmed_wrong_case, exact],
+                &BTreeMap::new()
+            ),
+            ["FishoidManager", "fishoidManager"]
+        );
+        assert_eq!(
+            factory_without_manager("ManagerFactoryManager"),
+            "ManagerFactory"
+        );
+        assert_eq!(factory_without_manager("Fishoidmanager"), "Fishoidmanager");
+    }
+
+    #[test]
+    fn model_name_matching_remains_case_insensitive() {
+        let actor = EnemyActorDefinition {
+            factory_name: "UnrelatedActor".to_string(),
+            class_name: "TUnrelatedActor".to_string(),
+            model_index: None,
+            fallback_models: Vec::new(),
+            primary_model: Some("fishoid.bmd".to_string()),
+            named_models: Vec::new(),
+            indexed_models: Vec::new(),
+            manager_factories: Vec::new(),
+        };
+        let manager = EnemyManagerDefinition {
+            factory_name: "UnrelatedManager".to_string(),
+            class_name: "TNoClassMatchManager".to_string(),
+            model_index: None,
+            spawned_actor_class: None,
+            models: vec![EnemyModelDefinition {
+                model_name: "FISHOID.BMD".to_string(),
+                load_flags: 0,
+                source_file: "src/Enemy/Test.cpp".to_string(),
+            }],
+        };
+
+        assert_eq!(
+            compatible_enemy_managers(&actor, &[manager], &BTreeMap::new()),
+            ["UnrelatedManager"]
+        );
+    }
+
+    #[test]
     fn extracts_local_global_and_symbolic_enemy_model_tables() {
         let text = r#"
             static const char cHeadModel[] = "head.bmd";
@@ -3005,12 +4153,21 @@ mod tests {
 
         let models = extract_map_static_models(text, "src/Map/MapStaticObject.cpp");
 
-        assert_eq!(models.len(), 2);
+        assert_eq!(models.len(), 3);
         assert_eq!(models[0].actor_name, "BiancoRiver");
-        assert_eq!(models[0].model_path, "/scene/map/map/BiancoRiver.bmd");
+        assert_eq!(
+            models[0].model_path.as_deref(),
+            Some("/scene/map/map/BiancoRiver.bmd")
+        );
         assert_eq!(models[0].load_flags, 0x1021_0000);
-        assert_eq!(models[1].model_path, "/common/map/SharedModel.bmd");
+        assert_eq!(
+            models[1].model_path.as_deref(),
+            Some("/common/map/SharedModel.bmd")
+        );
         assert_eq!(models[1].load_flags, 0x1122_0000);
+        assert_eq!(models[2].actor_name, "NoModel");
+        assert_eq!(models[2].model_path, None);
+        assert_eq!(models[2].load_flags, 0x1021_0000);
     }
 
     #[test]
@@ -3062,6 +4219,25 @@ mod tests {
             registry.find_npc_actor("NPCMareMB").unwrap().actor_key,
             "MareMB"
         );
+        assert!(registry.find_npc_actor("npcMareMB").is_none());
+        assert!(registry.find_npc_actor("NPCmareMB").is_none());
+    }
+
+    #[test]
+    fn map_static_bootstrap_factory_identity_is_case_sensitive() {
+        let fixture = complete_generator_fixture();
+        fixture.write(
+            "src/Map/Map.cpp",
+            r#"static void initStageCommon() { actor->init("fixturemap"); }"#,
+        );
+
+        let registry = SchemaGenerator::new(&fixture.root).generate().unwrap();
+        let fixture_map = registry
+            .map_static_models
+            .iter()
+            .find(|model| model.actor_name == "FixtureMap")
+            .unwrap();
+        assert!(!fixture_map.stage_bootstrap_created);
     }
 
     #[test]
@@ -3093,7 +4269,742 @@ mod tests {
         });
 
         let coin = registry.find_object("coin").unwrap();
+        assert_eq!(coin.class_name, "TCoin");
         assert_eq!(coin.category, "Item");
         assert!(coin.unsafe_to_edit);
+    }
+
+    #[test]
+    fn overlay_updates_existing_object_class_name() {
+        let mut registry = ObjectRegistry {
+            objects: vec![ObjectDefinition {
+                factory_name: "coin".to_string(),
+                class_name: "Unknown".to_string(),
+                category: "MapObj".to_string(),
+                source: SchemaSource::MapObjManager,
+                display_name: None,
+                preview_model: None,
+                hidden: false,
+                unsafe_to_edit: false,
+            }],
+            ..Default::default()
+        };
+
+        registry.apply_overlay(SchemaOverlay {
+            objects: vec![ObjectOverlay {
+                factory_name: "coin".to_string(),
+                class_name: Some("TCoin".to_string()),
+                category: None,
+                display_name: None,
+                preview_model: None,
+                hidden: None,
+                unsafe_to_edit: None,
+            }],
+        });
+
+        assert_eq!(registry.find_object("coin").unwrap().class_name, "TCoin");
+    }
+
+    #[test]
+    fn extracts_root_npc_material_color_channels() {
+        let text = r#"
+            static const GXColorS10 sBodyColors[] = {
+                { 10, 20, 30, 255 }, { 40, 50, 60, 255 },
+            };
+            static const GXColorS10 sClothReg1[] = {
+                { 70, 80, 90, 255 },
+            };
+            static const GXColorS10 sClothReg2[] = {
+                { 100, 110, 120, 255 },
+            };
+            static const TColorChangeInfo sBody = {
+                0x00000001, "_hand_mat", sBodyColors, nullptr
+            };
+            static const TColorChangeInfo sCloth = {
+                0x00000002, "_fuku_mat", sClothReg1, sClothReg2
+            };
+            static const TNpcInitInfo sMonteMA_InitData = {
+                nullptr, {}, { { &sBody, nullptr }, { &sCloth } },
+                1.0f, 2.0f, 3.0f, 4.0f,
+            };
+        "#;
+
+        let colors = extract_npc_material_color_definitions(text, "src/NPC/NpcInitData.cpp");
+        assert_eq!(colors.len(), 2);
+        assert_eq!(colors[0].actor_key, "MonteMA");
+        assert_eq!(colors[0].color_index_channel, 0);
+        assert_eq!(colors[0].model_index, 0);
+        assert_eq!(colors[0].change.mode, 1);
+        assert_eq!(colors[0].change.colors0[1], [40, 50, 60, 255]);
+        assert_eq!(colors[1].color_index_channel, 1);
+        assert_eq!(colors[1].model_index, 0);
+        assert_eq!(colors[1].change.mode, 2);
+        assert_eq!(colors[1].change.colors1[0], [100, 110, 120, 255]);
+    }
+
+    #[test]
+    fn extracts_explicit_npc_resource_bases() {
+        let text = r#"
+            void TMareMBaseManager::createModelData() {
+                static const TModelDataLoadEntry entry[] = {
+                    { "mareM.bmd", 0x10300000, 0 },
+                    { nullptr, 0, 0 },
+                };
+                createModelDataArrayBase(entry, "/scene/mareM");
+            }
+        "#;
+
+        let bases = extract_npc_manager_resource_bases(text);
+        assert_eq!(bases["TMareMBaseManager"], "/scene/mareM");
+    }
+
+    #[test]
+    fn generator_fixture_is_deterministic_and_rejects_extractor_drift() {
+        let fixture = complete_generator_fixture();
+
+        let first = SchemaGenerator::new(&fixture.root).generate().unwrap();
+        let second = SchemaGenerator::new(&fixture.root).generate().unwrap();
+        assert_eq!(first, second);
+        assert!(!first
+            .objects
+            .iter()
+            .any(|object| object.factory_name == "H_ma_rak_dummy"));
+        let primary = first.primary_object_resource("NPCExample").unwrap();
+        assert_eq!(primary.model_index, 0);
+        assert_eq!(primary.role, ObjectResourceRole::Primary);
+        assert_eq!(primary.model_name, "example.bmd");
+        assert_eq!(primary.resource_base.as_deref(), Some("/scene/example"));
+        assert_eq!(first.npc_material_colors_for("NPCExampleA").count(), 1);
+        assert!(first.is_map_obj_factory("MapObjBase"));
+        assert!(!first.is_map_obj_factory("MapObjFlag"));
+        assert_eq!(
+            first
+                .find_map_obj_resource("FixtureMapObj")
+                .and_then(|resource| resource.primary_model.as_deref()),
+            Some("FixturePrimary.bmd")
+        );
+        let shared = first
+            .find_map_obj_model_override("SharedFixture", "SharedFixture")
+            .expect("fixture shared model override");
+        assert_eq!(shared.model_path, "/scene/mapObj/shared_fixture.bmd");
+        assert_eq!(
+            shared.tev_color,
+            Some(MapObjTevColorDefinition {
+                register: 1,
+                color: [1, 2, 3, 255]
+            })
+        );
+
+        fixture.write(
+            "src/System/MarNameRefGen_BossEnemy.cpp",
+            r#"static const char* texture = "H_ma_rak_dummy";"#,
+        );
+        let error = SchemaGenerator::new(&fixture.root).generate().unwrap_err();
+        assert!(matches!(
+            error,
+            SchemaError::ExtractionDrift {
+                extractor: SchemaExtractor::FactoryRegistration,
+                source_path,
+                ..
+            } if source_path.ends_with("MarNameRefGen_BossEnemy.cpp")
+        ));
+    }
+
+    #[test]
+    fn registry_rejects_ambiguous_primary_object_resources() {
+        let object = ObjectDefinition {
+            factory_name: "NPCExample".to_string(),
+            class_name: "TBaseNPC".to_string(),
+            category: "NPC".to_string(),
+            source: SchemaSource::MarNameRefGen,
+            display_name: None,
+            preview_model: None,
+            hidden: false,
+            unsafe_to_edit: false,
+        };
+        let resource = |model_index| ObjectResourceBinding {
+            factory_name: "NPCExample".to_string(),
+            model_index,
+            role: ObjectResourceRole::Primary,
+            model_name: format!("example{model_index}.bmd"),
+            resource_base: None,
+            load_flags: 0x1021_0000,
+            source_file: "src/NPC/NpcManager.cpp".to_string(),
+        };
+        let registry = ObjectRegistry {
+            objects: vec![object],
+            object_resources: vec![resource(0), resource(1)],
+            ..ObjectRegistry::default()
+        };
+
+        let error = validate_registry(&registry).unwrap_err();
+        assert!(
+            matches!(error, SchemaError::RegistryInvariant { detail } if detail.contains("2 primary"))
+        );
+    }
+
+    #[test]
+    fn map_obj_resource_lookup_is_exact_and_rejects_duplicate_identities() {
+        let resource = MapObjResourceDefinition {
+            resource_name: "WoodBox".to_string(),
+            actor_type: 0x4000_0003,
+            primary_model: Some("kibako.bmd".to_string()),
+            load_flags: 0x1022_0000,
+            source_file: "src/MoveBG/MapObjInit.cpp".to_string(),
+        };
+        let mut registry = ObjectRegistry {
+            objects: vec![ObjectDefinition {
+                factory_name: "MapObjBase".to_string(),
+                class_name: "TMapObjBase".to_string(),
+                category: "MapObj".to_string(),
+                source: SchemaSource::MarNameRefGen,
+                display_name: None,
+                preview_model: None,
+                hidden: false,
+                unsafe_to_edit: false,
+            }],
+            map_obj_resources: vec![resource.clone()],
+            ..ObjectRegistry::default()
+        };
+        assert_eq!(
+            registry
+                .find_map_obj_resource("WoodBox")
+                .and_then(|definition| definition.primary_model.as_deref()),
+            Some("kibako.bmd")
+        );
+        assert!(registry.find_map_obj_resource("woodbox").is_none());
+
+        registry.map_obj_resources.push(resource);
+        let error = dedup_registry(&mut registry).unwrap_err();
+        assert!(
+            matches!(error, SchemaError::RegistryInvariant { detail } if detail.contains("duplicate map-object resource identity WoodBox"))
+        );
+    }
+
+    #[test]
+    fn legacy_map_obj_resources_deserialize_with_runtime_default_loader_flags() {
+        let resource: MapObjResourceDefinition = toml::from_str(
+            r#"
+                resource_name = "WoodBox"
+                primary_model = "kibako.bmd"
+                source_file = "src/MoveBG/MapObjInit.cpp"
+            "#,
+        )
+        .expect("deserialize pre-loader-flags schema");
+        assert_eq!(resource.actor_type, 0);
+        assert_eq!(resource.load_flags, 0x1022_0000);
+
+        let map_static: MapStaticModelDefinition = toml::from_str(
+            r#"
+                actor_name = "BiancoRiver"
+                model_path = "/scene/map/map/BiancoRiver.bmd"
+                load_flags = 270598144
+                source_file = "src/Map/MapStaticObject.cpp"
+            "#,
+        )
+        .expect("deserialize pre-optional-path map-static schema");
+        assert_eq!(
+            map_static.model_path.as_deref(),
+            Some("/scene/map/map/BiancoRiver.bmd")
+        );
+    }
+
+    #[test]
+    fn case_distinct_retail_factory_names_remain_distinct() {
+        let object = |factory_name: &str, class_name: &str| ObjectDefinition {
+            factory_name: factory_name.to_string(),
+            class_name: class_name.to_string(),
+            category: "MapObj".to_string(),
+            source: SchemaSource::MapObjManager,
+            display_name: None,
+            preview_model: None,
+            hidden: false,
+            unsafe_to_edit: false,
+        };
+        let mut registry = ObjectRegistry {
+            objects: vec![
+                object("maregate", "TMapObjBase"),
+                object("MareGate", "TMareGate"),
+            ],
+            ..ObjectRegistry::default()
+        };
+
+        dedup_registry(&mut registry).unwrap();
+        validate_registry(&registry).unwrap();
+
+        assert_eq!(registry.objects.len(), 2);
+        assert_eq!(
+            registry.find_object("maregate").unwrap().class_name,
+            "TMapObjBase"
+        );
+        assert_eq!(
+            registry.find_object("MareGate").unwrap().class_name,
+            "TMareGate"
+        );
+        assert!(registry.find_object("MAREGATE").is_none());
+    }
+
+    #[test]
+    #[ignore = "requires the neighboring Super Mario Sunshine decompilation checkout"]
+    fn generated_neighboring_decomp_schema_satisfies_registry_invariants() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let registry = SchemaGenerator::new(root).generate().unwrap();
+
+        assert!(!registry
+            .objects
+            .iter()
+            .any(|object| object.factory_name == "H_ma_rak_dummy"));
+        assert!(!registry.object_resources.is_empty());
+        // MapObjInit declares 363 records, but retail lookup contains 359
+        // resources plus its terminator. Three unregistered declarations must
+        // not leak into the generated registry.
+        assert_eq!(registry.map_obj_resources.len(), 359);
+        assert_eq!(
+            registry
+                .map_obj_resources
+                .iter()
+                .filter(|resource| resource.primary_model.is_some())
+                .count(),
+            332
+        );
+        assert_eq!(
+            registry
+                .map_obj_resources
+                .iter()
+                .filter(|resource| resource.primary_model.is_none())
+                .count(),
+            27
+        );
+        assert_eq!(
+            registry
+                .map_obj_resources
+                .iter()
+                .filter(|resource| resource.load_flags == 0x1122_0000)
+                .map(|resource| resource.resource_name.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["DokanGate", "IceBlock"])
+        );
+        assert!(registry
+            .map_obj_resources
+            .iter()
+            .filter(|resource| !matches!(resource.resource_name.as_str(), "DokanGate" | "IceBlock"))
+            .all(|resource| resource.load_flags == 0x1022_0000));
+        let ball_transforms = registry
+            .map_obj_ball_transforms
+            .iter()
+            .map(|definition| (definition.actor_type, definition))
+            .collect::<BTreeMap<_, _>>();
+        for (actor_type, radius) in [
+            (0x4000_0390, 40),
+            (0x4000_0391, 40),
+            (0x4000_0392, 50),
+            (0x4000_0393, 45),
+            (0x4000_0394, 50),
+            (0x4000_0395, 50),
+        ] {
+            assert_eq!(ball_transforms[&actor_type].body_radius, radius);
+        }
+        assert_eq!(
+            ball_transforms[&0x4000_0394].positive_y_axis_subtract,
+            Some(50)
+        );
+        assert_eq!(
+            ball_transforms[&0x4000_0392].one_minus_y_axis_subtract,
+            Some(10)
+        );
+        assert_eq!(ball_transforms[&0x4000_0395].positive_y_axis_subtract, None);
+        for (actor_name, has_model) in [
+            ("mareSeaPollutionS0", true),
+            ("mareSeaPollutionS12", true),
+            ("mareSeaPollutionS34567", false),
+        ] {
+            let definition = registry
+                .map_static_models
+                .iter()
+                .find(|definition| definition.actor_name == actor_name)
+                .unwrap_or_else(|| panic!("missing map-static resource {actor_name}"));
+            assert_eq!(definition.load_flags, 0x1021_0000, "{actor_name}");
+            assert_eq!(definition.model_path.is_some(), has_model, "{actor_name}");
+        }
+        assert_eq!(registry.map_obj_model_overrides.len(), 4);
+        for (factory_name, resource_name, model, color) in [
+            (
+                "SurfGesoRed",
+                "SurfGesoRed",
+                "/scene/mapObj/surfgeso.bmd",
+                Some([255, 180, 255, 255]),
+            ),
+            (
+                "SurfGesoYellow",
+                "SurfGesoYellow",
+                "/scene/mapObj/surfgeso.bmd",
+                Some([255, 255, 125, 255]),
+            ),
+            (
+                "SurfGesoGreen",
+                "SurfGesoGreen",
+                "/scene/mapObj/surfgeso.bmd",
+                Some([180, 255, 180, 255]),
+            ),
+            ("Shine", "shine", "shine.bmd", None),
+        ] {
+            let definition = registry
+                .find_map_obj_model_override(factory_name, resource_name)
+                .unwrap_or_else(|| panic!("missing override {factory_name}/{resource_name}"));
+            assert_eq!(definition.model_path, model);
+            assert_eq!(definition.load_flags, 0x1022_0000);
+            assert_eq!(
+                definition.tev_color.map(|color| color.color),
+                color,
+                "{resource_name} color"
+            );
+        }
+        assert_eq!(registry.map_obj_string_tev_programs.len(), 1);
+        let nozzle = &registry.map_obj_string_tev_programs[0];
+        assert_eq!(nozzle.resource_name, "NozzleBox");
+        assert_eq!(nozzle.class_name, "TNozzleBox");
+        assert_eq!(nozzle.tev_register, 1);
+        assert_eq!(nozzle.default_color, [255, 255, 255, 100]);
+        assert_eq!(
+            nozzle
+                .variants
+                .iter()
+                .map(|variant| (variant.selector_value.as_str(), variant.color))
+                .collect::<BTreeMap<_, _>>(),
+            BTreeMap::from([
+                ("back_nozzle_item", [90, 90, 120, 100]),
+                ("normal_nozzle_item", [0, 0, 255, 100]),
+                ("rocket_nozzle_item", [255, 0, 0, 100]),
+            ])
+        );
+        for unregistered in ["telegraph_pole_l", "telegraph_pole_s", "move_ice_car"] {
+            assert!(registry.find_map_obj_resource(unregistered).is_none());
+        }
+        assert_eq!(
+            registry
+                .find_map_obj_resource("WoodBox")
+                .and_then(|resource| resource.primary_model.as_deref()),
+            Some("kibako.bmd")
+        );
+        assert_eq!(
+            registry
+                .find_map_obj_resource("FruitPapaya")
+                .and_then(|resource| resource.primary_model.as_deref()),
+            Some("FruitPapaya.bmd")
+        );
+        assert_eq!(
+            registry
+                .find_map_obj_resource("MapSmoke")
+                .and_then(|resource| resource.primary_model.as_deref()),
+            None
+        );
+        for factory_name in ["MapObjBase", "MareEventBumpyWall", "WoodBox", "ResetFruit"] {
+            assert!(
+                registry.is_map_obj_factory(factory_name),
+                "missing TMapObjBase-derived factory {factory_name}"
+            );
+        }
+        for factory_name in ["MapStaticObj", "MapObjFlag", "NPCMareMA", "Mario"] {
+            assert!(
+                !registry.is_map_obj_factory(factory_name),
+                "non-TMapObjBase factory {factory_name} was misclassified"
+            );
+        }
+        assert!(!registry.npc_material_colors.is_empty());
+        for factory_name in [
+            "mario_cap",
+            "bottle_large",
+            "bottle_short",
+            "GesoSurfBoardStatic",
+            "GesoSurfBoard",
+        ] {
+            let object = registry
+                .find_object(factory_name)
+                .unwrap_or_else(|| panic!("missing table-driven factory {factory_name}"));
+            assert_eq!(object.class_name, "TItem");
+        }
+        for (factory_name, class_name) in [
+            ("Map", "TMap"),
+            ("Sky", "TSky"),
+            ("Shimmer", "TShimmer"),
+            ("Pollution", "TPollutionManager"),
+            ("MapObjBase", "TMapObjBase"),
+            ("MapObjGeneral", "TMapObjGeneral"),
+            ("MapStaticObj", "TMapStaticObj"),
+            ("WoodBarrel", "TWoodBarrel"),
+            ("NozzleBox", "TNozzleBox"),
+            ("Coin", "TCoin"),
+        ] {
+            let object = registry
+                .find_object(factory_name)
+                .unwrap_or_else(|| panic!("missing factory {factory_name}"));
+            assert_eq!(object.class_name, class_name);
+        }
+        assert_eq!(
+            registry.find_object("maregate").unwrap().class_name,
+            "TMapObjBase"
+        );
+        assert_eq!(
+            registry.find_object("MareGate").unwrap().class_name,
+            "TMareGate"
+        );
+        let mare = registry
+            .primary_object_resource("NPCMareMA")
+            .expect("Mare variants inherit the MareM root model binding");
+        assert_eq!(mare.model_name, "mareM.bmd");
+        assert_eq!(mare.resource_base.as_deref(), Some("/scene/mareM"));
+        assert_eq!(mare.load_flags, 0x1030_0000);
+        let monte = registry
+            .primary_object_resource("NPCMonteMH")
+            .expect("Monte MH has a decomp-derived root model binding");
+        assert_eq!(monte.model_name, "momA_model.bmd");
+        assert_eq!(monte.resource_base.as_deref(), Some("/scene/monteMA"));
+        assert_eq!(registry.npc_material_colors_for("NPCMonteMA").count(), 2);
+        assert_eq!(registry.npc_material_colors_for("NPCMareMA").count(), 1);
+    }
+
+    fn complete_generator_fixture() -> SchemaFixture {
+        let fixture = SchemaFixture::new("complete");
+        fixture.write(
+            "include/JSystem/J3D/J3DGraphLoader/J3DModelLoaderFlags.hpp",
+            "J3DMLF_Test = 0x10000000;",
+        );
+        fixture.write(
+            "src/System/MarNameRefGen.cpp",
+            r#"if (strcmp(name, "Mario") == 0) return new TMario;"#,
+        );
+        fixture.write(
+            "src/System/MarNameRefGen_Enemy.cpp",
+            r#"
+                if (strcmp(name, "FixtureEnemy") == 0) return new TFixtureEnemy;
+                if (strcmp(name, "FixtureEnemyManager") == 0) return new TFixtureEnemyManager;
+            "#,
+        );
+        fixture.write(
+            "src/System/MarNameRefGen_BossEnemy.cpp",
+            r#"
+                static const char* texture = "H_ma_rak_dummy";
+                if (strcmp(name, "FixtureBoss") == 0) return new TFixtureBoss;
+                if (strcmp(name, "FixtureBossManager") == 0) return new TFixtureBossManager;
+            "#,
+        );
+        fixture.write(
+            "src/System/MarNameRefGen_Map.cpp",
+            r#"if (strcmp(name, "Map") == 0) return new TMap;"#,
+        );
+        fixture.write(
+            "src/System/MarNameRefGen_MapObj.cpp",
+            r#"
+                if (strcmp(name, "MapObjBase") == 0) return new TMapObjBase;
+                if (strcmp(name, "MapObjFlag") == 0) return new TMapObjFlag("flag");
+                if (strcmp(name, "SharedFixture") == 0) return new TMapObjBase;
+                if (strcmp(name, "NozzleBox") == 0) return new TNozzleBox("box");
+            "#,
+        );
+        fixture.write(
+            "src/MoveBG/MapObjManager.cpp",
+            r#"
+                if (strcmp(name, "coin") == 0) return gpItemManager->coin;
+                mSharedFixtureModelData = SMS_MakeSDLModelData(
+                    "/scene/mapObj/shared_fixture.bmd", 0x10220000);
+            "#,
+        );
+        fixture.write(
+            "src/MoveBG/MapObjInit.cpp",
+            r#"
+                static const TMapObjAnimData fixture_anim_data[] = {
+                    { "FixturePrimary.bmd", nullptr, 0, nullptr, nullptr },
+                };
+                static const TMapObjAnimDataInfo fixture_anim_info = {
+                    1, 1, fixture_anim_data,
+                };
+                static const TMapObjAnimDataInfo no_data_anim_info = { 0, 0, nullptr };
+                static TMapObjData fixture_data = {
+                    "FixtureMapObj", 0x40000001, nullptr, nullptr, &fixture_anim_info,
+                    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                    0.0f, 0x00000000, 0,
+                };
+                static TMapObjData shared_fixture_data = {
+                    "SharedFixture", 0x40000002, nullptr, nullptr, &no_data_anim_info,
+                    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                    0.0f, 0x00008000, 0,
+                };
+                static TMapObjData nozzle_box_data = {
+                    "NozzleBox", 0x40000003, nullptr, nullptr, nullptr,
+                    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                    0.0f, 0x00000000, 0,
+                };
+                static TMapObjData end_data = {
+                    nullptr, 0, nullptr, nullptr, &no_data_anim_info,
+                    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                    0.0f, 0x00000000, 0,
+                };
+                static TMapObjData* sObjDataTable[] = {
+                    &fixture_data, &shared_fixture_data, &nozzle_box_data, &end_data
+                };
+                void TMapObjBase::makeMActors() {
+                    if (unkF8 & 0x8000) {
+                        mMActorKeeper->mModelLoaderFlags = 0x11220000;
+                    } else {
+                        mMActorKeeper->mModelLoaderFlags = 0x10220000;
+                    }
+                    if (mMapObjData->mAnim) {
+                        mMActor = initMActor(mMapObjData->mAnim->unk4[0].unk0, nullptr, 0);
+                    } else {
+                        char buffer[64];
+                        snprintf(buffer, 64, "%s.bmd", mMapObjData->unk0);
+                        mMActor = initMActor(buffer, nullptr, 0);
+                    }
+                }
+                void TMapObjBase::initActorData() {
+                    unkF8 = mMapObjData->unk34;
+                }
+            "#,
+        );
+        fixture.write(
+            "src/MoveBG/SharedFixture.cpp",
+            r#"
+                void TMapObjBase::initMapObj() {
+                    if (strcmp(unkF4, "SharedFixture") == 0) {
+                        tint.r = 1; tint.g = 2; tint.b = 3; tint.a = 255;
+                    }
+                    SDLModelData* modelData = gpMapObjManager->mSharedFixtureModelData;
+                    mMActor = SMS_MakeMActorFromSDLModelData(modelData, animationData, 3);
+                    initPacketMatColor(getModel(), GX_TEVREG1, &tint);
+                }
+            "#,
+        );
+        fixture.write(
+            "include/MoveBG/Item.hpp",
+            r#"
+                class TNozzleBox : public TMapObjGeneral {
+                    /* 0x15E */ u16 unk15E;
+                    /* 0x160 */ u16 unk160;
+                    /* 0x162 */ u16 unk162;
+                    /* 0x164 */ u16 unk164;
+                };
+            "#,
+        );
+        fixture.write(
+            "src/MoveBG/Item.cpp",
+            r#"
+                TNozzleBox::TNozzleBox(const char* name)
+                    : TMapObjGeneral(name), unk15E(0xFF), unk160(0xFF),
+                      unk162(0xFF), unk164(100) {}
+                void TNozzleBox::load(JSUMemoryInputStream& stream) {
+                    TMapObjBase::load(stream);
+                    unk158 = stream.readString();
+                    if (strcmp(unk158, "normal_nozzle_item") == 0) {
+                        unk15E = 0; unk160 = 0; unk162 = 0xFF;
+                    } else if (strcmp(unk158, "rocket_nozzle_item") == 0) {
+                        unk15E = 0xFF; unk160 = 0; unk162 = 0;
+                    } else if (strcmp(unk158, "back_nozzle_item") == 0) {
+                        unk15E = 0x5A; unk160 = 0x5A; unk162 = 0x78;
+                    }
+                    initPacketMatColor(getModel(), GX_TEVREG1,
+                        (const GXColorS10*)&unk15E);
+                }
+            "#,
+        );
+        fixture.write(
+            "src/MoveBG/MapObjBall.cpp",
+            r#"
+                void TMapObjBall::initMapObj() {
+                    switch (mActorType) {
+                    case 0x40000001:
+                        mBodyRadius = 50.0f * mScaling.y;
+                        break;
+                    }
+                }
+                void TResetFruit::makeObjAppeared() {
+                    (*m)[1][3] = mPosition.y + mBodyRadius;
+                }
+            "#,
+        );
+        fixture.write(
+            "src/Enemy/Fixture.cpp",
+            r#"
+                PARAM_INIT(mFixture, 1)
+                static const char* model = "/scene/fixture/model.bmd";
+                void loadFixture() { gpResourceManager->load("fixture.jpa", 7); }
+                void TFixtureEnemy::calc() {
+                    gpMarioParticleManager->emitAndBindToPosPtr(7, &mPosition, 1, this);
+                }
+            "#,
+        );
+        fixture.write(
+            "src/Map/MapStaticObject.cpp",
+            r#"
+                static const TMapStaticObj::ActorDataTableEntry actor_data_table[] = {
+                    { "FixtureMap", 0, 0, 0.0f, 0.0f, 0.0f, 0.0f, nullptr,
+                      "FixtureMap", 0x10210000, nullptr, 0, 0xFFFFFFFF, 0, 0, 0, 0x40 },
+                };
+            "#,
+        );
+        fixture.write(
+            "src/Map/Map.cpp",
+            r#"static void initStageCommon() { actor->init("FixtureMap"); }"#,
+        );
+        fixture.write(
+            "src/MoveBG/MapObjFlag.cpp",
+            r#"
+                f32 TMapObjFlag::mFlutterSpeed = 4.0f;
+                #define REGISTER_FLAG(N, NAME) snprintf(buf, 64, "/scene/mapObj/%s.bti", name);
+                void TMapObjFlagManager::registerObj(TMapObjFlag*, const char*) {
+                    REGISTER_FLAG(0, "flagSun")
+                }
+                void TMapObjFlag::load(JSUMemoryInputStream& stream) {
+                    char buf[64]; stream.readString(buf, 64); init(buf);
+                }
+                TMapObjFlag::TMapObjFlag(const char*) {
+                    mFlagHeight = 125.0f; mFlagWidth = 130.0f; mSegmentSize = 20.0f;
+                }
+                void TMapObjFlagManager::load(JSUMemoryInputStream&) {
+                    switch (gpMarDirector->mMap) {
+                    case 2: TMapObjFlag::mFlutterSpeed = 16.0f; break;
+                    default: TMapObjFlag::mFlutterSpeed = 8.0f; break;
+                    }
+                }
+                void TMapObjFlagManager::perform(u32, JDrama::TGraphics*) {
+                    flag->mPhase += TMapObjFlag::mFlutterSpeed;
+                    if (flag->mPhase > 360.0f) flag->mPhase -= 360.0f;
+                }
+            "#,
+        );
+        fixture.write(
+            "src/System/Application.cpp",
+            r#"bufStageArcBin = JKRDvdRipper::loadToMainRAM("/data/stageArc.bin", nullptr, EXPAND_SWITCH_DEFAULT, 0, mHeap);"#,
+        );
+        fixture.write(
+            "src/System/MarNameRefGen_NPC.cpp",
+            r#"
+                if (strcmp(name, "NPCExample") == 0) return new TBaseNPC(1, "?");
+                if (strcmp(name, "ExampleManager") == 0) return new TExampleManager;
+            "#,
+        );
+        fixture.write(
+            "src/NPC/NpcManager.cpp",
+            r#"
+                void TExampleManager::createModelData() {
+                    static const TModelDataLoadEntry entry[] = {
+                        { "example.bmd", 0x10210000, 0 }, { nullptr, 0, 0 },
+                    };
+                    createModelDataArrayBase(entry, "/scene/example");
+                }
+            "#,
+        );
+        fixture.write(
+            "src/NPC/NpcInitData.cpp",
+            r#"
+                static const GXColorS10 sBodyColors[] = { { 1, 2, 3, 255 } };
+                static const TColorChangeInfo sBody = {
+                    0x00000001, "_body", sBodyColors, nullptr
+                };
+                static const TNpcInitInfo sExample_InitData = {
+                    nullptr, {}, { { &sBody } }, 1.0f, 2.0f, 3.0f, 4.0f,
+                };
+            "#,
+        );
+        fixture
     }
 }

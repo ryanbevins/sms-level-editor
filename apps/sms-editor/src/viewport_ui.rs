@@ -21,13 +21,27 @@ fn preview_triangle_writes_opaque_depth(
     ) && !preview_triangle_is_translucent(preview, triangle)
 }
 
+#[cfg(test)]
 pub(super) fn outline_segments_from_coverage(
     coverage: &[bool],
     size: [usize; 2],
     bounds: [usize; 4],
     rect: egui::Rect,
 ) -> Vec<[egui::Pos2; 2]> {
-    let [width, height] = size;
+    outline_segments_from_bounded_coverage(coverage, size, [0, 0], size, bounds, rect)
+}
+
+pub(super) fn outline_segments_from_bounded_coverage(
+    coverage: &[bool],
+    coverage_size: [usize; 2],
+    coverage_origin: [usize; 2],
+    framebuffer_size: [usize; 2],
+    bounds: [usize; 4],
+    rect: egui::Rect,
+) -> Vec<[egui::Pos2; 2]> {
+    let [coverage_width, coverage_height] = coverage_size;
+    let [origin_x, origin_y] = coverage_origin;
+    let [width, height] = framebuffer_size;
     let [min_x, max_x, min_y, max_y] = bounds;
     let screen_pos = |x: f32, y: f32| {
         egui::pos2(
@@ -36,11 +50,13 @@ pub(super) fn outline_segments_from_coverage(
         )
     };
     let covered = |x: isize, y: isize| {
-        x >= 0
-            && y >= 0
-            && (x as usize) < width
-            && (y as usize) < height
-            && coverage[y as usize * width + x as usize]
+        let local_x = x - origin_x as isize;
+        let local_y = y - origin_y as isize;
+        local_x >= 0
+            && local_y >= 0
+            && (local_x as usize) < coverage_width
+            && (local_y as usize) < coverage_height
+            && coverage[local_y as usize * coverage_width + local_x as usize]
     };
     let mut segments = Vec::new();
 
@@ -634,10 +650,7 @@ impl SmsEditorApp {
         let size = framebuffer_size_for_rect(rect);
         let width = size[0];
         let height = size[1];
-        let mut coverage = vec![false; width * height];
-        let mut coverage_bounds: Option<[usize; 4]> = None;
-
-        for triangle in preview
+        let projected_triangles = preview
             .triangles
             .iter()
             .filter(|triangle| triangle.model_index == model_index)
@@ -647,58 +660,47 @@ impl SmsEditorApp {
                     PreviewRenderLayer::Particle | PreviewRenderLayer::ParticleDistortion
                 )
             })
-        {
-            let Some(projected) = self.project_preview_triangle(rect, size, triangle) else {
-                continue;
-            };
-            let min_x = projected
-                .screen
-                .iter()
-                .map(|vertex| vertex.x)
-                .fold(f32::INFINITY, f32::min)
-                .floor()
-                .max(0.0) as usize;
-            let max_x = projected
-                .screen
-                .iter()
-                .map(|vertex| vertex.x)
-                .fold(f32::NEG_INFINITY, f32::max)
-                .ceil()
-                .min(width.saturating_sub(1) as f32) as usize;
-            let min_y = projected
-                .screen
-                .iter()
-                .map(|vertex| vertex.y)
-                .fold(f32::INFINITY, f32::min)
-                .floor()
-                .max(0.0) as usize;
-            let max_y = projected
-                .screen
-                .iter()
-                .map(|vertex| vertex.y)
-                .fold(f32::NEG_INFINITY, f32::max)
-                .ceil()
-                .min(height.saturating_sub(1) as f32) as usize;
-            if min_x > max_x || min_y > max_y {
-                continue;
-            }
-
-            for y in min_y..=max_y {
-                for x in min_x..=max_x {
-                    if projected_triangle_depth_at_point(
-                        projected.screen,
-                        x as f32 + 0.5,
-                        y as f32 + 0.5,
-                    )
-                    .is_some()
-                    {
-                        coverage[y * width + x] = true;
-                    }
+            .filter_map(|triangle| {
+                let projected = self.project_preview_triangle(rect, size, triangle)?;
+                let min_x = projected
+                    .screen
+                    .iter()
+                    .map(|vertex| vertex.x)
+                    .fold(f32::INFINITY, f32::min)
+                    .floor()
+                    .max(0.0) as usize;
+                let max_x = projected
+                    .screen
+                    .iter()
+                    .map(|vertex| vertex.x)
+                    .fold(f32::NEG_INFINITY, f32::max)
+                    .ceil()
+                    .min(width.saturating_sub(1) as f32) as usize;
+                let min_y = projected
+                    .screen
+                    .iter()
+                    .map(|vertex| vertex.y)
+                    .fold(f32::INFINITY, f32::min)
+                    .floor()
+                    .max(0.0) as usize;
+                let max_y = projected
+                    .screen
+                    .iter()
+                    .map(|vertex| vertex.y)
+                    .fold(f32::NEG_INFINITY, f32::max)
+                    .ceil()
+                    .min(height.saturating_sub(1) as f32) as usize;
+                if min_x > max_x || min_y > max_y {
+                    return None;
                 }
-            }
-            coverage_bounds = Some(coverage_bounds.map_or(
-                [min_x, max_x, min_y, max_y],
-                |[old_min_x, old_max_x, old_min_y, old_max_y]| {
+                Some((projected, [min_x, max_x, min_y, max_y]))
+            })
+            .collect::<Vec<_>>();
+        let coverage_bounds = projected_triangles
+            .iter()
+            .map(|(_, bounds)| *bounds)
+            .reduce(
+                |[old_min_x, old_max_x, old_min_y, old_max_y], [min_x, max_x, min_y, max_y]| {
                     [
                         old_min_x.min(min_x),
                         old_max_x.max(max_x),
@@ -706,13 +708,39 @@ impl SmsEditorApp {
                         old_max_y.max(max_y),
                     ]
                 },
-            ));
-        }
-
+            );
         let Some([min_x, max_x, min_y, max_y]) = coverage_bounds else {
             return Vec::new();
         };
-        outline_segments_from_coverage(&coverage, size, [min_x, max_x, min_y, max_y], rect)
+        let coverage_size = [max_x - min_x + 1, max_y - min_y + 1];
+        let mut coverage = vec![false; coverage_size[0] * coverage_size[1]];
+
+        for (projected, [triangle_min_x, triangle_max_x, triangle_min_y, triangle_max_y]) in
+            projected_triangles
+        {
+            for y in triangle_min_y..=triangle_max_y {
+                for x in triangle_min_x..=triangle_max_x {
+                    if projected_triangle_depth_at_point(
+                        projected.screen,
+                        x as f32 + 0.5,
+                        y as f32 + 0.5,
+                    )
+                    .is_some()
+                    {
+                        coverage[(y - min_y) * coverage_size[0] + (x - min_x)] = true;
+                    }
+                }
+            }
+        }
+
+        outline_segments_from_bounded_coverage(
+            &coverage,
+            coverage_size,
+            [min_x, min_y],
+            size,
+            [min_x, max_x, min_y, max_y],
+            rect,
+        )
     }
 
     pub(super) fn paint_selected_object_outline(&self, painter: &egui::Painter, rect: egui::Rect) {
@@ -1342,10 +1370,16 @@ impl SmsEditorApp {
         let size = framebuffer_size_for_rect(rect);
         let mut image = viewport_framebuffer_background(size);
         let mut depth = vec![f32::INFINITY; size[0] * size[1]];
+        let camera_position = self.camera_frame().position;
+        let triangle_is_visible = |triangle: &PreviewTriangle| {
+            triangle.render_layer != PreviewRenderLayer::MirrorSurface
+                || preview.mirror_surface_model_is_visible(triangle.model_index, camera_position)
+        };
 
         for triangle in preview
             .triangles
             .iter()
+            .filter(|triangle| triangle_is_visible(triangle))
             .filter(|triangle| triangle.render_layer == PreviewRenderLayer::Sky)
         {
             if let Some(projected) = self.project_preview_triangle(rect, size, triangle) {
@@ -1358,6 +1392,7 @@ impl SmsEditorApp {
         for triangle in preview
             .triangles
             .iter()
+            .filter(|triangle| triangle_is_visible(triangle))
             .filter(|triangle| preview_triangle_writes_opaque_depth(preview, triangle))
         {
             if let Some(projected) = self.project_preview_triangle(rect, size, triangle) {
@@ -1370,6 +1405,7 @@ impl SmsEditorApp {
         let mut translucent: Vec<_> = preview
             .triangles
             .iter()
+            .filter(|triangle| triangle_is_visible(triangle))
             .filter(|triangle| {
                 !matches!(
                     triangle.render_layer,

@@ -7,6 +7,48 @@
 use serde::{Deserialize, Serialize};
 use sms_scene::{AssetRole, StageDocument};
 
+/// Optional intermediate targets required by the scene's GX material passes.
+///
+/// Frontends can use this contract to avoid allocating full-size render targets
+/// for effects that are not present in the active scene.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ViewportTargetFeatures {
+    pub screen_copy: bool,
+    pub wave_mask: bool,
+    pub mirror: bool,
+}
+
+/// How faithfully a GX blend mode can be represented by wgpu's blend state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GxBlendCompatibility {
+    Native,
+    /// This logic operation depends only on the incoming fragment (or a
+    /// constant), so a frontend can reproduce it without reading the current
+    /// framebuffer value.
+    SourceIndependentLogicOperation {
+        logic_operation: u8,
+    },
+    /// GX logic operations act on the existing framebuffer value. WebGPU does
+    /// not expose fixed-function framebuffer logic operations.
+    UnsupportedLogicOperation {
+        logic_operation: u8,
+    },
+    UnsupportedMode {
+        mode: u8,
+    },
+}
+
+pub fn gx_blend_compatibility(mode: u8, logic_operation: u8) -> GxBlendCompatibility {
+    match mode {
+        0 | 1 | 3 => GxBlendCompatibility::Native,
+        2 if matches!(logic_operation, 0 | 3 | 5 | 12 | 15) => {
+            GxBlendCompatibility::SourceIndependentLogicOperation { logic_operation }
+        }
+        2 => GxBlendCompatibility::UnsupportedLogicOperation { logic_operation },
+        mode => GxBlendCompatibility::UnsupportedMode { mode },
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RendererConfig {
     pub show_collision: bool,
@@ -179,6 +221,7 @@ mod tests {
             load_issues: Vec::new(),
             lighting: Default::default(),
             actor_previews: BTreeMap::new(),
+            loaded_project: None,
         };
         let scene = RenderScene::from_document(&document);
         let renderer = ViewportRenderer::new(RendererConfig::default());
@@ -187,5 +230,24 @@ mod tests {
             .labels
             .iter()
             .any(|label| label.contains("dolpic")));
+    }
+
+    #[test]
+    fn classifies_source_independent_and_framebuffer_dependent_gx_logic_operations() {
+        for logic_operation in [0, 3, 5, 12, 15] {
+            assert_eq!(
+                gx_blend_compatibility(2, logic_operation),
+                GxBlendCompatibility::SourceIndependentLogicOperation { logic_operation }
+            );
+        }
+        assert_eq!(
+            gx_blend_compatibility(2, 6),
+            GxBlendCompatibility::UnsupportedLogicOperation { logic_operation: 6 }
+        );
+        assert_eq!(gx_blend_compatibility(1, 6), GxBlendCompatibility::Native);
+        assert_eq!(
+            gx_blend_compatibility(9, 0),
+            GxBlendCompatibility::UnsupportedMode { mode: 9 }
+        );
     }
 }

@@ -16,5 +16,4 @@ sms-scene.workspace = true
 sms-schema.workspace = true
 
 [dev-dependencies]
-naga.workspace = true
-pollster = "1.0"
+pollster = "0.4"

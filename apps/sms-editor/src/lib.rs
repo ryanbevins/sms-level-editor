@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{
@@ -18,7 +18,9 @@ use sms_formats::{
     StageAssetKind, SMS_ANIMATION_FRAMES_PER_SECOND, SMS_DEFAULT_OBJECT_MODEL_LOAD_FLAGS,
     SMS_MAP_MODEL_LOAD_FLAGS, SMS_POLLUTION_MODEL_LOAD_FLAGS,
 };
-use sms_render::{RenderScene, RendererConfig, ViewportRenderer};
+use sms_render::{
+    gx_blend_compatibility, GxBlendCompatibility, RenderScene, RendererConfig, ViewportRenderer,
+};
 use sms_scene::{
     AssetRef, AssetRole, SceneObject, StageDocument, Transform, ValidationIssue, ValidationSeverity,
 };
@@ -114,6 +116,7 @@ struct PreviewVisibility {
 
 struct LoadedStage {
     base_root: String,
+    project_root: String,
     archives: Vec<SceneArchiveInfo>,
     registry: Option<ObjectRegistry>,
     schema_warning: Option<String>,
@@ -133,6 +136,149 @@ enum BackgroundResult {
 
 mod preview_types;
 use preview_types::*;
+
+fn validation_issues_for_preview(
+    document: &StageDocument,
+    preview: Option<&ModelPreview>,
+) -> Vec<ValidationIssue> {
+    let mut issues = document.validate();
+    let Some(preview) = preview else {
+        return issues;
+    };
+    for (index, failure) in preview.model_failures.iter().enumerate() {
+        issues.push(ValidationIssue::warning(
+            format!("renderer-model-preview-failed-{index}"),
+            format!(
+                "Model preview failed for '{}': {}",
+                failure.asset_path, failure.error
+            ),
+        ));
+    }
+    if preview.failed_models > preview.model_failures.len() {
+        issues.push(ValidationIssue::warning(
+            "renderer-model-preview-failures-truncated",
+            format!(
+                "{} additional model asset failure(s) were omitted after the first {} details",
+                preview.failed_models - preview.model_failures.len(),
+                preview.model_failures.len()
+            ),
+        ));
+    }
+    for (index, material) in preview.materials.iter().enumerate() {
+        let blend = material.blend_mode;
+        append_gpu_blend_validation_issue(
+            &mut issues,
+            index,
+            &material.name,
+            blend.mode,
+            blend.logic_op,
+        );
+    }
+    for (index, texture) in preview.textures.iter().enumerate() {
+        let mut unsupported_flags = Vec::new();
+        if texture.do_edge_lod {
+            unsupported_flags.push("edge LOD");
+        }
+        if texture.bias_clamp {
+            unsupported_flags.push("LOD bias clamp");
+        }
+        if !unsupported_flags.is_empty() {
+            issues.push(ValidationIssue::warning(
+                format!("renderer-gx-texture-lod-unsupported-{index}"),
+                format!(
+                    "Texture #{index} requests GX {}, which the wgpu preview does not emulate",
+                    unsupported_flags.join(" and ")
+                ),
+            ));
+        }
+        if !gpu_viewport::authored_sampler_anisotropy_is_supported(texture) {
+            issues.push(ValidationIssue::warning(
+                format!("renderer-gx-texture-anisotropy-filter-conflict-{index}"),
+                format!(
+                    "Texture #{index} requests GX {}x anisotropy with non-linear minification filters; WebGPU cannot combine those states, so the preview preserves the authored filters and disables anisotropy",
+                    1u16 << texture.max_anisotropy.min(2)
+                ),
+            ));
+        }
+    }
+    issues
+}
+
+fn append_gpu_blend_validation_issue(
+    issues: &mut Vec<ValidationIssue>,
+    material_index: usize,
+    material_name: &str,
+    mode: u8,
+    logic_op: u8,
+) {
+    match gx_blend_compatibility(mode, logic_op) {
+        GxBlendCompatibility::UnsupportedLogicOperation { logic_operation } => {
+            issues.push(ValidationIssue::warning(
+                format!("renderer-gx-logic-op-unsupported-{material_index}"),
+                format!(
+                    "Material #{material_index} '{material_name}' uses GX framebuffer logic operation {logic_operation}; the wgpu preview uses overwrite fallback because this operation depends on the existing framebuffer value"
+                ),
+            ));
+        }
+        GxBlendCompatibility::UnsupportedMode { mode } => {
+            issues.push(ValidationIssue::warning(
+                format!("renderer-gx-blend-mode-unsupported-{material_index}"),
+                format!(
+                    "Material #{material_index} '{material_name}' uses unknown GX blend mode {mode}; the wgpu preview uses overwrite fallback"
+                ),
+            ));
+        }
+        GxBlendCompatibility::Native
+        | GxBlendCompatibility::SourceIndependentLogicOperation { .. } => {}
+    }
+}
+
+const MAX_MODEL_FAILURE_DETAILS: usize = 32;
+
+fn record_model_preview_failure(
+    failed_assets: &mut BTreeSet<String>,
+    failures: &mut Vec<PreviewModelFailure>,
+    asset_path: &str,
+    error: String,
+) {
+    if !failed_assets.insert(normalized_preview_asset_path(asset_path)) {
+        return;
+    }
+    if failures.len() < MAX_MODEL_FAILURE_DETAILS {
+        failures.push(PreviewModelFailure {
+            asset_path: asset_path.to_string(),
+            error,
+        });
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum ObjectDelta {
+    Insert {
+        index: usize,
+        object: SceneObject,
+    },
+    Remove {
+        index: usize,
+        object: SceneObject,
+    },
+    Update {
+        before: Box<SceneObject>,
+        after: Box<SceneObject>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ObjectUndoRecord {
+    deltas: Vec<ObjectDelta>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ObjectUndoTransaction {
+    index: usize,
+    before: SceneObject,
+}
+
 struct SmsEditorApp {
     repo_root: String,
     base_root: String,
@@ -158,6 +304,8 @@ struct SmsEditorApp {
     object_filter: String,
     scene_filter: String,
     last_scanned_base_root: String,
+    pending_auto_refresh_root: Option<String>,
+    last_auto_refresh_attempt_root: String,
     tool: EditorTool,
     view_mode: ViewMode,
     left_tab: LeftTab,
@@ -181,9 +329,9 @@ struct SmsEditorApp {
     next_object_serial: u32,
     saved_objects: Vec<SceneObject>,
     document_dirty: bool,
-    undo_stack: Vec<Vec<SceneObject>>,
-    redo_stack: Vec<Vec<SceneObject>>,
-    undo_transaction: Option<Vec<SceneObject>>,
+    undo_stack: VecDeque<ObjectUndoRecord>,
+    redo_stack: VecDeque<ObjectUndoRecord>,
+    undo_transaction: Option<ObjectUndoTransaction>,
     pending_stage_open: Option<String>,
     close_confirmation_requested: bool,
     close_authorized: bool,
@@ -227,6 +375,8 @@ impl Default for SmsEditorApp {
             object_filter: String::new(),
             scene_filter: String::new(),
             last_scanned_base_root: String::new(),
+            pending_auto_refresh_root: None,
+            last_auto_refresh_attempt_root: String::new(),
             tool: EditorTool::Select,
             view_mode: ViewMode::Lit,
             left_tab: LeftTab::Content,
@@ -250,8 +400,8 @@ impl Default for SmsEditorApp {
             next_object_serial: 1,
             saved_objects: Vec::new(),
             document_dirty: false,
-            undo_stack: Vec::new(),
-            redo_stack: Vec::new(),
+            undo_stack: VecDeque::new(),
+            redo_stack: VecDeque::new(),
             undo_transaction: None,
             pending_stage_open: None,
             close_confirmation_requested: false,
@@ -377,18 +527,39 @@ impl SmsEditorApp {
     }
 
     fn refresh_scene_browser_if_needed(&mut self) {
-        let base_root = self.base_root.trim();
-        if base_root.is_empty() || self.last_scanned_base_root == base_root {
+        let base_root = self.base_root.trim().to_string();
+        if base_root.is_empty() {
+            self.pending_auto_refresh_root = None;
+            self.last_auto_refresh_attempt_root.clear();
             return;
         }
 
-        if PathBuf::from(base_root).exists() {
-            let should_open = self.document.is_none();
-            if should_open && !self.stage_id.trim().is_empty() {
-                self.open_stage();
-            } else {
-                self.scan_scenes();
-            }
+        if self.last_scanned_base_root == base_root {
+            self.pending_auto_refresh_root = None;
+            self.last_auto_refresh_attempt_root = base_root;
+            return;
+        }
+
+        if self.last_auto_refresh_attempt_root != base_root
+            && self.pending_auto_refresh_root.as_deref() != Some(base_root.as_str())
+        {
+            self.pending_auto_refresh_root = Some(base_root.clone());
+        }
+
+        if self.background_receiver.is_some()
+            || self.pending_auto_refresh_root.as_deref() != Some(base_root.as_str())
+            || !PathBuf::from(&base_root).exists()
+        {
+            return;
+        }
+
+        self.pending_auto_refresh_root = None;
+        self.last_auto_refresh_attempt_root = base_root;
+        let should_open = self.document.is_none();
+        if should_open && !self.stage_id.trim().is_empty() {
+            self.open_stage();
+        } else {
+            self.scan_scenes();
         }
     }
 
@@ -444,6 +615,7 @@ impl SmsEditorApp {
         }
         let base_root = self.base_root.trim().to_string();
         let repo_root = self.repo_root.trim().to_string();
+        let project_root = self.project_root.trim().to_string();
         let stage_id = self.stage_id.trim().to_string();
         if base_root.is_empty() || stage_id.is_empty() {
             self.log
@@ -468,6 +640,11 @@ impl SmsEditorApp {
                 };
                 let mut document = StageDocument::open(PathBuf::from(&base_root), stage_id)
                     .map_err(|err| err.to_string())?;
+                if !project_root.is_empty() {
+                    document
+                        .load_project_folder(PathBuf::from(&project_root))
+                        .map_err(|err| err.to_string())?;
+                }
                 if let Some(registry) = registry.clone() {
                     document = document.with_registry(registry);
                 }
@@ -475,6 +652,7 @@ impl SmsEditorApp {
                 let preview = SmsEditorApp::build_model_preview(&document, visibility);
                 Ok(Box::new(LoadedStage {
                     base_root,
+                    project_root,
                     archives,
                     registry,
                     schema_warning,
@@ -505,7 +683,12 @@ impl SmsEditorApp {
                                 registry.objects.len()
                             ));
                             if let Some(document) = &mut self.document {
+                                document.refresh_registry_derived_object_fields(
+                                    &mut self.saved_objects,
+                                    &registry,
+                                );
                                 document.set_registry(registry.clone());
+                                self.document_dirty = document.objects != self.saved_objects;
                                 self.issues = document.validate();
                             }
                             self.registry = Some(registry);
@@ -558,6 +741,7 @@ impl SmsEditorApp {
     fn apply_loaded_stage(&mut self, loaded: LoadedStage) {
         let LoadedStage {
             base_root,
+            project_root,
             archives,
             registry,
             schema_warning,
@@ -568,6 +752,19 @@ impl SmsEditorApp {
         if self.base_root.trim() != base_root {
             self.log.push(format!(
                 "Discarded stage load for superseded base root {base_root}."
+            ));
+            return;
+        }
+        if self.project_root.trim() != project_root {
+            self.log.push(format!(
+                "Discarded stage load for superseded project root {project_root}."
+            ));
+            return;
+        }
+        if self.stage_id.trim() != document.stage_id {
+            self.log.push(format!(
+                "Discarded stage load for superseded stage {}.",
+                document.stage_id
             ));
             return;
         }
@@ -608,7 +805,17 @@ impl SmsEditorApp {
             self.log
                 .push("Viewport preview could not decode BMD vertex data.".to_string());
         }
-        self.issues = document.validate();
+        self.issues = validation_issues_for_preview(&document, preview.as_ref());
+        for issue in self
+            .issues
+            .iter()
+            .filter(|issue| issue.code.starts_with("renderer-"))
+        {
+            self.log.push(format!(
+                "Renderer warning [{}] {}",
+                issue.code, issue.message
+            ));
+        }
         self.saved_objects = document.objects.clone();
         self.document_dirty = false;
         self.stage_id = document.stage_id.clone();
@@ -640,7 +847,11 @@ impl SmsEditorApp {
         const POINTS_PER_OBJECT_INSTANCE: usize = 500;
 
         let active_pollution_layers = active_pollution_layer_count(document);
-        let active_mirror_model_slots = active_mirror_model_slots(document);
+        let mirror_cubes = mirror_cubes(document);
+        let active_mirror_model_slots = mirror_cubes
+            .iter()
+            .map(|cube| cube.model_slot)
+            .collect::<BTreeSet<_>>();
         let models: Vec<_> = document
             .assets
             .iter()
@@ -702,27 +913,46 @@ impl SmsEditorApp {
         let mut camera_bounds_max = [f32::NEG_INFINITY; 3];
         let mut camera_bound_points = Vec::new();
         let mut loaded_models = 0;
-        let mut failed_models = 0;
+        let mut failed_model_assets = BTreeSet::new();
+        let mut model_failures = Vec::new();
         let mut source_vertices = 0;
         let mut source_triangles = 0;
         let mut source_textures = 0;
         let mut object_model_indices = BTreeMap::new();
+        let mut mirror_model_slots = BTreeMap::new();
 
         for asset in models {
             let asset_path = asset.path.to_string_lossy().replace('\\', "/");
             let include_in_camera_bounds = is_camera_bounds_model_path(&asset_path);
             let model_render_layer = preview_render_layer_for_model_path(&asset_path);
             let is_sky = model_render_layer == PreviewRenderLayer::Sky;
-            let Ok(bytes) = read_stage_asset_bytes(&asset.path) else {
-                failed_models += 1;
-                continue;
+            let bytes = match read_stage_asset_bytes(&asset.path) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    record_model_preview_failure(
+                        &mut failed_model_assets,
+                        &mut model_failures,
+                        &asset_path,
+                        format!("read asset: {error}"),
+                    );
+                    continue;
+                }
             };
-            let Ok(file) = J3dFile::parse(&bytes) else {
-                failed_models += 1;
-                continue;
+            let file = match J3dFile::parse(&bytes) {
+                Ok(file) => file,
+                Err(error) => {
+                    record_model_preview_failure(
+                        &mut failed_model_assets,
+                        &mut model_failures,
+                        &asset_path,
+                        format!("parse J3D: {error}"),
+                    );
+                    continue;
+                }
             };
 
-            let loader_flags = model_loader_flags_for_path(&asset_path);
+            let loader_flags = map_static_model_loader_flags(document, &asset_path)
+                .unwrap_or_else(|| model_loader_flags_for_path(&asset_path));
             let level_targets = level_transform_targets(document, &asset_path, &file);
             let initial_overrides = level_transform_overrides(&level_targets, 0.0);
             let preview_result = if initial_overrides.is_empty() {
@@ -742,6 +972,9 @@ impl SmsEditorApp {
                     apply_pollution_bitmap_mask(document, &asset_path, &mut preview);
                     loaded_models += 1;
                     let model_index = loaded_models;
+                    if let Some(slot) = mirror_surface_model_slot(&document.stage_id, &asset_path) {
+                        mirror_model_slots.insert(model_index, slot);
+                    }
                     let texture_base = push_preview_textures(&mut textures, &preview);
                     let material_base =
                         push_preview_materials(&mut materials, &preview, texture_base);
@@ -846,10 +1079,20 @@ impl SmsEditorApp {
                         });
                     }
                 }
-                Err(_) => {
-                    let Ok(preview) = file.vertex_preview() else {
-                        failed_models += 1;
-                        continue;
+                Err(geometry_error) => {
+                    let preview = match file.vertex_preview() {
+                        Ok(preview) => preview,
+                        Err(vertex_error) => {
+                            record_model_preview_failure(
+                                &mut failed_model_assets,
+                                &mut model_failures,
+                                &asset_path,
+                                format!(
+                                    "decode geometry: {geometry_error}; fallback vertex preview: {vertex_error}"
+                                ),
+                            );
+                            continue;
+                        }
                     };
 
                     loaded_models += 1;
@@ -997,17 +1240,25 @@ impl SmsEditorApp {
             let Some(model_path) = model_path else {
                 continue;
             };
+            // TMapStaticObj::initUnique submits ReflectSky only to Sunshine's
+            // mirror-sky draw buffers. The editor mirrors the already-loaded
+            // main sky instead, so instantiating this helper as a world object
+            // produces a second, enormous sky dome at the stage origin.
+            if path_is_mirror_sky_helper_model_path(&model_path) {
+                continue;
+            }
             let loader_flags = catalog_preview
                 .map(|preview| preview.load_flags)
+                .or_else(|| document.object_preview_load_flags(object))
                 .or_else(|| actor_model_loader_flags(object))
                 .unwrap_or_else(|| model_loader_flags_for_path(&model_path));
             let object_render_layer = preview_render_layer_for_model_path(&model_path);
             let object_preview_transform = if object_render_layer == PreviewRenderLayer::Heatwave {
                 shimmer_preview_transform(object.transform)
             } else {
-                reset_fruit_preview_transform(object, object.transform)
+                reset_fruit_preview_transform(object, object.transform, document.registry.as_ref())
             };
-            let animation_profile = std::iter::once(object.factory_name.to_ascii_lowercase())
+            let animation_profile = std::iter::once(object.factory_name.clone())
                 .chain(
                     npc_accessory_specs(document, object)
                         .into_iter()
@@ -1019,13 +1270,32 @@ impl SmsEditorApp {
             let model_cache_key = (model_path.clone(), loader_flags, animation_profile);
 
             if !object_model_cache.contains_key(&model_cache_key) {
-                let Ok(bytes) = read_stage_asset_bytes(&model_path) else {
-                    failed_models += 1;
+                if failed_model_assets.contains(&normalized_preview_asset_path(&model_path)) {
                     continue;
+                }
+                let bytes = match read_stage_asset_bytes(&model_path) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        record_model_preview_failure(
+                            &mut failed_model_assets,
+                            &mut model_failures,
+                            &model_path,
+                            format!("read actor model: {error}"),
+                        );
+                        continue;
+                    }
                 };
-                let Ok(file) = J3dFile::parse(&bytes) else {
-                    failed_models += 1;
-                    continue;
+                let file = match J3dFile::parse(&bytes) {
+                    Ok(file) => file,
+                    Err(error) => {
+                        record_model_preview_failure(
+                            &mut failed_model_assets,
+                            &mut model_failures,
+                            &model_path,
+                            format!("parse actor J3D: {error}"),
+                        );
+                        continue;
+                    }
                 };
                 let joint_animation = starting_joint_animation(document, object, &model_path);
                 let prepared_triangles = joint_animation
@@ -1038,9 +1308,17 @@ impl SmsEditorApp {
                         file.geometry_preview_with_joint_animation(loader_flags, animation, 0.0)
                     },
                 );
-                let Ok(mut preview) = preview_result else {
-                    failed_models += 1;
-                    continue;
+                let mut preview = match preview_result {
+                    Ok(preview) => preview,
+                    Err(error) => {
+                        record_model_preview_failure(
+                            &mut failed_model_assets,
+                            &mut model_failures,
+                            &model_path,
+                            format!("decode actor geometry: {error}"),
+                        );
+                        continue;
+                    }
                 };
                 apply_model_material_table(document, &model_path, loader_flags, &mut preview);
                 apply_actor_runtime_textures(document, object, &mut preview);
@@ -1252,11 +1530,32 @@ impl SmsEditorApp {
                 let asset_path = asset.path.to_string_lossy().replace('\\', "/");
                 let accessory_cache_key = normalized_preview_asset_path(&asset_path);
                 if !accessory_model_cache.contains_key(&accessory_cache_key) {
-                    let Ok(bytes) = read_stage_asset_bytes(&asset.path) else {
+                    if failed_model_assets.contains(&accessory_cache_key) {
                         continue;
+                    }
+                    let bytes = match read_stage_asset_bytes(&asset.path) {
+                        Ok(bytes) => bytes,
+                        Err(error) => {
+                            record_model_preview_failure(
+                                &mut failed_model_assets,
+                                &mut model_failures,
+                                &asset_path,
+                                format!("read accessory model: {error}"),
+                            );
+                            continue;
+                        }
                     };
-                    let Ok(file) = J3dFile::parse(&bytes) else {
-                        continue;
+                    let file = match J3dFile::parse(&bytes) {
+                        Ok(file) => file,
+                        Err(error) => {
+                            record_model_preview_failure(
+                                &mut failed_model_assets,
+                                &mut model_failures,
+                                &asset_path,
+                                format!("parse accessory J3D: {error}"),
+                            );
+                            continue;
+                        }
                     };
                     let loader_flags = 0x1021_0000;
                     let joint_animation =
@@ -1275,8 +1574,17 @@ impl SmsEditorApp {
                             )
                         },
                     );
-                    let Ok(mut preview) = preview_result else {
-                        continue;
+                    let mut preview = match preview_result {
+                        Ok(preview) => preview,
+                        Err(error) => {
+                            record_model_preview_failure(
+                                &mut failed_model_assets,
+                                &mut model_failures,
+                                &asset_path,
+                                format!("decode accessory geometry: {error}"),
+                            );
+                            continue;
+                        }
                     };
                     // Parts are ordinary J3D models. Give them the same BMT
                     // resolution as bodies and map objects so dummy textures
@@ -1341,7 +1649,7 @@ impl SmsEditorApp {
                     triangle_range: accessory_triangle_start..triangles.len(),
                 });
             }
-            if object.factory_name.to_ascii_lowercase().starts_with("npc") {
+            if object.factory_name.starts_with("NPC") {
                 push_npc_circle_shadow(
                     &mut triangles,
                     object.transform,
@@ -1440,7 +1748,16 @@ impl SmsEditorApp {
         material_animation_bindings.resize_with(materials.len(), Vec::new);
 
         if loaded_models == 0 || (points.is_empty() && triangles.is_empty()) {
-            return None;
+            if failed_model_assets.is_empty() {
+                return None;
+            }
+            // Keep a failure-only preview so validation can report the exact
+            // assets that failed instead of collapsing the entire result to
+            // `None` and losing every diagnostic.
+            bounds_min = [0.0; 3];
+            bounds_max = [1.0; 3];
+            camera_bounds_min = bounds_min;
+            camera_bounds_max = bounds_max;
         }
 
         if !bounds_are_finite(bounds_min, bounds_max) {
@@ -1472,11 +1789,14 @@ impl SmsEditorApp {
             camera_bounds_min,
             camera_bounds_max,
             loaded_models,
-            failed_models,
+            failed_models: failed_model_assets.len(),
+            model_failures,
             source_vertices,
             source_triangles,
             source_textures,
             object_model_indices,
+            mirror_cubes,
+            mirror_model_slots,
             animated_models,
             animated_flags,
             rotating_models,
@@ -1998,9 +2318,8 @@ fn object_matches_focus(object: &SceneObject, needle: &str) -> bool {
 
 fn object_display_name(object: &SceneObject) -> String {
     object
-        .raw_params
-        .get("name")
-        .cloned()
+        .raw_param("name")
+        .map(str::to_owned)
         .unwrap_or_else(|| object.factory_name.clone())
 }
 
@@ -2304,6 +2623,9 @@ fn is_default_preview_model_path(
     if !(path.contains("!/map/") || path.contains("/scene/map/")) {
         return false;
     }
+    if path_is_mirror_sky_helper_model_path(&path) {
+        return false;
+    }
     if path_is_sky_model_path(&path) {
         return true;
     }
@@ -2349,6 +2671,8 @@ fn preview_render_layer_for_model_path(path: &str) -> PreviewRenderLayer {
     let path = path.to_ascii_lowercase();
     if path_is_shimmer_model_path(&path) {
         PreviewRenderLayer::Heatwave
+    } else if path_is_mirror_sky_helper_model_path(&path) {
+        PreviewRenderLayer::MirrorScene
     } else if path_is_sea_indirect_model_path(&path) {
         PreviewRenderLayer::IndirectWater
     } else if path_is_water_reflection_model_path(&path) {
@@ -2394,36 +2718,43 @@ fn shimmer_preview_transform(transform: Transform) -> Transform {
     }
 }
 
-fn reset_fruit_preview_transform(object: &SceneObject, mut transform: Transform) -> Transform {
-    if !object.factory_name.eq_ignore_ascii_case("ResetFruit") {
+fn reset_fruit_preview_transform(
+    object: &SceneObject,
+    mut transform: Transform,
+    registry: Option<&ObjectRegistry>,
+) -> Transform {
+    if object.factory_name != "ResetFruit" {
         return transform;
     }
 
-    let Some(resource_name) = object.raw_params.get("stream_string_0") else {
+    let Some(resource_name) = object
+        .raw_param("actor_tail_string")
+        .or_else(|| object.raw_param("stream_string_0"))
+    else {
         return transform;
     };
-    let resource_name = resource_name.to_ascii_lowercase();
-    let base_radius = match resource_name.as_str() {
-        "fruitcoconut" | "fruitpapaya" => 40.0,
-        "fruitdurian" => 45.0,
-        "fruitbanana" | "fruitpine" => 50.0,
-        // redpepper.bmd is already authored bottom-origin in the geometry
-        // preview (like fruitbanana.bmd), so an additional lift makes it float.
-        "redpepper" => 0.0,
-        _ => return transform,
+    let Some(definition) = registry.and_then(|registry| {
+        registry
+            .find_map_obj_resource(resource_name)
+            .and_then(|resource| registry.find_map_obj_ball_transform(resource.actor_type))
+    }) else {
+        return transform;
     };
 
     // TMapObjBall::initMapObj sets the fruit-specific body radius, then
     // TResetFruit::makeObjAppeared places the model at position.y + radius.
     // Banana and pineapple apply the additional matrix corrections below.
+    let [rotation_x, rotation_y, rotation_z] = transform.rotation_degrees.map(f32::to_radians);
     let matrix_y_axis_y = transform.scale[1]
-        * transform.rotation_degrees[0].to_radians().cos()
-        * transform.rotation_degrees[2].to_radians().cos();
-    let mut y_offset = base_radius * transform.scale[1];
-    if resource_name == "fruitbanana" && matrix_y_axis_y > 0.0 {
-        y_offset -= 50.0 * matrix_y_axis_y;
-    } else if resource_name == "fruitpine" {
-        y_offset -= 10.0 * (1.0 - matrix_y_axis_y);
+        * (rotation_x.sin() * rotation_y.sin() * rotation_z.sin()
+            + rotation_z.cos() * rotation_x.cos());
+    let mut y_offset = f32::from(definition.body_radius) * transform.scale[1];
+    if let Some(correction) = definition.positive_y_axis_subtract {
+        if matrix_y_axis_y > 0.0 {
+            y_offset -= f32::from(correction) * matrix_y_axis_y;
+        }
+    } else if let Some(correction) = definition.one_minus_y_axis_subtract {
+        y_offset -= f32::from(correction) * (1.0 - matrix_y_axis_y);
     }
     transform.translation[1] += y_offset;
     transform
@@ -2461,6 +2792,13 @@ fn path_is_water_reflection_model_path(path: &str) -> bool {
         .is_some_and(|name| matches!(name, "reflectparts.bmd" | "reflectparts.bdl"))
 }
 
+fn path_is_mirror_sky_helper_model_path(path: &str) -> bool {
+    let path = path.replace('\\', "/").to_ascii_lowercase();
+    path.rsplit('/')
+        .next()
+        .is_some_and(|name| matches!(name, "reflectsky.bmd" | "reflectsky.bdl"))
+}
+
 fn path_is_mirror_surface_model_path(path: &str) -> bool {
     let path = path.replace('\\', "/").to_ascii_lowercase();
     if !path.contains("/map/mirror/") {
@@ -2473,10 +2811,10 @@ fn path_is_mirror_surface_model_path(path: &str) -> bool {
     })
 }
 
-fn active_mirror_model_slots(document: &StageDocument) -> BTreeSet<usize> {
+fn mirror_cubes(document: &StageDocument) -> Vec<PreviewMirrorCube> {
     const MIRROR_CUBE_TABLE_NAME: &str = "鏡キューブテーブル";
 
-    let mut slots = BTreeSet::new();
+    let mut cubes = Vec::new();
     for asset in document.assets.iter().filter(|asset| {
         asset.kind == StageAssetKind::Placement
             && asset
@@ -2506,15 +2844,42 @@ fn active_mirror_model_slots(document: &StageDocument) -> BTreeSet<usize> {
                     record.offset > table.start && record.offset + record.size <= table.end
                 })
         }) {
-            if let Some(slot) = cube
-                .cube_general_info
-                .and_then(|cube| usize::try_from(cube.data_no).ok())
+            let Some(info) = cube.cube_general_info else {
+                continue;
+            };
+            let Ok(model_slot) = usize::try_from(info.data_no) else {
+                continue;
+            };
+            let preview_cube = PreviewMirrorCube {
+                center: info.center,
+                rotation_degrees: info.rotation_degrees,
+                dimensions: info.dimensions,
+                model_slot,
+            };
+            if preview_cube
+                .center
+                .iter()
+                .chain(preview_cube.rotation_degrees.iter())
+                .chain(preview_cube.dimensions.iter())
+                .all(|value| value.is_finite())
+                && preview_cube
+                    .dimensions
+                    .iter()
+                    .all(|dimension| *dimension > 0.0)
             {
-                slots.insert(slot);
+                cubes.push(preview_cube);
             }
         }
     }
-    slots
+    cubes
+}
+
+#[cfg(test)]
+fn active_mirror_model_slots(document: &StageDocument) -> BTreeSet<usize> {
+    mirror_cubes(document)
+        .into_iter()
+        .map(|cube| cube.model_slot)
+        .collect()
 }
 
 fn mirror_surface_model_is_active(
@@ -2568,7 +2933,7 @@ fn map_static_model_is_active(document: &StageDocument, model_path: &str) -> boo
     let matching_definitions = registry
         .map_static_models
         .iter()
-        .filter(|definition| runtime_model_path_matches_asset(&definition.model_path, &model_path))
+        .filter(|definition| map_static_definition_matches_asset(definition, &model_path))
         .collect::<Vec<_>>();
     if matching_definitions.is_empty() {
         return true;
@@ -2580,15 +2945,46 @@ fn map_static_model_is_active(document: &StageDocument, model_path: &str) -> boo
         return true;
     }
 
-    matching_definitions.iter().any(|definition| {
-        document.objects.iter().any(|object| {
-            object.factory_name.eq_ignore_ascii_case("MapStaticObj")
+    matching_definitions
+        .iter()
+        .any(|definition| map_static_definition_is_active(document, definition))
+}
+
+fn map_static_model_loader_flags(document: &StageDocument, model_path: &str) -> Option<u32> {
+    let registry = document.registry.as_ref()?;
+    let model_path = normalized_preview_asset_path(model_path);
+    let flags = registry
+        .map_static_models
+        .iter()
+        .filter(|definition| map_static_definition_matches_asset(definition, &model_path))
+        .filter(|definition| map_static_definition_is_active(document, definition))
+        .map(|definition| definition.load_flags)
+        .collect::<BTreeSet<_>>();
+    (flags.len() == 1).then(|| *flags.first().expect("one map-static loader flag"))
+}
+
+fn map_static_definition_matches_asset(
+    definition: &sms_schema::MapStaticModelDefinition,
+    model_path: &str,
+) -> bool {
+    definition
+        .model_path
+        .as_deref()
+        .is_some_and(|runtime_path| runtime_model_path_matches_asset(runtime_path, model_path))
+}
+
+fn map_static_definition_is_active(
+    document: &StageDocument,
+    definition: &sms_schema::MapStaticModelDefinition,
+) -> bool {
+    definition.stage_bootstrap_created
+        || document.objects.iter().any(|object| {
+            object.factory_name == "MapStaticObj"
                 && object
-                    .raw_params
-                    .get("stream_string_0")
-                    .is_some_and(|name| name.eq_ignore_ascii_case(&definition.actor_name))
+                    .raw_param("actor_tail_string")
+                    .or_else(|| object.raw_param("stream_string_0"))
+                    .is_some_and(|name| name == definition.actor_name)
         })
-    })
 }
 
 fn runtime_model_path_matches_asset(runtime_path: &str, asset_path: &str) -> bool {
@@ -2681,15 +3077,14 @@ fn model_loader_flags_for_path(path: &str) -> u32 {
 }
 
 fn actor_model_loader_flags(object: &SceneObject) -> Option<u32> {
-    let factory = object.factory_name.to_ascii_lowercase();
-    Some(match factory.as_str() {
-        "npcmontem" | "npcmontema" | "npcmontemc" | "npcmontew" | "npcmontewa" => 0x1030_0000,
-        "npcmontemb" | "npcmontemd" | "npcmontemf" | "npcmontemg" | "npcmontemh" | "npcmontewb"
-        | "npcmontewc" => 0x1021_0000,
-        "npcmonteme" => 0x1001_0000,
+    Some(match object.factory_name.as_str() {
+        "NPCMonteM" | "NPCMonteMA" | "NPCMonteMC" | "NPCMonteW" | "NPCMonteWA" => 0x1030_0000,
+        "NPCMonteMB" | "NPCMonteMD" | "NPCMonteMF" | "NPCMonteMG" | "NPCMonteMH" | "NPCMonteWB"
+        | "NPCMonteWC" => 0x1021_0000,
+        "NPCMonteME" => 0x1001_0000,
         // TMareMBaseManager/TMareWBaseManager::createModelData use these flags
         // for the shared Mare body models and their material programs.
-        name if name.starts_with("npcmarem") || name.starts_with("npcmarew") => 0x1030_0000,
+        name if name.starts_with("NPCMareM") || name.starts_with("NPCMareW") => 0x1030_0000,
         _ => return None,
     })
 }
@@ -2906,12 +3301,8 @@ fn vector_drag(ui: &mut egui::Ui, values: &mut [f32; 3], speed: f32) -> VectorDr
 }
 
 fn runtime_yaw_degrees_per_frame(object: &SceneObject) -> f32 {
-    let factory = object.factory_name.to_ascii_lowercase();
-    let class = object
-        .class_name
-        .as_deref()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
+    let factory = object.factory_name.as_str();
+    let class = object.class_name.as_deref().unwrap_or_default();
 
     // TItemManager::perform advances its shared item matrix by two degrees
     // every retail frame. TItem::calc copies that matrix into coins, including
@@ -2919,7 +3310,7 @@ fn runtime_yaw_degrees_per_frame(object: &SceneObject) -> f32 {
     let is_coin = is_coin_object(object);
     // TShine::control advances the normal live state by unk16C, whose
     // constructor default is also two degrees per retail frame.
-    if is_coin || factory == "shine" || class == "tshine" {
+    if is_coin || factory == "Shine" || class == "TShine" {
         2.0
     } else {
         0.0
@@ -2927,28 +3318,24 @@ fn runtime_yaw_degrees_per_frame(object: &SceneObject) -> f32 {
 }
 
 fn is_coin_object(object: &SceneObject) -> bool {
-    let factory = object.factory_name.to_ascii_lowercase();
-    let class = object
-        .class_name
-        .as_deref()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
+    let factory = object.factory_name.as_str();
+    let class = object.class_name.as_deref().unwrap_or_default();
     let resource = object
-        .raw_params
-        .get("stream_string_0")
-        .map(|value| value.to_ascii_lowercase());
+        .raw_param("actor_tail_string")
+        .or_else(|| object.raw_param("stream_string_0"))
+        .map(str::to_ascii_lowercase);
     if resource.as_deref() == Some("invisible_coin") {
         return false;
     }
 
     matches!(
-        factory.as_str(),
-        "coin" | "coinred" | "coinblue" | "coin_red" | "coin_blue" | "flowercoin" | "joint_coin"
-    ) || class.starts_with("tcoin")
-        || class == "coin"
-        || class == "coinred"
-        || class == "coinblue"
-        || class == "tflowercoin"
+        factory,
+        "coin" | "CoinRed" | "CoinBlue" | "coin_red" | "coin_blue" | "FlowerCoin" | "joint_coin"
+    ) || class.starts_with("TCoin")
+        || class == "Coin"
+        || class == "CoinRed"
+        || class == "CoinBlue"
+        || class == "TFlowerCoin"
         || matches!(
             resource.as_deref(),
             Some("coin" | "coin_red" | "coin_blue" | "joint_coin")

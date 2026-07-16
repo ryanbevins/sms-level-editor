@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::binary::{
-    be_f32, be_i16, be_u16, be_u32, checked_slice, read_jut_name_table, require_magic,
+    be_f32, be_i16, be_u16, be_u32, checked_slice, read_jut_name_table, require_len, require_magic,
 };
 use crate::j3d_anim::J3dJointAnimation;
 use crate::{FormatError, PreserveBytes, Result};
@@ -29,6 +29,8 @@ mod arc_bytes {
 mod texture;
 use texture::*;
 const FORMAT: &str = "J3D";
+const MAX_TEX1_TEXTURE_COUNT: usize = 4096;
+const MAX_TEX1_RETAINED_BYTES: usize = 512 * 1024 * 1024;
 pub const SMS_MAP_MODEL_LOAD_FLAGS: u32 = 0x1002_0000;
 pub const SMS_POLLUTION_MODEL_LOAD_FLAGS: u32 = 0x1122_0000;
 pub const SMS_DEFAULT_OBJECT_MODEL_LOAD_FLAGS: u32 = 0x1022_0000;
@@ -67,6 +69,8 @@ const GX_DRAW_QUADS: u8 = 0x80;
 const GX_DRAW_TRIANGLES: u8 = 0x90;
 const GX_DRAW_TRIANGLE_STRIP: u8 = 0x98;
 const GX_DRAW_TRIANGLE_FAN: u8 = 0xA0;
+const GX_OPCODE_MASK: u8 = 0xF8;
+const GX_VAT_MASK: u8 = 0x07;
 const GX_TF_I4: u8 = 0x0;
 const GX_TF_I8: u8 = 0x1;
 const GX_TF_IA4: u8 = 0x2;
@@ -130,12 +134,95 @@ pub struct J3dSection {
     pub size: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct J3dFile {
+    header: J3dHeader,
+    sections: Vec<J3dSection>,
+    bytes: J3dSource,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct J3dSource {
+    source: Arc<[u8]>,
+    parsed_len: usize,
+}
+
+impl J3dSource {
+    fn new(source: Arc<[u8]>, parsed_len: usize) -> Self {
+        debug_assert!(parsed_len <= source.len());
+        Self { source, parsed_len }
+    }
+
+    #[cfg(test)]
+    fn full(source: Arc<[u8]>) -> Self {
+        let parsed_len = source.len();
+        Self { source, parsed_len }
+    }
+
+    fn source_bytes(&self) -> &[u8] {
+        &self.source
+    }
+}
+
+impl std::fmt::Debug for J3dSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("J3dSource")
+            .field("source_len", &self.source.len())
+            .field("parsed_len", &self.parsed_len)
+            .finish()
+    }
+}
+
+impl std::ops::Deref for J3dSource {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.source[..self.parsed_len]
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct J3dFileSerde {
     header: J3dHeader,
     sections: Vec<J3dSection>,
     #[serde(with = "arc_bytes")]
     bytes: Arc<[u8]>,
+}
+
+impl Serialize for J3dFile {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        J3dFileSerde {
+            header: self.header.clone(),
+            sections: self.sections.clone(),
+            bytes: Arc::clone(&self.bytes.source),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for J3dFile {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let decoded = J3dFileSerde::deserialize(deserializer)?;
+        let parsed_len = decoded.header.file_size as usize;
+        if parsed_len > decoded.bytes.len() {
+            return Err(serde::de::Error::custom(format!(
+                "J3D declared size {parsed_len} exceeds serialized source length {}",
+                decoded.bytes.len()
+            )));
+        }
+        Ok(Self {
+            header: decoded.header,
+            sections: decoded.sections,
+            bytes: J3dSource::new(decoded.bytes, parsed_len),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -700,7 +787,7 @@ impl J3dPreparedAnimatedTriangles {
 }
 
 #[derive(Clone)]
-struct PreparedModelSource(Arc<[u8]>);
+struct PreparedModelSource(J3dSource);
 
 impl std::fmt::Debug for PreparedModelSource {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -758,6 +845,7 @@ impl PreparedPrimitiveVertex {
 impl J3dFile {
     pub fn parse(bytes: impl AsRef<[u8]>) -> Result<Self> {
         let bytes = bytes.as_ref();
+        require_len(FORMAT, bytes, 0x20)?;
         require_magic(FORMAT, bytes, b"J3D2")?;
 
         let file_type = String::from_utf8_lossy(checked_slice(FORMAT, bytes, 0x04, 4)?)
@@ -765,11 +853,20 @@ impl J3dFile {
             .to_string();
         let file_size = be_u32(bytes, 0x08, FORMAT)?;
         let section_count = be_u32(bytes, 0x0C, FORMAT)?;
+        let declared_size = file_size as usize;
+        if declared_size < 0x20 || declared_size > bytes.len() {
+            return Err(FormatError::InvalidOffset {
+                format: FORMAT,
+                offset: declared_size,
+                len: bytes.len(),
+            });
+        }
+        let file = &bytes[..declared_size];
 
         let mut sections = Vec::<J3dSection>::new();
         let mut offset = 0x20usize;
         for section_index in 0..section_count {
-            if offset + 8 > bytes.len() {
+            if offset.checked_add(8).is_none_or(|end| end > file.len()) {
                 // Retail texture-only BMTs such as Mamma's sandbombbase.bmt
                 // declare a second block even though their sole TEX1 block
                 // ends exactly at the declared file size. J3D's material-table
@@ -777,8 +874,7 @@ impl J3dFile {
                 // narrow as possible so truncated BMD/BDL files remain errors.
                 let retail_texture_only_bmt = file_type.starts_with("bmt")
                     && section_index + 1 == section_count
-                    && offset == bytes.len()
-                    && file_size as usize == bytes.len()
+                    && offset == file.len()
                     && sections.len() == 1
                     && sections[0].tag == "TEX1";
                 if retail_texture_only_bmt {
@@ -787,14 +883,14 @@ impl J3dFile {
                 return Err(FormatError::InvalidOffset {
                     format: FORMAT,
                     offset,
-                    len: bytes.len(),
+                    len: file.len(),
                 });
             }
 
-            let tag = String::from_utf8_lossy(checked_slice(FORMAT, bytes, offset, 4)?)
+            let tag = String::from_utf8_lossy(checked_slice(FORMAT, file, offset, 4)?)
                 .trim_end_matches('\0')
                 .to_string();
-            let size = be_u32(bytes, offset + 4, FORMAT)?;
+            let size = be_u32(file, offset + 4, FORMAT)?;
             if size < 8 {
                 return Err(FormatError::Unsupported {
                     format: FORMAT,
@@ -802,13 +898,15 @@ impl J3dFile {
                 });
             }
 
-            checked_slice(FORMAT, bytes, offset, size as usize)?;
+            checked_slice(FORMAT, file, offset, size as usize)?;
             sections.push(J3dSection {
                 tag,
                 offset: offset as u32,
                 size,
             });
-            offset += size as usize;
+            offset = offset
+                .checked_add(size as usize)
+                .ok_or_else(|| invalid_offset(offset, file.len()))?;
         }
 
         Ok(Self {
@@ -818,7 +916,7 @@ impl J3dFile {
                 section_count,
             },
             sections,
-            bytes: Arc::from(bytes),
+            bytes: J3dSource::new(Arc::from(bytes), declared_size),
         })
     }
 
@@ -968,7 +1066,7 @@ impl J3dFile {
             .max()
             .unwrap_or(0);
         Ok(J3dPreparedAnimatedTriangles {
-            source: PreparedModelSource(Arc::clone(&self.bytes)),
+            source: PreparedModelSource(self.bytes.clone()),
             packets,
             source_triangle_count,
             max_packet_vertex_count,
@@ -999,7 +1097,8 @@ impl J3dFile {
     }
 
     fn prepared_animation_source_matches(&self, prepared: &J3dPreparedAnimatedTriangles) -> bool {
-        Arc::ptr_eq(&prepared.source.0, &self.bytes)
+        prepared.source.0.parsed_len == self.bytes.parsed_len
+            && Arc::ptr_eq(&prepared.source.0.source, &self.bytes.source)
     }
 
     fn triangles_with_draw_matrices(
@@ -1175,12 +1274,10 @@ impl J3dFile {
                 format: FORMAT,
                 message: "missing SHP1 section".to_string(),
             })?;
-        let shape_materials = self.shape_material_indices().unwrap_or_default();
-        let textures = self.texture_previews().unwrap_or_default();
-        let material_colors = self.material_preview_colors().unwrap_or_default();
-        let materials = self
-            .material_programs_with_loader_flags(loader_flags)
-            .unwrap_or_default();
+        let shape_materials = self.shape_material_indices()?;
+        let textures = self.texture_previews()?;
+        let material_colors = self.material_preview_colors()?;
+        let materials = self.material_programs_with_loader_flags(loader_flags)?;
         let material_render_states = materials
             .iter()
             .map(|material| J3dMaterialRenderState {
@@ -1191,12 +1288,8 @@ impl J3dFile {
                 z_comp_loc: Some(material.z_comp_loc),
             })
             .collect::<Vec<_>>();
-        let material_textures = self
-            .material_texture_bindings(&textures, &material_colors)
-            .unwrap_or_default();
-        let draw_matrices = self
-            .preview_draw_matrices(loader_flags, animation, overrides)
-            .unwrap_or_default();
+        let material_textures = self.material_texture_bindings(&textures, &material_colors)?;
+        let draw_matrices = self.preview_draw_matrices(loader_flags, animation, overrides)?;
         let triangles = self.read_shape_triangles(
             shp1.offset as usize,
             &vertex_preview.positions,
@@ -1560,9 +1653,7 @@ impl J3dFile {
         &self,
         joint_matrices: &[Mtx34],
     ) -> Result<Vec<Option<Mtx34>>> {
-        let envelope_matrices = self
-            .preview_envelope_matrices(joint_matrices)
-            .unwrap_or_default();
+        let envelope_matrices = self.preview_envelope_matrices(joint_matrices)?;
         let Some(drw1) = self.section("DRW1") else {
             return Ok(joint_matrices.iter().copied().map(Some).collect());
         };
@@ -2168,47 +2259,60 @@ impl J3dFile {
     }
 
     pub fn texture_previews(&self) -> Result<Vec<J3dTexturePreview>> {
+        self.texture_previews_with_limits(MAX_TEX1_TEXTURE_COUNT, MAX_TEX1_RETAINED_BYTES)
+    }
+
+    fn texture_previews_with_limits(
+        &self,
+        max_texture_count: usize,
+        max_retained_bytes: usize,
+    ) -> Result<Vec<J3dTexturePreview>> {
         let Some(tex1) = self.section("TEX1") else {
             return Ok(Vec::new());
         };
         let base = tex1.offset as usize;
         let texture_count = be_u16(&self.bytes, base + 0x08, FORMAT)? as usize;
+        if texture_count > max_texture_count {
+            return Err(FormatError::ResourceLimit {
+                format: FORMAT,
+                resource: "TEX1 texture count",
+                requested: texture_count,
+                limit: max_texture_count,
+            });
+        }
         let texture_offset = relative_offset(&self.bytes, base, 0x0C)?;
         let texture_names = optional_relative_offset(&self.bytes, base, 0x10)
-            .and_then(|offset| read_jut_name_table(&self.bytes, offset, self.bytes.len()).ok())
+            .map(|offset| read_jut_name_table(&self.bytes, offset, self.bytes.len()))
+            .transpose()?
             .unwrap_or_default();
         let mut textures = Vec::with_capacity(texture_count);
+        let mut retained_bytes = 0usize;
 
         for index in 0..texture_count {
             let header_offset = texture_offset + index * 0x20;
             checked_slice(FORMAT, &self.bytes, header_offset, 0x20)?;
-            let mut texture =
-                decode_timg(&self.bytes, header_offset).unwrap_or(J3dTexturePreview {
-                    name: String::new(),
-                    width: 1,
-                    height: 1,
-                    format: 0xFF,
-                    wrap_s: 0,
-                    wrap_t: 0,
-                    min_filter: 1,
-                    mag_filter: 1,
-                    mipmap_enabled: false,
-                    do_edge_lod: false,
-                    bias_clamp: false,
-                    max_anisotropy: 0,
-                    min_lod: 0.0,
-                    max_lod: 0.0,
-                    lod_bias: 0.0,
-                    mipmap_count: 1,
-                    rgba: vec![255, 255, 255, 255],
-                    mips: vec![J3dTextureMipPreview {
-                        width: 1,
-                        height: 1,
-                        rgba: vec![255, 255, 255, 255],
-                    }],
+            let texture_bytes = decoded_timg_retained_bytes(&self.bytes, header_offset)?;
+            let requested =
+                retained_bytes
+                    .checked_add(texture_bytes)
+                    .ok_or(FormatError::ResourceLimit {
+                        format: FORMAT,
+                        resource: "TEX1 retained decoded texture bytes",
+                        requested: usize::MAX,
+                        limit: max_retained_bytes,
+                    })?;
+            if requested > max_retained_bytes {
+                return Err(FormatError::ResourceLimit {
+                    format: FORMAT,
+                    resource: "TEX1 retained decoded texture bytes",
+                    requested,
+                    limit: max_retained_bytes,
                 });
+            }
+            let mut texture = decode_timg(&self.bytes, header_offset)?;
             texture.name = texture_names.get(index).cloned().unwrap_or_default();
             textures.push(texture);
+            retained_bytes = requested;
         }
 
         Ok(textures)
@@ -2405,12 +2509,12 @@ impl J3dFile {
         let Some(mat3) = self.section("MAT3") else {
             return Ok(Vec::new());
         };
-        let textures = self.texture_previews().unwrap_or_default();
-        let material_colors = self.material_preview_colors().unwrap_or_default();
-        let material_render_states = self.material_render_states().unwrap_or_default();
+        let textures = self.texture_previews()?;
+        let material_colors = self.material_preview_colors()?;
+        let material_render_states = self.material_render_states()?;
         let base = mat3.offset as usize;
         let material_count = be_u16(&self.bytes, base + 0x08, FORMAT)? as usize;
-        let material_programs = self.material_programs().unwrap_or_default();
+        let material_programs = self.material_programs()?;
         let init_offset = relative_offset(&self.bytes, base, 0x0C)?;
         let material_id_offset = relative_offset(&self.bytes, base, 0x10)?;
         let tex_no_offset = relative_offset(&self.bytes, base, 0x48).ok();
@@ -3874,7 +3978,7 @@ fn material_tev_stage_info(
 
 impl PreserveBytes for J3dFile {
     fn source_bytes(&self) -> &[u8] {
-        &self.bytes
+        self.bytes.source_bytes()
     }
 }
 
@@ -4393,6 +4497,7 @@ fn decode_display_list(
         if command == 0 {
             break;
         }
+        let opcode = gx_primitive_opcode(command)?;
         if offset + 2 > bytes.len() {
             return Err(FormatError::InvalidOffset {
                 format: FORMAT,
@@ -4419,7 +4524,7 @@ fn decode_display_list(
             )?);
         }
 
-        match command {
+        match opcode {
             GX_DRAW_TRIANGLES => {
                 for chunk in primitive.chunks_exact(3) {
                     push_triangle(
@@ -4521,6 +4626,7 @@ fn decode_prepared_display_list(
         if command == 0 {
             break;
         }
+        let opcode = gx_primitive_opcode(command)?;
         if offset + 2 > bytes.len() {
             return Err(FormatError::InvalidOffset {
                 format: FORMAT,
@@ -4547,7 +4653,7 @@ fn decode_prepared_display_list(
         }
 
         let base = vertices.len();
-        match command {
+        match opcode {
             GX_DRAW_TRIANGLES => {
                 for start in (0..primitive.len()).step_by(3) {
                     if start + 2 < primitive.len() {
@@ -4586,6 +4692,29 @@ fn decode_prepared_display_list(
         vertices,
         triangle_indices,
     })
+}
+
+fn gx_primitive_opcode(command: u8) -> Result<u8> {
+    let vat = command & GX_VAT_MASK;
+    if vat != 0 {
+        return Err(FormatError::Unsupported {
+            format: FORMAT,
+            message: format!("GX primitive command 0x{command:02X} uses unsupported VAT {vat}"),
+        });
+    }
+
+    let opcode = command & GX_OPCODE_MASK;
+    if matches!(
+        opcode,
+        GX_DRAW_QUADS | GX_DRAW_TRIANGLES | GX_DRAW_TRIANGLE_STRIP | GX_DRAW_TRIANGLE_FAN
+    ) {
+        Ok(opcode)
+    } else {
+        Err(FormatError::Unsupported {
+            format: FORMAT,
+            message: format!("unsupported GX primitive opcode 0x{opcode:02X}"),
+        })
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4682,16 +4811,23 @@ fn read_prepared_primitive_vertex(
                 } else if desc.attr == GX_VA_POS {
                     position = positions.get(index).copied();
                 } else if desc.attr == GX_VA_NRM {
-                    normal = read_indexed_normal(source_bytes, index, vertex_arrays).ok();
+                    normal = Some(read_indexed_normal(source_bytes, index, vertex_arrays)?);
                 } else if desc.attr == GX_VA_CLR0 || desc.attr == GX_VA_CLR1 {
                     let color_index = (desc.attr - GX_VA_CLR0) as usize;
-                    colors[color_index] =
-                        read_indexed_vertex_color(source_bytes, index, vertex_arrays, color_index)
-                            .ok();
+                    colors[color_index] = Some(read_indexed_vertex_color(
+                        source_bytes,
+                        index,
+                        vertex_arrays,
+                        color_index,
+                    )?);
                 } else if (GX_VA_TEX0..=GX_VA_TEX7).contains(&desc.attr) {
                     let tex_index = (desc.attr - GX_VA_TEX0) as usize;
-                    tex_coords[tex_index] =
-                        read_indexed_tex_coord(source_bytes, index, vertex_arrays, tex_index).ok();
+                    tex_coords[tex_index] = Some(read_indexed_tex_coord(
+                        source_bytes,
+                        index,
+                        vertex_arrays,
+                        tex_index,
+                    )?);
                 }
             }
             GX_INDEX16 => {
@@ -4703,16 +4839,23 @@ fn read_prepared_primitive_vertex(
                 } else if desc.attr == GX_VA_POS {
                     position = positions.get(index).copied();
                 } else if desc.attr == GX_VA_NRM {
-                    normal = read_indexed_normal(source_bytes, index, vertex_arrays).ok();
+                    normal = Some(read_indexed_normal(source_bytes, index, vertex_arrays)?);
                 } else if desc.attr == GX_VA_CLR0 || desc.attr == GX_VA_CLR1 {
                     let color_index = (desc.attr - GX_VA_CLR0) as usize;
-                    colors[color_index] =
-                        read_indexed_vertex_color(source_bytes, index, vertex_arrays, color_index)
-                            .ok();
+                    colors[color_index] = Some(read_indexed_vertex_color(
+                        source_bytes,
+                        index,
+                        vertex_arrays,
+                        color_index,
+                    )?);
                 } else if (GX_VA_TEX0..=GX_VA_TEX7).contains(&desc.attr) {
                     let tex_index = (desc.attr - GX_VA_TEX0) as usize;
-                    tex_coords[tex_index] =
-                        read_indexed_tex_coord(source_bytes, index, vertex_arrays, tex_index).ok();
+                    tex_coords[tex_index] = Some(read_indexed_tex_coord(
+                        source_bytes,
+                        index,
+                        vertex_arrays,
+                        tex_index,
+                    )?);
                 }
             }
             _ => {}

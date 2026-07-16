@@ -20,10 +20,10 @@ fn material_uniform_is_uniform_buffer_aligned() {
 
 #[test]
 fn j3d_shader_parses_and_validates() {
-    let module = naga::front::wgsl::parse_str(J3D_SHADER).expect("J3D WGSL parses");
-    naga::valid::Validator::new(
-        naga::valid::ValidationFlags::all(),
-        naga::valid::Capabilities::all(),
+    let module = wgpu::naga::front::wgsl::parse_str(J3D_SHADER).expect("J3D WGSL parses");
+    wgpu::naga::valid::Validator::new(
+        wgpu::naga::valid::ValidationFlags::all(),
+        wgpu::naga::valid::Capabilities::empty(),
     )
     .validate(&module)
     .expect("J3D WGSL validates");
@@ -403,11 +403,12 @@ fn geometry_updates_limit_uploads_to_the_dirty_vertex_span() {
 fn geometry_updates_refresh_the_mirror_plane_height() {
     let mut preview = geometry_update_preview();
     preview.triangles[0].render_layer = PreviewRenderLayer::MirrorSurface;
+    preview.mirror_model_slots.insert(1, 0);
     for vertex in &mut preview.triangles[0].vertices {
         vertex[1] = 12.0;
     }
     let mut scene = GpuSceneData::from_preview(&preview);
-    assert_eq!(scene.mirror_plane_y, Some(12.0));
+    assert_eq!(scene.mirror_plane_y_by_slot.get(&0), Some(&12.0));
 
     for vertex in &mut preview.triangles[0].vertices {
         vertex[1] = 48.0;
@@ -420,26 +421,174 @@ fn geometry_updates_refresh_the_mirror_plane_height() {
         &mut dirty_vertex_ranges,
     );
 
-    assert_eq!(scene.mirror_plane_y, Some(48.0));
+    assert_eq!(scene.mirror_plane_y_by_slot.get(&0), Some(&48.0));
 }
 
 #[test]
-fn gpu_batches_store_direct_nonindexed_triangle_lists() {
+fn viewport_targets_are_requested_only_for_present_effect_passes() {
     let preview = geometry_update_preview();
-    let scene = GpuSceneData::from_preview(&preview);
-
     assert_eq!(
-        scene
-            .batches
-            .iter()
-            .map(|batch| batch.vertices.len())
-            .sum::<usize>(),
-        preview.triangles.len() * 3
+        GpuSceneData::from_preview(&preview).target_features(),
+        ViewportTargetFeatures::default()
     );
-    assert!(scene
-        .batches
+
+    let mut preview = geometry_update_preview();
+    preview.triangles[0].render_layer = PreviewRenderLayer::Heatwave;
+    assert!(
+        GpuSceneData::from_preview(&preview)
+            .target_features()
+            .screen_copy
+    );
+
+    preview.triangles[0].render_layer = PreviewRenderLayer::MirrorSurface;
+    assert!(
+        GpuSceneData::from_preview(&preview)
+            .target_features()
+            .mirror
+    );
+
+    preview.triangles[0].render_layer = PreviewRenderLayer::WaveFoam;
+    let wave_without_water = GpuSceneData::from_preview(&preview).target_features();
+    assert!(!wave_without_water.wave_mask);
+    preview.triangles[1].render_layer = PreviewRenderLayer::Water;
+    assert!(
+        GpuSceneData::from_preview(&preview)
+            .target_features()
+            .wave_mask
+    );
+}
+
+#[test]
+fn static_vertex_indexing_preserves_the_exact_expanded_triangle_stream() {
+    let static_preview = shared_static_quad_preview();
+    let static_scene = GpuSceneData::from_preview(&static_preview);
+    assert_eq!(static_scene.batches.len(), 1);
+    let indexed_batch = &static_scene.batches[0];
+    let indices = indexed_batch
+        .indices
+        .as_ref()
+        .expect("a static quad should share its exact-bit corner vertices");
+    assert!(!indexed_batch.updateable);
+    assert_eq!(indexed_batch.vertices.len(), 4);
+    assert_eq!(indices.len(), 6);
+    assert!(static_scene.triangle_vertices.iter().all(Option::is_none));
+
+    let mut updateable_preview = static_preview;
+    updateable_preview
+        .object_model_indices
+        .insert("updateable-object".to_owned(), 1);
+    let direct_scene = GpuSceneData::from_preview(&updateable_preview);
+    assert_eq!(direct_scene.batches.len(), 1);
+    let direct_batch = &direct_scene.batches[0];
+    assert!(direct_batch.updateable);
+    assert!(direct_batch.indices.is_none());
+    assert_eq!(direct_batch.vertices.len(), 6);
+    assert!(direct_scene.triangle_vertices.iter().all(Option::is_some));
+
+    let expanded = indices
         .iter()
-        .all(|batch| batch.vertices.len() % 3 == 0));
+        .map(|index| indexed_batch.vertices[*index as usize])
+        .collect::<Vec<_>>();
+    assert_eq!(
+        bytemuck::cast_slice::<GpuVertex, u8>(&expanded),
+        bytemuck::cast_slice::<GpuVertex, u8>(&direct_batch.vertices)
+    );
+}
+
+#[test]
+fn intrinsically_dynamic_batches_remain_direct_triangle_lists() {
+    let billboard = J3dBillboard {
+        mode: J3dBillboardMode::Full,
+        center: [0.5, 0.5, 0.0],
+        axes: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        offsets: [[-0.5, -0.5, 0.0], [0.5, -0.5, 0.0], [0.5, 0.5, 0.0]],
+        normals: Some([[0.0, 0.0, 1.0]; 3]),
+    };
+    let mut billboard_preview = shared_static_quad_preview();
+    for triangle in &mut billboard_preview.triangles {
+        triangle.billboard = Some(billboard);
+    }
+
+    let mut particle_preview = shared_static_quad_preview();
+    for triangle in &mut particle_preview.triangles {
+        triangle.render_layer = PreviewRenderLayer::Particle;
+        triangle.particle_type = Some(0);
+    }
+
+    let mut wave_preview = shared_static_quad_preview();
+    for triangle in &mut wave_preview.triangles {
+        triangle.render_layer = PreviewRenderLayer::WaveFoam;
+    }
+
+    for preview in [billboard_preview, particle_preview, wave_preview] {
+        let scene = GpuSceneData::from_preview(&preview);
+        assert!(scene.batches.iter().all(|batch| batch.updateable));
+        assert!(scene.batches.iter().all(|batch| batch.indices.is_none()));
+        assert!(scene.triangle_vertices.iter().all(Option::is_some));
+    }
+}
+
+#[test]
+fn ranged_flag_and_rotating_batches_remain_direct_triangle_lists() {
+    let mut flag_preview = shared_static_quad_preview();
+    flag_preview
+        .animated_flags
+        .push(crate::AnimatedFlagPreview {
+            transform: crate::Transform::default(),
+            rows: 2,
+            cols: 2,
+            step_height: 1.0,
+            step_width: 1.0,
+            flag_height: 1.0,
+            flag_width: 1.0,
+            segment_size: 1.0,
+            initial_phase_degrees: 0.0,
+            flutter_speed_degrees_per_frame: 1.0,
+            phase_wrap_degrees: 360.0,
+            point_range: 0..0,
+            triangle_range: 0..2,
+        });
+
+    let mut rotating_preview = shared_static_quad_preview();
+    rotating_preview
+        .rotating_models
+        .push(crate::RuntimeRotatingModelPreview {
+            positions: Arc::new(Vec::new()),
+            triangles: Arc::new(Vec::new()),
+            instances: vec![crate::AnimatedModelInstance {
+                transform: crate::Transform::default(),
+                model_index: 1,
+                point_range: 0..0,
+                point_stride: 1,
+                triangle_range: 0..2,
+                accessories: Vec::new(),
+                runtime_yaw_degrees_per_frame: 1.0,
+            }],
+        });
+
+    for preview in [flag_preview, rotating_preview] {
+        let scene = GpuSceneData::from_preview(&preview);
+        assert!(scene.batches.iter().all(|batch| batch.updateable));
+        assert!(scene.batches.iter().all(|batch| batch.indices.is_none()));
+        assert!(scene.triangle_vertices.iter().all(Option::is_some));
+    }
+}
+
+#[test]
+fn bounded_cache_eviction_keeps_separately_active_values_alive() {
+    let active = Arc::new(String::from("active"));
+    let active_values = [active.clone()];
+    let mut cache = BTreeMap::new();
+    insert_bounded_cache(&mut cache, 2, 0, active.clone());
+    insert_bounded_cache(&mut cache, 2, 1, Arc::new(String::from("cached")));
+
+    insert_bounded_cache(&mut cache, 2, 1, Arc::new(String::from("replacement")));
+    assert_eq!(cache.len(), 2, "replacing a key must not flush the cache");
+    insert_bounded_cache(&mut cache, 2, 2, Arc::new(String::from("new")));
+
+    assert_eq!(cache.keys().copied().collect::<Vec<_>>(), vec![2]);
+    assert!(Arc::ptr_eq(&active_values[0], &active));
+    assert_eq!(active_values[0].as_str(), "active");
 }
 
 #[test]
@@ -459,6 +608,35 @@ fn mirror_scene_includes_sky_and_actor_models_but_not_level_water() {
     let mut water = actor;
     water.render_layer = PreviewRenderLayer::Water;
     assert!(!triangle_is_mirror_visible(&water, &actor_models));
+}
+
+#[test]
+fn mirror_surface_batches_require_the_matching_active_cube_slot() {
+    assert!(!render_layer_is_visible_for_active_mirror(
+        PreviewRenderLayer::MirrorSurface,
+        Some(0),
+        None,
+    ));
+    assert!(!render_layer_is_visible_for_active_mirror(
+        PreviewRenderLayer::MirrorSurface,
+        Some(0),
+        Some(1),
+    ));
+    assert!(render_layer_is_visible_for_active_mirror(
+        PreviewRenderLayer::MirrorSurface,
+        Some(0),
+        Some(0),
+    ));
+    assert!(!render_layer_is_visible_for_active_mirror(
+        PreviewRenderLayer::MirrorSurface,
+        None,
+        None,
+    ));
+    assert!(render_layer_is_visible_for_active_mirror(
+        PreviewRenderLayer::Main,
+        None,
+        None,
+    ));
 }
 
 fn geometry_update_preview() -> ModelPreview {
@@ -503,10 +681,13 @@ fn geometry_update_preview() -> ModelPreview {
         camera_bounds_max: [11.0, 1.0, 0.0],
         loaded_models: 2,
         failed_models: 0,
+        model_failures: Vec::new(),
         source_vertices: 6,
         source_triangles: 2,
         source_textures: 0,
         object_model_indices: BTreeMap::new(),
+        mirror_cubes: Vec::new(),
+        mirror_model_slots: BTreeMap::new(),
         animated_models: Vec::new(),
         animated_flags: Vec::new(),
         rotating_models: Vec::new(),
@@ -516,6 +697,18 @@ fn geometry_update_preview() -> ModelPreview {
         level_transform_duration_frames: 600.0,
         level_transform_particle_end_frames: 600.0,
     }
+}
+
+fn shared_static_quad_preview() -> ModelPreview {
+    let mut preview = geometry_update_preview();
+    let triangles = &mut preview.triangles;
+    triangles[0].packet_index = 0;
+    triangles[0].model_index = 1;
+    triangles[0].vertices = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0]];
+    triangles[1].packet_index = 0;
+    triangles[1].model_index = 1;
+    triangles[1].vertices = [[0.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]];
+    preview
 }
 
 fn gpu_triangle_vertex_bytes(scene: &GpuSceneData, triangle_index: usize) -> &[u8] {
@@ -779,6 +972,31 @@ fn runtime_wave_batch_updates_its_animation_clock() {
     assert_eq!(material.uniform_at_time(2.5).runtime_parameters[0], 2.5);
 }
 
+#[test]
+fn material_refresh_reapplies_batch_derived_runtime_state() {
+    let mut preview = geometry_update_preview();
+    preview.materials = vec![test_material(4)];
+    preview.triangles[0].material_index = Some(0);
+    preview.triangles[0].render_layer = PreviewRenderLayer::WaveFoam;
+    preview.triangles[1].material_index = Some(0);
+    preview.triangles[1].render_layer = PreviewRenderLayer::Heatwave;
+    let mut scene = GpuSceneData::from_preview(&preview);
+
+    assert!(scene.materials[0].runtime_wave);
+    assert_eq!(
+        scene.materials[0].uniform.texture_sizes[1][0..2],
+        [320.0, 224.0]
+    );
+
+    scene.replace_material_from_preview(0, &preview.materials[0], &preview);
+
+    assert!(scene.materials[0].runtime_wave);
+    assert_eq!(
+        scene.materials[0].uniform.texture_sizes[1][0..2],
+        [320.0, 224.0]
+    );
+}
+
 fn lod_preview_texture() -> PreviewTexture {
     let mip = |size| egui::ColorImage::filled([size, size], egui::Color32::WHITE);
     PreviewTexture {
@@ -819,6 +1037,21 @@ fn gpu_sampler_preserves_authored_lod_range_and_gx_mip_filter() {
         sampler_mipmap_filter(4, true),
         wgpu::MipmapFilterMode::Linear
     );
+}
+
+#[test]
+fn gpu_sampler_preserves_gx_anisotropy_when_webgpu_filters_are_compatible() {
+    let mut texture = lod_preview_texture();
+    texture.max_anisotropy = 2;
+    let data = GpuTextureData::from_preview_texture(&texture);
+
+    assert_eq!(data.anisotropy_clamp, 4);
+    assert!(authored_sampler_anisotropy_is_supported(&texture));
+
+    texture.min_filter = 3;
+    let data = GpuTextureData::from_preview_texture(&texture);
+    assert_eq!(data.anisotropy_clamp, 1);
+    assert!(!authored_sampler_anisotropy_is_supported(&texture));
 }
 
 #[test]
@@ -888,9 +1121,14 @@ fn gx_composite_matches_eframe_depth_attachment_without_writing_it() {
 }
 
 #[test]
-fn gx_source_color_blend_factors_do_not_change_with_blend_slot() {
-    assert_eq!(gx_blend_factor(2), wgpu::BlendFactor::Src);
-    assert_eq!(gx_blend_factor(3), wgpu::BlendFactor::OneMinusSrc);
+fn gx_color_blend_aliases_follow_their_source_and_destination_slots() {
+    assert_eq!(gx_source_blend_factor(2), wgpu::BlendFactor::Dst);
+    assert_eq!(gx_source_blend_factor(3), wgpu::BlendFactor::OneMinusDst);
+    assert_eq!(gx_destination_blend_factor(2), wgpu::BlendFactor::Src);
+    assert_eq!(
+        gx_destination_blend_factor(3),
+        wgpu::BlendFactor::OneMinusSrc
+    );
 }
 
 #[test]
@@ -907,6 +1145,81 @@ fn gx_subtract_blend_subtracts_source_from_framebuffer() {
     assert_eq!(blend.color.dst_factor, wgpu::BlendFactor::One);
     assert_eq!(blend.color.operation, wgpu::BlendOperation::ReverseSubtract);
     assert_eq!(blend.alpha.operation, wgpu::BlendOperation::ReverseSubtract);
+}
+
+#[test]
+fn gx_logic_operations_use_an_explicit_overwrite_fallback() {
+    assert!(gpu_blend_state(GpuBlendKey {
+        mode: 2,
+        src_factor: 4,
+        dst_factor: 5,
+        logic_op: 6,
+    })
+    .is_none());
+}
+
+#[test]
+fn gx_noop_logic_operation_preserves_framebuffer_color() {
+    let blend = gpu_blend_state(GpuBlendKey {
+        mode: 2,
+        src_factor: 0,
+        dst_factor: 0,
+        logic_op: 5,
+    })
+    .expect("GX_LO_NOOP uses a zero-source/one-destination blend");
+
+    assert_eq!(blend.color.src_factor, wgpu::BlendFactor::Zero);
+    assert_eq!(blend.color.dst_factor, wgpu::BlendFactor::One);
+    assert_eq!(blend.alpha.src_factor, wgpu::BlendFactor::Zero);
+    assert_eq!(blend.alpha.dst_factor, wgpu::BlendFactor::One);
+    assert!(J3D_SHADER.contains("case 0u: { return vec4<f32>(0.0); }"));
+    assert!(J3D_SHADER.contains("case 12u: { return vec4<f32>(1.0) - color; }"));
+    assert!(J3D_SHADER.contains("case 15u: { return vec4<f32>(1.0); }"));
+}
+
+#[test]
+fn material_uniform_carries_logic_mode_for_source_transforms() {
+    let mut material = test_material(1);
+    material.blend_mode.mode = 2;
+    material.blend_mode.logic_op = 12;
+    let uniform = GpuMaterialUniform::from_j3d(&material);
+
+    assert_eq!(uniform.runtime_parameters[1], 2.0);
+    assert_eq!(uniform.runtime_parameters[2], 12.0);
+}
+
+#[test]
+fn pipeline_blend_keys_drop_fields_unused_by_the_active_mode() {
+    assert_eq!(
+        GpuBlendKey {
+            mode: 3,
+            src_factor: 4,
+            dst_factor: 5,
+            logic_op: 6,
+        }
+        .canonical(),
+        GpuBlendKey {
+            mode: 3,
+            src_factor: 0,
+            dst_factor: 0,
+            logic_op: 0,
+        }
+    );
+    assert_eq!(
+        GpuBlendKey {
+            mode: 2,
+            src_factor: 4,
+            dst_factor: 5,
+            logic_op: 6,
+        }
+        .canonical(),
+        GpuBlendKey {
+            mode: 2,
+            src_factor: 0,
+            dst_factor: 0,
+            logic_op: 6,
+        }
+    );
 }
 
 #[test]

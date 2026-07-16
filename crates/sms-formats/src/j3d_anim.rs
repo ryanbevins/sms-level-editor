@@ -34,7 +34,7 @@ impl J3dJointAnimation {
         let bytes = bytes.as_ref();
         require_len(FORMAT, bytes, FILE_HEADER_SIZE)?;
         require_magic(FORMAT, bytes, b"J3D1bck1")?;
-        let (declared_size, base, section_end) =
+        let (_declared_size, base, section_end) =
             animation_section(bytes, b"ANK1", "missing ANK1 section")?;
         checked_slice(FORMAT, &bytes[..section_end], base, 0x24)?;
 
@@ -74,7 +74,7 @@ impl J3dJointAnimation {
             attribute,
             max_frame,
             joints,
-            bytes: bytes[..declared_size].to_vec(),
+            bytes: bytes.to_vec(),
         })
     }
 
@@ -129,7 +129,7 @@ impl J3dTexturePatternAnimation {
         let bytes = bytes.as_ref();
         require_len(FORMAT, bytes, FILE_HEADER_SIZE)?;
         require_magic(FORMAT, bytes, b"J3D1btp1")?;
-        let (declared_size, base, section_end) =
+        let (_declared_size, base, section_end) =
             animation_section(bytes, b"TPT1", "missing TPT1 section")?;
         checked_slice(FORMAT, &bytes[..section_end], base, 0x20)?;
 
@@ -182,7 +182,7 @@ impl J3dTexturePatternAnimation {
             attribute,
             max_frame,
             bindings,
-            bytes: bytes[..declared_size].to_vec(),
+            bytes: bytes.to_vec(),
         })
     }
 
@@ -278,7 +278,7 @@ impl J3dTextureSrtAnimation {
         let bytes = bytes.as_ref();
         require_len(FORMAT, bytes, FILE_HEADER_SIZE)?;
         require_magic(FORMAT, bytes, b"J3D1btk1")?;
-        let (declared_size, base, section_end) =
+        let (_declared_size, base, section_end) =
             animation_section(bytes, b"TTK1", "missing TTK1 section")?;
         checked_slice(FORMAT, &bytes[..section_end], base, TTK1_HEADER_SIZE)?;
 
@@ -364,7 +364,7 @@ impl J3dTextureSrtAnimation {
             attribute,
             max_frame,
             bindings,
-            bytes: bytes[..declared_size].to_vec(),
+            bytes: bytes.to_vec(),
         })
     }
 
@@ -954,6 +954,24 @@ mod tests {
         let mut btk = test_btk();
         let btk_section_size = (btk.len() - FILE_HEADER_SIZE + 4) as u32;
         put_u32(&mut btk, FILE_HEADER_SIZE + 4, btk_section_size);
+        assert_eq!(J3dTextureSrtAnimation::parse(&btk).unwrap().to_bytes(), btk);
+    }
+
+    #[test]
+    fn preserve_bytes_includes_data_after_the_declared_animation_size() {
+        let mut bck = test_bck();
+        bck.extend_from_slice(b"bck tail");
+        assert_eq!(J3dJointAnimation::parse(&bck).unwrap().to_bytes(), bck);
+
+        let mut btp = test_btp();
+        btp.extend_from_slice(b"btp tail");
+        assert_eq!(
+            J3dTexturePatternAnimation::parse(&btp).unwrap().to_bytes(),
+            btp
+        );
+
+        let mut btk = test_btk();
+        btk.extend_from_slice(b"btk tail");
         assert_eq!(J3dTextureSrtAnimation::parse(&btk).unwrap().to_bytes(), btk);
     }
 
