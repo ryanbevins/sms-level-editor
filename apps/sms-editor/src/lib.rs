@@ -2822,7 +2822,7 @@ fn content_browser_card_text(
 ) -> String {
     let mut lines = vec![archive.stage_id.clone()];
     if let Some(stage_name) = localized.and_then(|label| label.stage_name.as_deref()) {
-        lines.push(elide_label(stage_name, 30));
+        lines.push(stage_name.to_string());
     }
     if let Some(label) = localized {
         if let Some(first) = label.scenario_names.first() {
@@ -2832,15 +2832,110 @@ fn content_browser_card_text(
             } else {
                 format!(" (+{remaining})")
             };
-            lines.push(format!(
-                "{}{}",
-                elide_label(first, 34usize.saturating_sub(suffix.len())),
-                suffix
-            ));
+            lines.push(format!("{first}{suffix}"));
         }
     }
     lines.push(format_bytes_short(archive.size_bytes));
     lines.join("\n")
+}
+
+fn content_browser_card_button(
+    ui: &mut egui::Ui,
+    size: egui::Vec2,
+    selected: bool,
+    label: &str,
+) -> egui::Response {
+    let response = ui.add_sized(size, egui::Button::selectable(selected, ""));
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Button, ui.is_enabled(), selected, label)
+    });
+    if !ui.is_rect_visible(response.rect) {
+        return response;
+    }
+
+    let lines = label.lines().collect::<Vec<_>>();
+    let Some(title) = lines.first().copied() else {
+        return response;
+    };
+    let size_text = lines.last().copied().unwrap_or_default();
+    let details = if lines.len() > 2 {
+        &lines[1..lines.len() - 1]
+    } else {
+        &[]
+    };
+
+    let inner = response.rect.shrink2(egui::vec2(8.0, 6.0));
+    let text_color = ui.style().interact(&response).text_color();
+    let size_galley = egui::WidgetText::from(egui::RichText::new(size_text).small().weak())
+        .into_galley(
+            ui,
+            Some(egui::TextWrapMode::Truncate),
+            inner.width() * 0.35,
+            egui::TextStyle::Small,
+        );
+    let title_width = (inner.width() - size_galley.size().x - 8.0).max(24.0);
+    let title_galley = egui::WidgetText::from(egui::RichText::new(title).strong()).into_galley(
+        ui,
+        Some(egui::TextWrapMode::Truncate),
+        title_width,
+        egui::TextStyle::Button,
+    );
+    let detail_galleys = details
+        .iter()
+        .enumerate()
+        .map(|(index, line)| {
+            let text = if index == 0 {
+                egui::RichText::new(*line).strong()
+            } else {
+                egui::RichText::new(*line).small()
+            };
+            egui::WidgetText::from(text).into_galley(
+                ui,
+                Some(egui::TextWrapMode::Truncate),
+                inner.width(),
+                egui::TextStyle::Body,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let top_height = title_galley.size().y.max(size_galley.size().y);
+    let details_height = detail_galleys
+        .iter()
+        .map(|galley| galley.size().y)
+        .sum::<f32>();
+    let row_gap = 3.0;
+    let total_height = top_height
+        + if detail_galleys.is_empty() {
+            0.0
+        } else {
+            5.0 + details_height + row_gap * detail_galleys.len().saturating_sub(1) as f32
+        };
+    let painter = ui.painter().with_clip_rect(inner);
+    let mut y = inner.center().y - total_height * 0.5;
+    painter.galley(
+        egui::pos2(inner.left(), y + (top_height - title_galley.size().y) * 0.5),
+        title_galley,
+        text_color,
+    );
+    painter.galley(
+        egui::pos2(
+            inner.right() - size_galley.size().x,
+            y + (top_height - size_galley.size().y) * 0.5,
+        ),
+        size_galley,
+        text_color,
+    );
+
+    if !detail_galleys.is_empty() {
+        y += top_height + 5.0;
+        for galley in detail_galleys {
+            let height = galley.size().y;
+            painter.galley(egui::pos2(inner.left(), y), galley, text_color);
+            y += height + row_gap;
+        }
+    }
+
+    response
 }
 
 fn content_browser_hover_text(
@@ -2860,16 +2955,6 @@ fn content_browser_hover_text(
     lines.push(archive.relative_path.display().to_string());
     lines.push(archive.path.display().to_string());
     lines.join("\n")
-}
-
-fn elide_label(label: &str, maximum_chars: usize) -> String {
-    let mut characters = label.chars();
-    let prefix = characters.by_ref().take(maximum_chars).collect::<String>();
-    if characters.next().is_some() {
-        format!("{prefix}…")
-    } else {
-        prefix
-    }
 }
 
 fn merge_bounds(
@@ -3856,7 +3941,7 @@ struct ContentBrowserLayout {
 }
 
 fn content_browser_layout(available_width: f32, item_count: usize) -> ContentBrowserLayout {
-    const MIN_CARD_WIDTH: f32 = 150.0;
+    const MIN_CARD_WIDTH: f32 = 180.0;
     const MAX_CARD_WIDTH: f32 = 260.0;
     const GAP: f32 = 8.0;
 

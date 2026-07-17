@@ -15,14 +15,16 @@ fn editor_layout_defaults_to_the_unreal_style_workspace() {
 #[test]
 fn content_browser_layout_wraps_to_the_available_width() {
     let narrow = content_browser_layout(360.0, 20);
+    let medium = content_browser_layout(760.0, 20);
     let wide = content_browser_layout(1_240.0, 20);
     let sparse = content_browser_layout(1_240.0, 3);
 
-    assert_eq!(narrow.columns, 2);
+    assert_eq!(narrow.columns, 1);
+    assert!(medium.columns > narrow.columns);
     assert!(wide.columns > narrow.columns);
     assert_eq!(sparse.columns, 3);
-    assert!((150.0..=260.0).contains(&wide.card_width));
-    for (available_width, layout) in [(360.0, narrow), (1_240.0, wide)] {
+    assert!((180.0..=260.0).contains(&wide.card_width));
+    for (available_width, layout) in [(360.0, narrow), (760.0, medium), (1_240.0, wide)] {
         let occupied_width =
             layout.card_width * layout.columns as f32 + 8.0 * (layout.columns - 1) as f32;
         assert!(occupied_width <= available_width);
@@ -51,6 +53,7 @@ fn content_browser_cards_include_game_localized_stage_and_scenario_names() {
     assert!(card.contains("bianco0"));
     assert!(card.contains("BIANCO HILLS"));
     assert!(card.contains("Road to the Big Windmill (+1)"));
+    assert_eq!(card.lines().count(), 4);
     assert!(hover.contains("The Hillside Cave Secret"));
 }
 

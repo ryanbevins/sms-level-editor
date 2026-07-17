@@ -586,12 +586,13 @@ impl SmsEditorApp {
                             .scene_labels
                             .get(&archive.stage_id.to_ascii_lowercase());
                         let label = content_browser_card_text(archive, localized);
-                        let response = ui
-                            .add_sized(
-                                [layout.card_width, 88.0],
-                                egui::Button::selectable(selected, label).truncate(),
-                            )
-                            .on_hover_text(content_browser_hover_text(archive, localized));
+                        let response = content_browser_card_button(
+                            ui,
+                            egui::vec2(layout.card_width, 88.0),
+                            selected,
+                            &label,
+                        )
+                        .on_hover_text(content_browser_hover_text(archive, localized));
                         if response.clicked() {
                             open_archive = Some(archive.clone());
                         }
