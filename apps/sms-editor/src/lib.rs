@@ -30,8 +30,13 @@ use sms_schema::{ObjectDefinition, ObjectRegistry, ParticleBindingTarget, Schema
 mod camera;
 mod document_commands;
 mod gpu_viewport;
+mod project;
+mod project_ui;
 mod ui_panels;
 mod viewport_ui;
+
+use project::*;
+use project_ui::{path_display_row, NewProjectDraft};
 
 const VIEWPORT_NEAR_CLIP: f32 = 8.0;
 
@@ -289,6 +294,12 @@ struct ObjectUndoTransaction {
 }
 
 struct SmsEditorApp {
+    current_project: Option<OpenProject>,
+    recent_projects: RecentProjects,
+    show_project_hub: bool,
+    project_hub_error: Option<String>,
+    new_project_draft: Option<NewProjectDraft>,
+    project_name_draft: String,
     repo_root: String,
     base_root: String,
     project_root: String,
@@ -343,6 +354,7 @@ struct SmsEditorApp {
     redo_stack: VecDeque<ObjectUndoRecord>,
     undo_transaction: Option<ObjectUndoTransaction>,
     pending_stage_open: Option<String>,
+    pending_project_hub: bool,
     close_confirmation_requested: bool,
     close_authorized: bool,
     background_receiver: Option<Receiver<BackgroundResult>>,
@@ -359,16 +371,84 @@ struct SmsEditorApp {
 impl Default for SmsEditorApp {
     fn default() -> Self {
         let args = editor_startup_args();
-        let base_root = args.base_root.unwrap_or_else(default_base_root);
+        let has_project_startup = args.project_file.is_some();
+        let startup_project = args
+            .project_file
+            .as_deref()
+            .map(OpenProject::load)
+            .transpose();
+        let (current_project, project_hub_error) = match startup_project {
+            Ok(project) => (project, None),
+            Err(error) => (None, Some(error)),
+        };
+        #[cfg(test)]
+        let mut recent_projects = RecentProjects::empty();
+        #[cfg(not(test))]
+        let mut recent_projects = RecentProjects::load_default();
+        if let Some(project) = &current_project {
+            let _ = recent_projects.touch(project);
+        }
+        let has_legacy_startup = args.base_root.is_some() && !has_project_startup;
+        let base_root = current_project.as_ref().map_or_else(
+            || args.base_root.unwrap_or_default(),
+            |project| {
+                project
+                    .descriptor
+                    .base_game_root
+                    .to_string_lossy()
+                    .into_owned()
+            },
+        );
+        let repo_root = current_project
+            .as_ref()
+            .and_then(|project| project.descriptor.schema_source_root.as_ref())
+            .map(|path| path.to_string_lossy().into_owned())
+            .or(args.repo_root)
+            .unwrap_or_else(default_repo_root);
+        let project_root = current_project.as_ref().map_or_else(
+            || "sms-editor-project".to_string(),
+            |project| project.data_root().to_string_lossy().into_owned(),
+        );
+        let stage_id = args
+            .stage_id
+            .or_else(|| {
+                current_project
+                    .as_ref()
+                    .and_then(|project| project.descriptor.last_stage.clone())
+            })
+            .unwrap_or_default();
+        let launch = current_project
+            .as_ref()
+            .map(|project| project.descriptor.launch.clone())
+            .unwrap_or_default();
+        let show_project_hub = !has_legacy_startup && current_project.is_none();
         Self {
-            repo_root: args.repo_root.unwrap_or_else(default_repo_root),
+            project_name_draft: current_project
+                .as_ref()
+                .map(|project| project.descriptor.name.clone())
+                .unwrap_or_default(),
+            current_project,
+            recent_projects,
+            show_project_hub,
+            project_hub_error,
+            new_project_draft: None,
+            repo_root,
             base_root,
-            project_root: "sms-editor-project".to_string(),
+            project_root,
             stage_export_path: String::new(),
-            stage_id: args.stage_id.unwrap_or_else(|| "dolpic0".to_string()),
-            dolphin_path: String::new(),
-            game_path: String::new(),
-            dolphin_user_dir: String::new(),
+            stage_id,
+            dolphin_path: launch
+                .dolphin_executable
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            game_path: launch
+                .game_image
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            dolphin_user_dir: launch
+                .dolphin_user_directory
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default(),
             registry: None,
             document: None,
             render_scene: None,
@@ -415,6 +495,7 @@ impl Default for SmsEditorApp {
             redo_stack: VecDeque::new(),
             undo_transaction: None,
             pending_stage_open: None,
+            pending_project_hub: false,
             close_confirmation_requested: false,
             close_authorized: false,
             background_receiver: None,
@@ -453,6 +534,10 @@ impl eframe::App for SmsEditorApp {
             self.close_confirmation_requested = true;
         }
 
+        if self.show_project_hub {
+            return;
+        }
+
         if ctx.egui_wants_keyboard_input() {
             return;
         }
@@ -484,6 +569,12 @@ impl eframe::App for SmsEditorApp {
     }
 
     fn ui(&mut self, root_ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if self.show_project_hub {
+            egui::CentralPanel::default().show(root_ui, |ui| self.project_hub(ui));
+            self.new_project_dialog(root_ui.ctx());
+            self.unsaved_changes_dialog(root_ui.ctx());
+            return;
+        }
         self.refresh_scene_browser_if_needed();
 
         egui::Panel::top("toolbar")
@@ -807,6 +898,7 @@ impl SmsEditorApp {
             self.log.push(warning);
         }
         self.project_root = project_root;
+        self.adopt_resolved_project_data_root();
         self.registry = registry;
         self.scene_archives = archives;
         self.last_scanned_base_root = self.base_root.trim().to_string();

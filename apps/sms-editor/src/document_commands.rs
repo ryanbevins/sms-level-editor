@@ -196,6 +196,9 @@ impl SmsEditorApp {
                 false
             }
         };
+        if result {
+            self.persist_project_settings(false);
+        }
         result
     }
 
@@ -600,7 +603,10 @@ impl SmsEditorApp {
     }
 
     pub(super) fn unsaved_changes_dialog(&mut self, ctx: &egui::Context) {
-        if self.pending_stage_open.is_none() && !self.close_confirmation_requested {
+        if self.pending_stage_open.is_none()
+            && !self.close_confirmation_requested
+            && !self.pending_project_hub
+        {
             return;
         }
 
@@ -611,7 +617,11 @@ impl SmsEditorApp {
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ctx, |ui| {
                 ui.label("The current stage has changes that have not been saved.");
-                ui.label("Save the editor project before continuing?");
+                ui.label(if self.pending_project_hub {
+                    "Save the project before returning to the project hub?"
+                } else {
+                    "Save the editor project before continuing?"
+                });
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if ui.button("Save and Continue").clicked() {
@@ -632,12 +642,17 @@ impl SmsEditorApp {
             Some(2) => {
                 self.pending_stage_open = None;
                 self.close_confirmation_requested = false;
+                self.pending_project_hub = false;
             }
             _ => {}
         }
     }
 
     pub(super) fn finish_pending_navigation(&mut self, ctx: &egui::Context) {
+        if self.pending_project_hub {
+            self.enter_project_hub();
+            return;
+        }
         if self.close_confirmation_requested {
             self.close_confirmation_requested = false;
             self.close_authorized = true;

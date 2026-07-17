@@ -71,6 +71,8 @@ may be missing or visually incorrect.
 
 ### Scene editing prototype
 
+- Create and reopen named `.sms` projects from a launch hub with a persistent
+  recent-project list and native file/folder choosers
 - Browse and select placement objects through an outliner
 - Place schema-discovered objects and duplicate or delete existing objects
 - Edit translation, rotation, and scale through the inspector and viewport
@@ -106,11 +108,22 @@ arguments.
 
 ## Saved Projects Are Not Mods
 
-The current **Save Project** action and the CLI's `export-project` command write
-an editor-only project folder containing:
+The desktop editor uses a versioned, human-readable `project-name.sms` file as
+the identity of a project. It records the project name, extracted base-game
+root, managed project-data location, last opened stage, schema source, and
+optional Dolphin launch paths. The launch hub stores only a recent-project
+index and reopens these descriptors; it does not duplicate project content.
+
+Each `.sms` descriptor points to a separate managed data folder containing:
 
 - `sms-project.toml`; and
-- a JSON scene overlay under `files/editor/stages/`.
+- JSON scene overlays under `files/editor/stages/`.
+
+The CLI's `export-project` command continues to operate directly on this managed
+data folder. Existing folder-only projects can be wrapped in a `.sms` descriptor
+through **Import Legacy Folder** without moving or rewriting their overlay data.
+See [the project format specification](docs/project-format.md) for the version 1
+schema and path-resolution rules.
 
 This output records the editor's current object representation and typed archive
 edits. The stage's semantic archive is freshly imported from the configured base
@@ -181,10 +194,17 @@ cargo build --release -p sms-editor
 
 The executable is written to `target\release\sms-editor.exe`.
 
-Launch the development UI with its project and stage controls:
+Launch the development UI at the recent-project hub:
 
 ```powershell
 cargo run --release -p sms-editor
+```
+
+Pass a `.sms` descriptor to reopen it directly (the stored last stage is opened
+automatically):
+
+```powershell
+cargo run --release -p sms-editor -- "C:\Mods\Isle Delfino.sms"
 ```
 
 Development and diagnostic sessions can also prefill an extracted root, decomp

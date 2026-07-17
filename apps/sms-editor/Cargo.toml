@@ -10,10 +10,13 @@ repository.workspace = true
 bytemuck.workspace = true
 eframe.workspace = true
 egui.workspace = true
+rfd = "0.17.2"
+serde.workspace = true
 sms-formats.workspace = true
 sms-render.workspace = true
 sms-scene.workspace = true
 sms-schema.workspace = true
+toml.workspace = true
 
 [dev-dependencies]
 pollster = "0.4"

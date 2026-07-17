@@ -5,33 +5,66 @@ impl SmsEditorApp {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
 
-            let open_enabled =
-                !self.base_root.trim().is_empty() && self.background_receiver.is_none();
-            if command_button(ui, "Schema", self.background_receiver.is_none()).clicked() {
-                self.generate_schema();
+            ui.menu_button("File", |ui| {
+                if ui
+                    .button("Open a SMSProject")
+                    .on_hover_text("Return to the recent-project hub")
+                    .clicked()
+                {
+                    ui.close();
+                    self.request_project_hub();
+                }
+                ui.separator();
+                if ui
+                    .add_enabled(
+                        self.background_receiver.is_none(),
+                        egui::Button::new("Schema"),
+                    )
+                    .clicked()
+                {
+                    ui.close();
+                    self.generate_schema();
+                }
+                if ui
+                    .add_enabled(self.document.is_some(), egui::Button::new("Validate"))
+                    .clicked()
+                {
+                    ui.close();
+                    self.validate();
+                }
+                if ui
+                    .add_enabled(self.document.is_some(), egui::Button::new("Save Project"))
+                    .clicked()
+                {
+                    ui.close();
+                    self.save_project();
+                }
+                let export_enabled = self.document.is_some()
+                    && !self.stage_export_path.trim().is_empty()
+                    && self.background_receiver.is_none();
+                if ui
+                    .add_enabled(export_enabled, egui::Button::new("Export Stage"))
+                    .on_hover_text(
+                        "Create a new rebuilt stage archive at the explicit external path",
+                    )
+                    .clicked()
+                {
+                    ui.close();
+                    self.export_stage_archive();
+                }
+                ui.separator();
+                if ui.button("Launch").clicked() {
+                    ui.close();
+                    self.launch_dolphin();
+                }
+            });
+            if let Some(project) = &self.current_project {
+                ui.label(
+                    egui::RichText::new(&project.descriptor.name)
+                        .strong()
+                        .color(egui::Color32::from_rgb(159, 208, 201)),
+                );
             }
-            if command_button(ui, "Open", open_enabled).clicked() {
-                self.request_open_stage(self.stage_id.clone());
-            }
-            if command_button(ui, "Validate", self.document.is_some()).clicked() {
-                self.validate();
-            }
-            if command_button(ui, "Save Project", self.document.is_some()).clicked() {
-                self.save_project();
-            }
-            let export_enabled = self.document.is_some()
-                && !self.stage_export_path.trim().is_empty()
-                && self.background_receiver.is_none();
-            if command_button(ui, "Export Stage", export_enabled)
-                .on_hover_text("Create a new rebuilt stage archive at the explicit external path")
-                .clicked()
-            {
-                self.export_stage_archive();
-            }
-            if command_button(ui, "Launch", true).clicked() {
-                self.launch_dolphin();
-            }
-
             ui.separator();
             for tool in [
                 EditorTool::Select,
@@ -169,14 +202,57 @@ impl SmsEditorApp {
     }
 
     pub(super) fn project_panel(&mut self, ui: &mut egui::Ui) {
-        ui.heading("SMS Level Editor");
+        ui.heading("Project Settings");
         ui.add_space(4.0);
-        labeled_text(ui, "Repo Root", &mut self.repo_root);
-        labeled_text(ui, "Base Game Root", &mut self.base_root);
-        labeled_text(ui, "Editor Project", &mut self.project_root);
-        ui.small(
-            "Each game region uses a separate editor project. Project files are kept outside the extracted base game.",
+        let mut save_name = false;
+        if let Some(project) = &self.current_project {
+            ui.horizontal(|ui| {
+                ui.label("Name");
+                ui.text_edit_singleline(&mut self.project_name_draft);
+                if ui
+                    .add_enabled(
+                        !self.project_name_draft.trim().is_empty()
+                            && self.project_name_draft != project.descriptor.name,
+                        egui::Button::new("Save Name"),
+                    )
+                    .clicked()
+                {
+                    save_name = true;
+                }
+            });
+            ui.small(format!(
+                "Project file: {}",
+                project.descriptor_path.display()
+            ));
+        } else {
+            ui.colored_label(
+                egui::Color32::from_rgb(245, 190, 90),
+                "Temporary session — create a .sms project to make it appear on the launch hub.",
+            );
+        }
+        if save_name {
+            self.persist_project_settings(true);
+        }
+
+        ui.add_space(8.0);
+        let choose_repo = path_display_row(ui, "Schema Source", &self.repo_root, "Browse...", true);
+        let choose_base = path_display_row(
+            ui,
+            "Extracted Game",
+            &self.base_root,
+            "Browse...",
+            self.document.is_none() && self.background_receiver.is_none(),
         );
+        path_display_row(ui, "Project Data", &self.project_root, "Managed", false);
+        ui.small(
+            "The .sms file defines this project. Managed edits stay outside the extracted game directory.",
+        );
+        if choose_repo {
+            self.choose_schema_source_root();
+        }
+        if choose_base {
+            self.choose_base_game_root();
+        }
         if let Some(document) = &self.document {
             if !document_uses_selected_base(document, self.base_root.trim()) {
                 ui.colored_label(
@@ -188,7 +264,19 @@ impl SmsEditorApp {
                 );
             }
         }
-        labeled_text(ui, "Stage Export", &mut self.stage_export_path);
+        let choose_export = path_display_row(
+            ui,
+            "Stage Export",
+            &self.stage_export_path,
+            "Choose...",
+            self.document.is_some(),
+        );
+        if choose_export {
+            self.choose_stage_export_path();
+        }
+        if !self.stage_export_path.is_empty() && ui.small_button("Clear export path").clicked() {
+            self.stage_export_path.clear();
+        }
         labeled_text(ui, "Stage", &mut self.stage_id);
 
         ui.separator();
@@ -307,9 +395,38 @@ impl SmsEditorApp {
 
         ui.separator();
         ui.heading("Dolphin");
-        labeled_text(ui, "Executable", &mut self.dolphin_path);
-        labeled_text(ui, "Game", &mut self.game_path);
-        labeled_text(ui, "User Dir", &mut self.dolphin_user_dir);
+        let choose_dolphin =
+            path_display_row(ui, "Executable", &self.dolphin_path, "Browse...", true);
+        let choose_game = path_display_row(ui, "Game", &self.game_path, "Browse...", true);
+        let choose_user_dir =
+            path_display_row(ui, "User Dir", &self.dolphin_user_dir, "Browse...", true);
+        if choose_dolphin {
+            self.choose_dolphin_executable();
+        }
+        if choose_game {
+            self.choose_game_image();
+        }
+        if choose_user_dir {
+            self.choose_dolphin_user_directory();
+        }
+        let mut launch_settings_changed = false;
+        ui.horizontal_wrapped(|ui| {
+            if !self.dolphin_path.is_empty() && ui.small_button("Clear executable").clicked() {
+                self.dolphin_path.clear();
+                launch_settings_changed = true;
+            }
+            if !self.game_path.is_empty() && ui.small_button("Clear game").clicked() {
+                self.game_path.clear();
+                launch_settings_changed = true;
+            }
+            if !self.dolphin_user_dir.is_empty() && ui.small_button("Clear user dir").clicked() {
+                self.dolphin_user_dir.clear();
+                launch_settings_changed = true;
+            }
+        });
+        if launch_settings_changed {
+            self.persist_project_settings(false);
+        }
 
         ui.separator();
         if let Some(registry) = &self.registry {
@@ -328,7 +445,15 @@ impl SmsEditorApp {
     pub(super) fn content_browser_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("Content Browser");
         ui.add_space(4.0);
-        labeled_text(ui, "Base Game Root", &mut self.base_root);
+        if path_display_row(
+            ui,
+            "Extracted Game",
+            &self.base_root,
+            "Browse...",
+            self.document.is_none() && self.background_receiver.is_none(),
+        ) {
+            self.choose_base_game_root();
+        }
 
         ui.horizontal(|ui| {
             let can_scan = PathBuf::from(self.base_root.trim()).exists();
