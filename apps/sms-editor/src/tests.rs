@@ -22,6 +22,36 @@ fn content_browser_layout_wraps_to_the_available_width() {
     assert!(wide.columns > narrow.columns);
     assert_eq!(sparse.columns, 3);
     assert!((150.0..=260.0).contains(&wide.card_width));
+    for (available_width, layout) in [(360.0, narrow), (1_240.0, wide)] {
+        let occupied_width =
+            layout.card_width * layout.columns as f32 + 8.0 * (layout.columns - 1) as f32;
+        assert!(occupied_width <= available_width);
+    }
+}
+
+#[test]
+fn content_browser_cards_include_game_localized_stage_and_scenario_names() {
+    let archive = SceneArchiveInfo {
+        stage_id: "bianco0".to_string(),
+        group: "bianco".to_string(),
+        relative_path: PathBuf::from("files/data/scene/bianco0.szs"),
+        path: PathBuf::from("C:/game/files/data/scene/bianco0.szs"),
+        size_bytes: 2_300_000,
+    };
+    let localized = SceneArchiveLabel {
+        stage_name: Some("BIANCO HILLS".to_string()),
+        scenario_names: vec![
+            "Road to the Big Windmill".to_string(),
+            "The Hillside Cave Secret".to_string(),
+        ],
+    };
+
+    let card = content_browser_card_text(&archive, Some(&localized));
+    let hover = content_browser_hover_text(&archive, Some(&localized));
+    assert!(card.contains("bianco0"));
+    assert!(card.contains("BIANCO HILLS"));
+    assert!(card.contains("Road to the Big Windmill (+1)"));
+    assert!(hover.contains("The Hillside Cave Secret"));
 }
 
 #[test]
@@ -2809,6 +2839,8 @@ fn completed_stage_load_is_discarded_when_the_project_path_changed() {
         document,
         scene,
         preview: None,
+        scene_labels: BTreeMap::new(),
+        scene_label_warning: None,
     };
 
     app.apply_loaded_stage(loaded);
@@ -2841,6 +2873,8 @@ fn completed_stage_load_adopts_the_resolved_project_folder() {
         document,
         scene,
         preview: None,
+        scene_labels: BTreeMap::new(),
+        scene_label_warning: None,
     };
 
     app.apply_loaded_stage(loaded);
@@ -2873,6 +2907,8 @@ fn completed_stage_load_is_discarded_when_the_selected_stage_changed() {
         document,
         scene,
         preview: None,
+        scene_labels: BTreeMap::new(),
+        scene_label_warning: None,
     };
 
     app.apply_loaded_stage(loaded);

@@ -524,13 +524,15 @@ impl SmsEditorApp {
             );
         });
         ui.small(format!(
-            "{} stage{} from this project's extracted game  |  current: {}",
+            "{} stage{} from this project's extracted game  |  {} localized label{}  |  current: {}",
             self.scene_archives.len(),
             if self.scene_archives.len() == 1 {
                 ""
             } else {
                 "s"
             },
+            self.scene_labels.len(),
+            if self.scene_labels.len() == 1 { "" } else { "s" },
             if self.stage_id.trim().is_empty() {
                 "none"
             } else {
@@ -544,9 +546,22 @@ impl SmsEditorApp {
             .scene_archives
             .iter()
             .filter(|archive| {
+                let localized = self
+                    .scene_labels
+                    .get(&archive.stage_id.to_ascii_lowercase());
                 filter.is_empty()
                     || archive.stage_id.to_ascii_lowercase().contains(&filter)
                     || archive.group.to_ascii_lowercase().contains(&filter)
+                    || localized.is_some_and(|label| {
+                        label
+                            .stage_name
+                            .as_ref()
+                            .is_some_and(|name| name.to_ascii_lowercase().contains(&filter))
+                            || label
+                                .scenario_names
+                                .iter()
+                                .any(|name| name.to_ascii_lowercase().contains(&filter))
+                    })
                     || archive
                         .relative_path
                         .to_string_lossy()
@@ -567,21 +582,16 @@ impl SmsEditorApp {
                 .show(ui, |ui| {
                     for (index, archive) in archives.iter().enumerate() {
                         let selected = self.stage_id.eq_ignore_ascii_case(&archive.stage_id);
-                        let label = format!(
-                            "{}\n{}",
-                            archive.stage_id,
-                            format_bytes_short(archive.size_bytes)
-                        );
+                        let localized = self
+                            .scene_labels
+                            .get(&archive.stage_id.to_ascii_lowercase());
+                        let label = content_browser_card_text(archive, localized);
                         let response = ui
                             .add_sized(
-                                [layout.card_width, 52.0],
-                                egui::Button::selectable(selected, label),
+                                [layout.card_width, 88.0],
+                                egui::Button::selectable(selected, label).truncate(),
                             )
-                            .on_hover_text(format!(
-                                "{}\n{}",
-                                archive.relative_path.display(),
-                                archive.path.display()
-                            ));
+                            .on_hover_text(content_browser_hover_text(archive, localized));
                         if response.clicked() {
                             open_archive = Some(archive.clone());
                         }

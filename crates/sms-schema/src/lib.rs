@@ -7,6 +7,7 @@ mod map_obj_shared_model_extractor;
 mod map_obj_stream_tev_extractor;
 mod map_obj_string_tev_extractor;
 mod source_inventory;
+mod stage_name_extractor;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -26,6 +27,7 @@ use map_obj_shared_model_extractor::{
 use map_obj_stream_tev_extractor::extract_map_obj_stream_tev_colors;
 use map_obj_string_tev_extractor::extract_nozzle_box_tev_program;
 use source_inventory::SourceInventory;
+pub use stage_name_extractor::{extract_stage_name_tables, StageNameTables};
 
 #[derive(Debug, Error)]
 pub enum SchemaError {
@@ -81,6 +83,7 @@ pub enum SchemaExtractor {
     NpcResources,
     NpcInitData,
     NpcRootColors,
+    StageNames,
 }
 
 impl std::fmt::Display for SchemaExtractor {
@@ -104,6 +107,7 @@ impl std::fmt::Display for SchemaExtractor {
             Self::NpcResources => "NPC model resource",
             Self::NpcInitData => "NPC initialization",
             Self::NpcRootColors => "NPC root color",
+            Self::StageNames => "stage name",
         };
         formatter.write_str(name)
     }

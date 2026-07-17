@@ -33,12 +33,14 @@ mod gpu_viewport;
 mod outliner;
 mod project;
 mod project_ui;
+mod scene_labels;
 mod ui_panels;
 mod viewport_ui;
 
 use outliner::*;
 use project::*;
 use project_ui::{path_display_row, NewProjectDraft};
+use scene_labels::*;
 
 const VIEWPORT_NEAR_CLIP: f32 = 8.0;
 
@@ -169,6 +171,8 @@ struct LoadedStage {
     document: StageDocument,
     scene: RenderScene,
     preview: Option<ModelPreview>,
+    scene_labels: BTreeMap<String, SceneArchiveLabel>,
+    scene_label_warning: Option<String>,
 }
 
 struct ProjectLoadSelection {
@@ -176,11 +180,17 @@ struct ProjectLoadSelection {
     warning: Option<String>,
 }
 
+struct SceneScanResult {
+    archives: Vec<SceneArchiveInfo>,
+    labels: BTreeMap<String, SceneArchiveLabel>,
+    label_warning: Option<String>,
+}
+
 enum BackgroundResult {
     Schema(Box<Result<ObjectRegistry, String>>),
     Scan {
         base_root: String,
-        result: Result<Vec<SceneArchiveInfo>, String>,
+        result: Result<SceneScanResult, String>,
     },
     Open(Result<Box<LoadedStage>, String>),
     Export(Result<StageArchiveExportOutcome, String>),
@@ -350,6 +360,7 @@ struct SmsEditorApp {
     document: Option<StageDocument>,
     render_scene: Option<RenderScene>,
     scene_archives: Vec<SceneArchiveInfo>,
+    scene_labels: BTreeMap<String, SceneArchiveLabel>,
     model_preview: Option<ModelPreview>,
     gpu_viewport: Option<gpu_viewport::GpuViewportScene>,
     gpu_target_format: Option<eframe::wgpu::TextureFormat>,
@@ -500,6 +511,7 @@ impl Default for SmsEditorApp {
             document: None,
             render_scene: None,
             scene_archives: Vec::new(),
+            scene_labels: BTreeMap::new(),
             model_preview: None,
             gpu_viewport: None,
             gpu_target_format: None,
@@ -754,9 +766,25 @@ impl SmsEditorApp {
 
         let (sender, receiver) = mpsc::channel();
         let task_base_root = base_root.clone();
+        let repo_root = self.repo_root.trim().to_string();
         thread::spawn(move || {
             let result = discover_scene_archives(PathBuf::from(&task_base_root))
-                .map_err(|err| err.to_string());
+                .map_err(|err| err.to_string())
+                .map(|archives| {
+                    let (labels, label_warning) = match load_scene_archive_labels(
+                        PathBuf::from(&task_base_root).as_path(),
+                        PathBuf::from(&repo_root).as_path(),
+                        &archives,
+                    ) {
+                        Ok(labels) => (labels, None),
+                        Err(error) => (BTreeMap::new(), Some(error)),
+                    };
+                    SceneScanResult {
+                        archives,
+                        labels,
+                        label_warning,
+                    }
+                });
             let _ = sender.send(BackgroundResult::Scan {
                 base_root: task_base_root,
                 result,
@@ -807,6 +835,14 @@ impl SmsEditorApp {
             let result = (|| -> Result<Box<LoadedStage>, String> {
                 let archives = discover_scene_archives(PathBuf::from(&base_root))
                     .map_err(|err| err.to_string())?;
+                let (scene_labels, scene_label_warning) = match load_scene_archive_labels(
+                    PathBuf::from(&base_root).as_path(),
+                    PathBuf::from(&repo_root).as_path(),
+                    &archives,
+                ) {
+                    Ok(labels) => (labels, None),
+                    Err(error) => (BTreeMap::new(), Some(error)),
+                };
                 let (registry, schema_warning) = if let Some(registry) = existing_registry {
                     (Some(registry), None)
                 } else {
@@ -837,6 +873,8 @@ impl SmsEditorApp {
                     document,
                     scene,
                     preview,
+                    scene_labels,
+                    scene_label_warning,
                 }))
             })();
             let _ = sender.send(BackgroundResult::Open(result));
@@ -877,15 +915,17 @@ impl SmsEditorApp {
                         Err(err) => self.log.push(format!("Schema generation failed: {err}")),
                     },
                     BackgroundResult::Scan { base_root, result } => match result {
-                        Ok(archives) => {
+                        Ok(scan) => {
                             if self.base_root.trim() != base_root {
                                 self.log.push(format!(
                                     "Discarded scene scan for superseded base root {base_root}."
                                 ));
                                 return;
                             }
-                            let count = archives.len();
-                            self.scene_archives = archives;
+                            let count = scan.archives.len();
+                            let label_count = scan.labels.len();
+                            self.scene_archives = scan.archives;
+                            self.scene_labels = scan.labels;
                             self.last_scanned_base_root = base_root;
                             if self.stage_id.trim().is_empty() {
                                 if let Some(first) = self.scene_archives.first() {
@@ -894,6 +934,16 @@ impl SmsEditorApp {
                             }
                             self.log
                                 .push(format!("Discovered {count} scene archive(s)."));
+                            if label_count > 0 {
+                                self.log.push(format!(
+                                    "Loaded {label_count} localized scene label(s) from the extracted game."
+                                ));
+                            }
+                            if let Some(warning) = scan.label_warning {
+                                self.log.push(format!(
+                                    "Scene names are unavailable; archive IDs remain active: {warning}"
+                                ));
+                            }
                         }
                         Err(err) => self.log.push(format!("Scene scan failed: {err}")),
                     },
@@ -944,6 +994,8 @@ impl SmsEditorApp {
             document,
             scene,
             preview,
+            scene_labels,
+            scene_label_warning,
         } = loaded;
         if self.base_root.trim() != base_root {
             self.log.push(format!(
@@ -972,10 +1024,16 @@ impl SmsEditorApp {
         if let Some(warning) = project_warning {
             self.log.push(warning);
         }
+        if let Some(warning) = scene_label_warning {
+            self.log.push(format!(
+                "Scene names are unavailable; archive IDs remain active: {warning}"
+            ));
+        }
         self.project_root = project_root;
         self.adopt_resolved_project_data_root();
         self.registry = registry;
         self.scene_archives = archives;
+        self.scene_labels = scene_labels;
         self.last_scanned_base_root = self.base_root.trim().to_string();
         self.log.push(format!(
             "Opened stage '{}' with {} asset(s), {} model(s), {} collision file(s).",
@@ -2755,6 +2813,62 @@ fn format_bytes_short(bytes: u64) -> String {
         format!("{:.0} KB", bytes as f64 / 1_000.0)
     } else {
         format!("{bytes} B")
+    }
+}
+
+fn content_browser_card_text(
+    archive: &SceneArchiveInfo,
+    localized: Option<&SceneArchiveLabel>,
+) -> String {
+    let mut lines = vec![archive.stage_id.clone()];
+    if let Some(stage_name) = localized.and_then(|label| label.stage_name.as_deref()) {
+        lines.push(elide_label(stage_name, 30));
+    }
+    if let Some(label) = localized {
+        if let Some(first) = label.scenario_names.first() {
+            let remaining = label.scenario_names.len().saturating_sub(1);
+            let suffix = if remaining == 0 {
+                String::new()
+            } else {
+                format!(" (+{remaining})")
+            };
+            lines.push(format!(
+                "{}{}",
+                elide_label(first, 34usize.saturating_sub(suffix.len())),
+                suffix
+            ));
+        }
+    }
+    lines.push(format_bytes_short(archive.size_bytes));
+    lines.join("\n")
+}
+
+fn content_browser_hover_text(
+    archive: &SceneArchiveInfo,
+    localized: Option<&SceneArchiveLabel>,
+) -> String {
+    let mut lines = Vec::new();
+    if let Some(stage_name) = localized.and_then(|label| label.stage_name.as_deref()) {
+        lines.push(format!("Stage: {stage_name}"));
+    }
+    if let Some(label) = localized {
+        lines.extend(label.scenario_names.iter().map(|name| format!("• {name}")));
+    }
+    if !lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines.push(archive.relative_path.display().to_string());
+    lines.push(archive.path.display().to_string());
+    lines.join("\n")
+}
+
+fn elide_label(label: &str, maximum_chars: usize) -> String {
+    let mut characters = label.chars();
+    let prefix = characters.by_ref().take(maximum_chars).collect::<String>();
+    if characters.next().is_some() {
+        format!("{prefix}…")
+    } else {
+        prefix
     }
 }
 
