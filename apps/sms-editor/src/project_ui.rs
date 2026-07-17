@@ -414,9 +414,13 @@ impl SmsEditorApp {
     }
 
     pub(super) fn persist_project_settings(&mut self, announce: bool) -> bool {
+        let saved_camera = self.current_project_camera_state();
         let Some(project) = &mut self.current_project else {
             return false;
         };
+        if let Some((stage_id, camera)) = saved_camera {
+            project.descriptor.stage_cameras.insert(stage_id, camera);
+        }
         project.descriptor.name = self.project_name_draft.trim().to_string();
         project.descriptor.base_game_root = PathBuf::from(self.base_root.trim());
         project.descriptor.schema_source_root = optional_path(&self.repo_root);
@@ -428,6 +432,7 @@ impl SmsEditorApp {
         };
         match project.save() {
             Ok(()) => {
+                self.camera_state_save_pending = false;
                 if let Err(error) = self.recent_projects.touch(project) {
                     self.log.push(error);
                 }
@@ -443,6 +448,77 @@ impl SmsEditorApp {
                 self.log.push(error);
                 false
             }
+        }
+    }
+
+    fn current_project_camera_state(&self) -> Option<(String, ProjectCameraState)> {
+        let stage_id = self.stage_id.trim();
+        let document = self.document.as_ref()?;
+        if stage_id.is_empty() || document.stage_id != stage_id {
+            return None;
+        }
+        let camera = self.renderer.camera();
+        let state = ProjectCameraState {
+            focus: camera.focus,
+            distance: camera.distance,
+            yaw_degrees: camera.yaw_degrees,
+            pitch_degrees: camera.pitch_degrees,
+            viewport_pan: [self.viewport_pan.x, self.viewport_pan.y],
+            viewport_zoom: self.viewport_zoom,
+            camera_speed: self.camera_speed,
+        };
+        state.is_valid().then(|| (stage_id.to_string(), state))
+    }
+
+    pub(super) fn restore_project_camera_state(&mut self) -> bool {
+        let stage_id = self.stage_id.trim();
+        let Some(state) = self
+            .current_project
+            .as_ref()
+            .and_then(|project| project.descriptor.stage_cameras.get(stage_id))
+            .cloned()
+        else {
+            return false;
+        };
+        if !state.is_valid() {
+            self.log.push(format!(
+                "Ignored invalid saved camera for stage '{stage_id}'."
+            ));
+            return false;
+        }
+        let camera = self.renderer.camera_mut();
+        camera.focus = state.focus;
+        camera.distance = state.distance.max(50.0);
+        camera.yaw_degrees = state.yaw_degrees;
+        camera.pitch_degrees = state.pitch_degrees.clamp(-89.0, 89.0);
+        self.viewport_pan = egui::vec2(state.viewport_pan[0], state.viewport_pan[1]);
+        self.viewport_zoom = state.viewport_zoom.clamp(0.05, 20.0);
+        self.camera_speed = state.camera_speed.clamp(0.01, 8.0);
+        self.camera_state_save_pending = false;
+        self.log
+            .push(format!("Restored camera for stage '{stage_id}'."));
+        true
+    }
+
+    pub(super) fn queue_camera_state_save(&mut self) {
+        if self.current_project.is_some() && self.document.is_some() {
+            self.camera_state_save_pending = true;
+            self.camera_state_changed_at = Instant::now();
+        }
+    }
+
+    pub(super) fn persist_camera_state_if_due(&mut self) {
+        if self.camera_state_save_pending
+            && self.camera_state_changed_at.elapsed() >= Duration::from_millis(750)
+            && !self.persist_project_settings(false)
+        {
+            self.camera_state_changed_at = Instant::now();
+        }
+    }
+
+    pub(super) fn flush_camera_state(&mut self) {
+        if self.camera_state_save_pending {
+            self.persist_project_settings(false);
         }
     }
 
@@ -595,6 +671,9 @@ impl SmsEditorApp {
         self.redo_stack.clear();
         self.undo_transaction = None;
         self.pending_stage_open = None;
+        self.camera_state_save_pending = false;
+        self.hovered_gizmo_axis = None;
+        self.gizmo_drag = None;
         self.last_scanned_base_root.clear();
         self.last_auto_refresh_attempt_root.clear();
     }

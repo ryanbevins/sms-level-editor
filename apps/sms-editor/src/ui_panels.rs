@@ -2,7 +2,7 @@ use super::*;
 
 impl SmsEditorApp {
     pub(super) fn toolbar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_wrapped(|ui| {
+        ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
 
             ui.menu_button("File", |ui| {
@@ -58,29 +58,116 @@ impl SmsEditorApp {
                     self.launch_dolphin();
                 }
             });
-            if let Some(project) = &self.current_project {
-                ui.label(
-                    egui::RichText::new(&project.descriptor.name)
-                        .strong()
-                        .color(egui::Color32::from_rgb(159, 208, 201)),
-                );
-            }
-            ui.separator();
+            ui.menu_button("Edit", |ui| {
+                if ui.button("Project Settings...").clicked() {
+                    ui.close();
+                    self.show_project_settings = true;
+                }
+                ui.separator();
+                ui.checkbox(&mut self.show_stats, "Show Stats");
+                if ui
+                    .checkbox(&mut self.show_console, "Show Console")
+                    .changed()
+                {
+                    if self.show_console {
+                        self.bottom_tab = BottomTab::Console;
+                    } else if self.bottom_tab == BottomTab::Console {
+                        self.bottom_tab = BottomTab::Content;
+                    }
+                }
+            });
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let (warnings, errors) = self.issue_counts();
+                let color = if errors > 0 {
+                    egui::Color32::from_rgb(255, 116, 104)
+                } else if warnings > 0 {
+                    egui::Color32::from_rgb(235, 190, 92)
+                } else {
+                    egui::Color32::from_rgb(111, 220, 168)
+                };
+                let issue_button = egui::Button::new(
+                    egui::RichText::new(format!("{warnings} warnings  {errors} errors"))
+                        .color(color)
+                        .strong(),
+                )
+                .fill(egui::Color32::from_rgb(37, 42, 43))
+                .stroke(egui::Stroke::new(1.4, color));
+                if ui
+                    .add(issue_button)
+                    .on_hover_text("Open validation issues")
+                    .clicked()
+                {
+                    self.show_issues = true;
+                }
+                if self.is_dirty() {
+                    ui.colored_label(egui::Color32::from_rgb(245, 190, 90), "Unsaved changes");
+                }
+                if let Some(label) = &self.background_label {
+                    ui.label(label);
+                    ui.spinner();
+                }
+            });
+        });
+    }
+
+    pub(super) fn viewport_toolbar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(5.0, 4.0);
             for tool in [
                 EditorTool::Select,
                 EditorTool::Move,
                 EditorTool::Rotate,
                 EditorTool::Scale,
-                EditorTool::Place,
             ] {
                 if ui
                     .selectable_label(self.tool == tool, tool.label())
-                    .on_hover_text(format!("{} tool", tool.label()))
+                    .on_hover_text(format!("{} tool ({})", tool.label(), tool_shortcut(tool)))
                     .clicked()
                 {
                     self.tool = tool;
                 }
             }
+
+            ui.separator();
+            if ui
+                .selectable_label(
+                    self.snap_enabled,
+                    if self.snap_enabled {
+                        "Snapping On"
+                    } else {
+                        "Snapping Off"
+                    },
+                )
+                .on_hover_text("Enable or disable transform snapping")
+                .clicked()
+            {
+                self.snap_enabled = !self.snap_enabled;
+            }
+            ui.add_enabled_ui(self.snap_enabled, |ui| {
+                ui.add(
+                    egui::DragValue::new(&mut self.snap_translation)
+                        .range(0.01..=100_000.0)
+                        .speed(5.0)
+                        .prefix("Move "),
+                )
+                .on_hover_text("Translation snap interval");
+                ui.add(
+                    egui::DragValue::new(&mut self.snap_rotation)
+                        .range(0.01..=360.0)
+                        .speed(1.0)
+                        .prefix("Rotate ")
+                        .suffix("°"),
+                )
+                .on_hover_text("Rotation snap interval");
+                ui.add(
+                    egui::DragValue::new(&mut self.snap_scale)
+                        .range(0.001..=100.0)
+                        .speed(0.01)
+                        .prefix("Scale "),
+                )
+                .on_hover_text("Scale snap interval");
+            });
 
             ui.separator();
             for mode in [ViewMode::Lit, ViewMode::Collision, ViewMode::Objects] {
@@ -130,75 +217,73 @@ impl SmsEditorApp {
                     self.level_transform_progress = 0.0;
                 }
             }
-
-            ui.separator();
-            if ui
-                .add_enabled(self.can_undo(), egui::Button::new("Undo"))
-                .clicked()
-            {
-                self.undo();
-            }
-            if ui
-                .add_enabled(self.can_redo(), egui::Button::new("Redo"))
-                .clicked()
-            {
-                self.redo();
-            }
-
-            ui.separator();
-            if let Some(label) = &self.background_label {
-                ui.spinner();
-                ui.label(label);
-                ui.separator();
-            }
-            if self.is_dirty() {
-                ui.colored_label(egui::Color32::from_rgb(245, 190, 90), "Unsaved changes");
-            }
-            ui.separator();
-            let (warnings, errors) = self.issue_counts();
-            ui.colored_label(
-                if errors > 0 {
-                    egui::Color32::from_rgb(255, 116, 104)
-                } else if warnings > 0 {
-                    egui::Color32::from_rgb(235, 190, 92)
-                } else {
-                    egui::Color32::from_rgb(111, 220, 168)
-                },
-                format!("{} warnings  {} errors", warnings, errors),
-            );
         });
-    }
-
-    pub(super) fn left_dock(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.left_tab, LeftTab::Project, "Project");
-            ui.selectable_value(&mut self.left_tab, LeftTab::Content, "Content");
-            ui.selectable_value(&mut self.left_tab, LeftTab::Palette, "Palette");
-            ui.selectable_value(&mut self.left_tab, LeftTab::Outliner, "Outliner");
-        });
-        ui.separator();
-
-        match self.left_tab {
-            LeftTab::Project => self.project_panel(ui),
-            LeftTab::Content => self.content_browser_panel(ui),
-            LeftTab::Palette => self.palette_panel(ui),
-            LeftTab::Outliner => self.outliner_panel(ui),
-        }
     }
 
     pub(super) fn right_dock(&mut self, ui: &mut egui::Ui) {
+        let available_height = ui.available_height();
+        let outliner_height = (available_height * 0.44)
+            .max(150.0)
+            .min((available_height - 170.0).max(150.0));
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), outliner_height),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| self.outliner_panel(ui),
+        );
+        ui.separator();
+        egui::ScrollArea::vertical()
+            .id_salt("inspector-scroll")
+            .show(ui, |ui| self.inspector_panel(ui));
+    }
+
+    pub(super) fn bottom_dock(&mut self, ui: &mut egui::Ui) {
+        if !self.show_console && self.bottom_tab == BottomTab::Console {
+            self.bottom_tab = BottomTab::Content;
+        }
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.right_tab, RightTab::Inspector, "Inspector");
-            ui.selectable_value(&mut self.right_tab, RightTab::Assets, "Assets");
-            ui.selectable_value(&mut self.right_tab, RightTab::Issues, "Issues");
+            ui.selectable_value(&mut self.bottom_tab, BottomTab::Content, "Content Browser");
+            ui.selectable_value(&mut self.bottom_tab, BottomTab::Palette, "Object Palette");
+            if self.show_console {
+                ui.selectable_value(&mut self.bottom_tab, BottomTab::Console, "Console");
+            }
         });
         ui.separator();
 
-        match self.right_tab {
-            RightTab::Inspector => self.inspector_panel(ui),
-            RightTab::Assets => self.assets_panel(ui),
-            RightTab::Issues => self.issues_panel(ui),
+        match self.bottom_tab {
+            BottomTab::Content => self.content_browser_panel(ui),
+            BottomTab::Palette => self.palette_panel(ui),
+            BottomTab::Console => self.console(ui),
         }
+    }
+
+    pub(super) fn project_settings_window(&mut self, ctx: &egui::Context) {
+        if !self.show_project_settings {
+            return;
+        }
+        let mut open = self.show_project_settings;
+        egui::Window::new("Project Settings")
+            .open(&mut open)
+            .default_width(580.0)
+            .default_height(680.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| self.project_panel(ui));
+            });
+        self.show_project_settings = open;
+    }
+
+    pub(super) fn issues_window(&mut self, ctx: &egui::Context) {
+        if !self.show_issues {
+            return;
+        }
+        let mut open = self.show_issues;
+        egui::Window::new("Validation Issues")
+            .open(&mut open)
+            .default_width(680.0)
+            .default_height(440.0)
+            .resizable(true)
+            .show(ctx, |ui| self.issues_panel(ui));
+        self.show_issues = open;
     }
 
     pub(super) fn project_panel(&mut self, ui: &mut egui::Ui) {
@@ -375,25 +460,6 @@ impl SmsEditorApp {
         }
 
         ui.separator();
-        ui.heading("Snap");
-        ui.checkbox(&mut self.snap_enabled, "Enabled");
-        ui.add(
-            egui::DragValue::new(&mut self.snap_translation)
-                .speed(5.0)
-                .prefix("Move "),
-        );
-        ui.add(
-            egui::DragValue::new(&mut self.snap_rotation)
-                .speed(1.0)
-                .prefix("Rotate "),
-        );
-        ui.add(
-            egui::DragValue::new(&mut self.snap_scale)
-                .speed(0.01)
-                .prefix("Scale "),
-        );
-
-        ui.separator();
         ui.heading("Dolphin");
         let choose_dolphin =
             path_display_row(ui, "Executable", &self.dolphin_path, "Browse...", true);
@@ -443,36 +509,24 @@ impl SmsEditorApp {
     }
 
     pub(super) fn content_browser_panel(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Content Browser");
-        ui.add_space(4.0);
-        if path_display_row(
-            ui,
-            "Extracted Game",
-            &self.base_root,
-            "Browse...",
-            self.document.is_none() && self.background_receiver.is_none(),
-        ) {
-            self.choose_base_game_root();
-        }
-
         ui.horizontal(|ui| {
-            let can_scan = PathBuf::from(self.base_root.trim()).exists();
-            if command_button(ui, "Scan", can_scan).clicked() {
-                self.scan_scenes();
-            }
-            if command_button(ui, "Open", !self.stage_id.trim().is_empty()).clicked() {
-                self.request_open_stage(self.stage_id.clone());
-            }
-        });
-
-        ui.separator();
-        ui.horizontal(|ui| {
-            ui.label("Scenes");
-            ui.text_edit_singleline(&mut self.scene_filter);
+            ui.heading("Content Browser");
+            ui.add_space(8.0);
+            ui.label("Search");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.scene_filter)
+                    .desired_width(240.0)
+                    .hint_text("Stage or archive path"),
+            );
         });
         ui.small(format!(
-            "{} scene archive(s)  current: {}",
+            "{} stage{} from this project's extracted game  |  current: {}",
             self.scene_archives.len(),
+            if self.scene_archives.len() == 1 {
+                ""
+            } else {
+                "s"
+            },
             if self.stage_id.trim().is_empty() {
                 "none"
             } else {
@@ -499,37 +553,68 @@ impl SmsEditorApp {
             .collect();
 
         let mut open_archive = None;
-        let mut current_group = String::new();
         egui::ScrollArea::vertical().show(ui, |ui| {
-            for archive in archives {
-                if archive.group != current_group {
-                    current_group = archive.group.clone();
-                    ui.add_space(4.0);
-                    ui.label(
-                        egui::RichText::new(if current_group.is_empty() {
-                            "Ungrouped"
-                        } else {
-                            current_group.as_str()
-                        })
-                        .strong()
-                        .color(egui::Color32::from_rgb(159, 208, 201)),
-                    );
-                }
-
-                let selected = self.stage_id.eq_ignore_ascii_case(&archive.stage_id);
-                let label = format!(
-                    "{}    {}",
-                    archive.stage_id,
-                    format_bytes_short(archive.size_bytes)
+            let mut start = 0;
+            while start < archives.len() {
+                let group = archives[start].group.clone();
+                let end = archives[start..]
+                    .iter()
+                    .position(|archive| archive.group != group)
+                    .map_or(archives.len(), |offset| start + offset);
+                let layout = content_browser_layout(ui.available_width(), end - start);
+                ui.add_space(5.0);
+                ui.label(
+                    egui::RichText::new(if group.is_empty() {
+                        "Ungrouped"
+                    } else {
+                        group.as_str()
+                    })
+                    .strong()
+                    .color(egui::Color32::from_rgb(159, 208, 201)),
                 );
-                let response = ui
-                    .selectable_label(selected, label)
-                    .on_hover_text(archive.path.display().to_string());
-                ui.small(archive.relative_path.display().to_string());
-                ui.separator();
+                ui.add_space(3.0);
+                egui::Grid::new(("content-browser-grid", group.as_str()))
+                    .num_columns(layout.columns)
+                    .min_col_width(layout.card_width)
+                    .max_col_width(layout.card_width)
+                    .spacing(egui::vec2(8.0, 8.0))
+                    .show(ui, |ui| {
+                        for (index, archive) in archives[start..end].iter().enumerate() {
+                            let selected = self.stage_id.eq_ignore_ascii_case(&archive.stage_id);
+                            let label = format!(
+                                "{}\n{}",
+                                archive.stage_id,
+                                format_bytes_short(archive.size_bytes)
+                            );
+                            let response = ui
+                                .add_sized(
+                                    [layout.card_width, 52.0],
+                                    egui::Button::selectable(selected, label),
+                                )
+                                .on_hover_text(format!(
+                                    "{}\n{}",
+                                    archive.relative_path.display(),
+                                    archive.path.display()
+                                ));
+                            if response.clicked() {
+                                open_archive = Some(archive.clone());
+                            }
+                            if (index + 1) % layout.columns == 0 {
+                                ui.end_row();
+                            }
+                        }
+                    });
+                start = end;
+            }
 
-                if response.clicked() {
-                    open_archive = Some(archive);
+            if archives.is_empty() {
+                if self.background_receiver.is_some() {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Discovering stages from the project game root...");
+                    });
+                } else {
+                    ui.label("No stages match the current search.");
                 }
             }
         });
@@ -647,7 +732,6 @@ impl SmsEditorApp {
         });
         if let Some(id) = clicked_id {
             self.selected_object_id = Some(id);
-            self.right_tab = RightTab::Inspector;
         }
     }
 
@@ -676,14 +760,6 @@ impl SmsEditorApp {
                 self.begin_undo_transaction();
             }
             if edit.changed {
-                if self.snap_enabled {
-                    snap_transform(
-                        &mut transform,
-                        self.snap_translation,
-                        self.snap_rotation,
-                        self.snap_scale,
-                    );
-                }
                 self.update_selected_transform(transform);
             }
             if edit.stopped {
@@ -726,39 +802,6 @@ impl SmsEditorApp {
         }
     }
 
-    pub(super) fn assets_panel(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Assets");
-        if let Some(document) = &self.document {
-            let scene = self.render_scene.as_ref();
-            ui.label(format!(
-                "{} scanned assets  {} models  {} collision",
-                document.assets.len(),
-                scene.map_or(0, |scene| scene.model_paths.len()),
-                scene.map_or(0, |scene| scene.collision_paths.len())
-            ));
-            if let Some(preview) = &self.model_preview {
-                ui.label(format!(
-                    "Preview: {} model(s), {} shown point(s), {} source vertex/vertices, {} failed",
-                    preview.loaded_models,
-                    preview.points.len(),
-                    preview.source_vertices,
-                    preview.failed_models
-                ));
-            }
-            ui.separator();
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                for asset in document.assets.iter().take(400) {
-                    ui.horizontal(|ui| {
-                        ui.monospace(format!("{:?}", asset.kind));
-                        ui.label(asset.path.display().to_string());
-                    });
-                }
-            });
-        } else {
-            ui.label("No stage open.");
-        }
-    }
-
     pub(super) fn issues_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("Validation");
         if self.issues.is_empty() {
@@ -794,5 +837,15 @@ impl SmsEditorApp {
                     ui.label(line);
                 }
             });
+    }
+}
+
+fn tool_shortcut(tool: EditorTool) -> &'static str {
+    match tool {
+        EditorTool::Select => "Q",
+        EditorTool::Move => "W",
+        EditorTool::Rotate => "E",
+        EditorTool::Scale => "R",
+        EditorTool::Place => "Object Palette",
     }
 }

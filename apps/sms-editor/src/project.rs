@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
@@ -26,7 +27,44 @@ pub(super) struct ProjectLaunchConfiguration {
     pub(super) dolphin_user_directory: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(super) struct ProjectCameraState {
+    pub(super) focus: [f32; 3],
+    pub(super) distance: f32,
+    pub(super) yaw_degrees: f32,
+    pub(super) pitch_degrees: f32,
+    #[serde(default)]
+    pub(super) viewport_pan: [f32; 2],
+    #[serde(default = "default_viewport_zoom")]
+    pub(super) viewport_zoom: f32,
+    #[serde(default = "default_camera_speed")]
+    pub(super) camera_speed: f32,
+}
+
+impl ProjectCameraState {
+    pub(super) fn is_valid(&self) -> bool {
+        self.focus.iter().all(|value| value.is_finite())
+            && self.distance.is_finite()
+            && self.distance > 0.0
+            && self.yaw_degrees.is_finite()
+            && self.pitch_degrees.is_finite()
+            && self.viewport_pan.iter().all(|value| value.is_finite())
+            && self.viewport_zoom.is_finite()
+            && self.viewport_zoom > 0.0
+            && self.camera_speed.is_finite()
+            && self.camera_speed > 0.0
+    }
+}
+
+fn default_viewport_zoom() -> f32 {
+    1.0
+}
+
+fn default_camera_speed() -> f32 {
+    1.0
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(super) struct SmsProjectFile {
     pub(super) format_version: u32,
     pub(super) kind: String,
@@ -39,6 +77,8 @@ pub(super) struct SmsProjectFile {
     pub(super) schema_source_root: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) last_stage: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(super) stage_cameras: BTreeMap<String, ProjectCameraState>,
     #[serde(default)]
     pub(super) launch: ProjectLaunchConfiguration,
 }
@@ -60,6 +100,7 @@ impl SmsProjectFile {
             project_data_root,
             schema_source_root,
             last_stage: None,
+            stage_cameras: BTreeMap::new(),
             launch: ProjectLaunchConfiguration::default(),
         }
     }
@@ -161,6 +202,18 @@ impl SmsProjectFile {
         }
         if self.project_id.trim().is_empty() {
             return Err(format!("Project '{}' has no project id", path.display()));
+        }
+        if self.stage_cameras.iter().any(|(stage, camera)| {
+            stage.trim().is_empty()
+                || !stage
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || "_-".contains(character))
+                || !camera.is_valid()
+        }) {
+            return Err(format!(
+                "Project '{}' has an invalid saved stage camera",
+                path.display()
+            ));
         }
         if self.base_game_root.as_os_str().is_empty() {
             return Err(format!(
@@ -569,11 +622,23 @@ mod tests {
         let root = temporary_path("round-trip");
         fs::create_dir_all(&root).unwrap();
         let descriptor_path = root.join("Isle Delfino.sms");
-        let project = SmsProjectFile::new(
+        let mut project = SmsProjectFile::new(
             "Isle Delfino",
             PathBuf::from(r"C:\Games\SunshineJPExtract"),
             PathBuf::from("Isle Delfino.smsdata"),
             Some(PathBuf::from(r"C:\src\sms")),
+        );
+        project.stage_cameras.insert(
+            "dolpic0".to_string(),
+            ProjectCameraState {
+                focus: [100.0, 200.0, 300.0],
+                distance: 4_000.0,
+                yaw_degrees: 215.0,
+                pitch_degrees: -28.0,
+                viewport_pan: [12.0, -8.0],
+                viewport_zoom: 1.25,
+                camera_speed: 0.75,
+            },
         );
 
         project.save(&descriptor_path).unwrap();

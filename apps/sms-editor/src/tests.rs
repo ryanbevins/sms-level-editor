@@ -1,5 +1,28 @@
 use super::*;
 
+#[test]
+fn editor_layout_defaults_to_the_unreal_style_workspace() {
+    let app = SmsEditorApp::default();
+
+    assert_eq!(app.bottom_tab, BottomTab::Content);
+    assert!(!app.show_project_settings);
+    assert!(!app.show_issues);
+    assert!(!app.show_console);
+    assert!(!app.show_stats);
+}
+
+#[test]
+fn content_browser_layout_wraps_to_the_available_width() {
+    let narrow = content_browser_layout(360.0, 20);
+    let wide = content_browser_layout(1_240.0, 20);
+    let sparse = content_browser_layout(1_240.0, 3);
+
+    assert_eq!(narrow.columns, 2);
+    assert!(wide.columns > narrow.columns);
+    assert_eq!(sparse.columns, 3);
+    assert!((150.0..=260.0).contains(&wide.card_width));
+}
+
 fn assert_vec3_close(actual: [f32; 3], expected: [f32; 3]) {
     for (actual, expected) in actual.into_iter().zip(expected) {
         assert!(
@@ -110,6 +133,45 @@ fn fly_camera_velocity_interpolates_in_and_out() {
         viewport_ui::interpolate_camera_velocity(accelerated_again, [0.0; 3], 1.0 / 60.0, 12.0);
     assert!(decelerated[0] > 0.0);
     assert!(decelerated[0] < accelerated_again[0]);
+}
+
+#[test]
+fn project_camera_state_restores_the_last_stage_view() {
+    let mut project = SmsProjectFile::new(
+        "Camera Test",
+        PathBuf::from(r"C:\Games\SunshineJPExtract"),
+        PathBuf::from("Camera Test.smsdata"),
+        None,
+    );
+    project.stage_cameras.insert(
+        "bianco2".to_string(),
+        ProjectCameraState {
+            focus: [120.0, 340.0, 560.0],
+            distance: 7_500.0,
+            yaw_degrees: 135.0,
+            pitch_degrees: -22.0,
+            viewport_pan: [14.0, -9.0],
+            viewport_zoom: 1.4,
+            camera_speed: 0.5,
+        },
+    );
+    let mut app = SmsEditorApp {
+        current_project: Some(OpenProject {
+            descriptor_path: PathBuf::from("Camera Test.sms"),
+            descriptor: project,
+        }),
+        stage_id: "bianco2".to_string(),
+        ..SmsEditorApp::default()
+    };
+
+    assert!(app.restore_project_camera_state());
+    assert_vec3_close(app.renderer.camera().focus, [120.0, 340.0, 560.0]);
+    assert_eq!(app.renderer.camera().distance, 7_500.0);
+    assert_eq!(app.renderer.camera().yaw_degrees, 135.0);
+    assert_eq!(app.renderer.camera().pitch_degrees, -22.0);
+    assert_eq!(app.viewport_pan, egui::vec2(14.0, -9.0));
+    assert_eq!(app.viewport_zoom, 1.4);
+    assert_eq!(app.camera_speed, 0.5);
 }
 
 #[test]
@@ -1423,32 +1485,82 @@ fn alt_orbit_uses_same_horizontal_yaw_sign() {
 }
 
 #[test]
-fn move_drag_uses_camera_relative_ground_plane() {
-    let app = camera_app();
-    let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+fn gizmo_move_snaps_only_the_dragged_axis() {
+    let drag = GizmoDrag {
+        axis: GizmoAxis::X,
+        tool: EditorTool::Move,
+        start_pointer: egui::pos2(100.0, 100.0),
+        screen_origin: egui::pos2(100.0, 100.0),
+        screen_direction: egui::vec2(1.0, 0.0),
+        world_units_per_pixel: 1.0,
+        start_transform: Transform {
+            translation: [13.0, 17.0, 23.0],
+            rotation_degrees: [7.0, 11.0, 19.0],
+            scale: [1.1, 1.2, 1.3],
+        },
+    };
 
-    let right_drag = app.viewport_drag_move_delta(rect, egui::vec2(10.0, 0.0));
-    let up_drag = app.viewport_drag_move_delta(rect, egui::vec2(0.0, -10.0));
+    let transformed = viewport_ui::transform_from_gizmo_drag(
+        drag,
+        egui::pos2(160.0, 100.0),
+        true,
+        50.0,
+        15.0,
+        0.1,
+    );
 
-    assert!(right_drag[0] < 0.0);
-    assert!(right_drag[2].abs() < 0.001);
-    assert!(up_drag[2] > 0.0);
-    assert!(up_drag[0].abs() < 0.001);
+    assert_eq!(transformed.translation, [50.0, 17.0, 23.0]);
+    assert_eq!(transformed.rotation_degrees, [7.0, 11.0, 19.0]);
+    assert_eq!(transformed.scale, [1.1, 1.2, 1.3]);
 }
 
 #[test]
-fn move_drag_rotates_with_camera_yaw() {
-    let mut app = camera_app();
-    app.renderer.camera_mut().yaw_degrees = 90.0;
-    let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+fn gizmo_rotate_and_scale_edit_only_the_active_axis() {
+    let start_transform = Transform {
+        translation: [13.0, 17.0, 23.0],
+        rotation_degrees: [7.0, 11.0, 19.0],
+        scale: [1.1, 1.2, 1.3],
+    };
+    let rotated = viewport_ui::transform_from_gizmo_drag(
+        GizmoDrag {
+            axis: GizmoAxis::Y,
+            tool: EditorTool::Rotate,
+            start_pointer: egui::pos2(164.0, 100.0),
+            screen_origin: egui::pos2(100.0, 100.0),
+            screen_direction: egui::vec2(1.0, 0.0),
+            world_units_per_pixel: 1.0,
+            start_transform,
+        },
+        egui::pos2(100.0, 164.0),
+        true,
+        50.0,
+        15.0,
+        0.1,
+    );
+    let scaled = viewport_ui::transform_from_gizmo_drag(
+        GizmoDrag {
+            axis: GizmoAxis::Z,
+            tool: EditorTool::Scale,
+            start_pointer: egui::pos2(100.0, 100.0),
+            screen_origin: egui::pos2(100.0, 100.0),
+            screen_direction: egui::vec2(0.0, 1.0),
+            world_units_per_pixel: 1.0,
+            start_transform,
+        },
+        egui::pos2(100.0, 160.0),
+        true,
+        50.0,
+        15.0,
+        0.1,
+    );
 
-    let right_drag = app.viewport_drag_move_delta(rect, egui::vec2(10.0, 0.0));
-    let up_drag = app.viewport_drag_move_delta(rect, egui::vec2(0.0, -10.0));
-
-    assert!(right_drag[2] > 0.0);
-    assert!(right_drag[0].abs() < 0.001);
-    assert!(up_drag[0] > 0.0);
-    assert!(up_drag[2].abs() < 0.001);
+    assert_eq!(rotated.rotation_degrees, [7.0, 105.0, 19.0]);
+    assert_eq!(rotated.translation, start_transform.translation);
+    assert_eq!(rotated.scale, start_transform.scale);
+    assert_eq!(scaled.scale[0..2], start_transform.scale[0..2]);
+    assert!(scaled.scale[2] > start_transform.scale[2]);
+    assert_eq!(scaled.translation, start_transform.translation);
+    assert_eq!(scaled.rotation_degrees, start_transform.rotation_degrees);
 }
 
 #[test]

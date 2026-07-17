@@ -396,24 +396,6 @@ impl SmsEditorApp {
         }
     }
 
-    pub(super) fn nudge_selected(&mut self, delta: [f32; 3]) {
-        let Some(mut object) = self.selected_object().cloned() else {
-            return;
-        };
-        for (value, add) in object.transform.translation.iter_mut().zip(delta) {
-            *value += add;
-        }
-        if self.snap_enabled {
-            snap_transform(
-                &mut object.transform,
-                self.snap_translation,
-                self.snap_rotation,
-                self.snap_scale,
-            );
-        }
-        self.update_selected_transform(object.transform);
-    }
-
     #[cfg(test)]
     pub(super) fn mutate_document(&mut self, label: &str, mutate: impl FnOnce(&mut StageDocument)) {
         let in_transaction = self.undo_transaction.is_some();
@@ -588,14 +570,6 @@ impl SmsEditorApp {
         self.ensure_selection_exists();
         self.rebuild_model_preview_from_document();
         self.log.push("Redo.".to_string());
-    }
-
-    pub(super) fn can_undo(&self) -> bool {
-        !self.undo_stack.is_empty()
-    }
-
-    pub(super) fn can_redo(&self) -> bool {
-        !self.redo_stack.is_empty()
     }
 
     pub(super) fn is_dirty(&self) -> bool {
@@ -860,6 +834,7 @@ impl SmsEditorApp {
         if let Some(object) = self.selected_object() {
             self.renderer.camera_mut().focus = object.transform.translation;
             self.viewport_pan = egui::Vec2::ZERO;
+            self.queue_camera_state_save();
         }
     }
 
@@ -873,6 +848,7 @@ impl SmsEditorApp {
             camera.yaw_degrees = self.startup_camera_yaw.unwrap_or(222.0);
             camera.pitch_degrees = self.startup_camera_pitch.unwrap_or(-30.0);
             camera.distance = (preview.radius() * 4.2).clamp(2500.0, 600_000.0);
+            self.queue_camera_state_save();
             return;
         }
 
@@ -881,6 +857,7 @@ impl SmsEditorApp {
         camera.yaw_degrees = self.startup_camera_yaw.unwrap_or(222.0);
         camera.pitch_degrees = self.startup_camera_pitch.unwrap_or(-30.0);
         camera.distance = 7000.0;
+        self.queue_camera_state_save();
     }
 
     pub(super) fn apply_startup_camera_focus(&mut self) {

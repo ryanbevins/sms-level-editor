@@ -6,7 +6,7 @@ use std::sync::{
     Arc,
 };
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use sms_formats::{
@@ -69,6 +69,50 @@ enum EditorTool {
     Place,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GizmoAxis {
+    X,
+    Y,
+    Z,
+}
+
+impl GizmoAxis {
+    fn index(self) -> usize {
+        match self {
+            Self::X => 0,
+            Self::Y => 1,
+            Self::Z => 2,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::X => "X",
+            Self::Y => "Y",
+            Self::Z => "Z",
+        }
+    }
+
+    fn world_direction(self) -> [f32; 3] {
+        match self {
+            Self::X => [1.0, 0.0, 0.0],
+            Self::Y => [0.0, 1.0, 0.0],
+            Self::Z => [0.0, 0.0, 1.0],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GizmoDrag {
+    axis: GizmoAxis,
+    tool: EditorTool,
+    start_pointer: egui::Pos2,
+    screen_origin: egui::Pos2,
+    screen_direction: egui::Vec2,
+    world_units_per_pixel: f32,
+    start_transform: Transform,
+}
+
 impl EditorTool {
     fn label(self) -> &'static str {
         match self {
@@ -99,18 +143,10 @@ impl ViewMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LeftTab {
-    Project,
+enum BottomTab {
     Content,
     Palette,
-    Outliner,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RightTab {
-    Inspector,
-    Assets,
-    Issues,
+    Console,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -329,8 +365,12 @@ struct SmsEditorApp {
     last_auto_refresh_attempt_root: String,
     tool: EditorTool,
     view_mode: ViewMode,
-    left_tab: LeftTab,
-    right_tab: RightTab,
+    bottom_tab: BottomTab,
+    show_project_settings: bool,
+    show_issues: bool,
+    show_console: bool,
+    show_stats: bool,
+    applied_window_title: String,
     snap_enabled: bool,
     snap_translation: f32,
     snap_rotation: f32,
@@ -347,6 +387,10 @@ struct SmsEditorApp {
     viewport_zoom: f32,
     camera_speed: f32,
     camera_fly_velocity: [f32; 3],
+    camera_state_save_pending: bool,
+    camera_state_changed_at: Instant,
+    hovered_gizmo_axis: Option<GizmoAxis>,
+    gizmo_drag: Option<GizmoDrag>,
     next_object_serial: u32,
     saved_objects: Vec<SceneObject>,
     document_dirty: bool,
@@ -470,8 +514,12 @@ impl Default for SmsEditorApp {
             last_auto_refresh_attempt_root: String::new(),
             tool: EditorTool::Select,
             view_mode: ViewMode::Lit,
-            left_tab: LeftTab::Content,
-            right_tab: RightTab::Inspector,
+            bottom_tab: BottomTab::Content,
+            show_project_settings: false,
+            show_issues: false,
+            show_console: false,
+            show_stats: false,
+            applied_window_title: String::new(),
             snap_enabled: true,
             snap_translation: 50.0,
             snap_rotation: 15.0,
@@ -488,6 +536,10 @@ impl Default for SmsEditorApp {
             viewport_zoom: 1.0,
             camera_speed: 1.0,
             camera_fly_velocity: [0.0; 3],
+            camera_state_save_pending: false,
+            camera_state_changed_at: Instant::now(),
+            hovered_gizmo_axis: None,
+            gizmo_drag: None,
             next_object_serial: 1,
             saved_objects: Vec::new(),
             document_dirty: false,
@@ -526,10 +578,13 @@ impl SmsEditorApp {
 impl eframe::App for SmsEditorApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_background_task(ctx);
-        if ctx.input(|input| input.viewport().close_requested())
-            && self.is_dirty()
-            && !self.close_authorized
-        {
+        self.persist_camera_state_if_due();
+        self.sync_window_title(ctx);
+        let close_requested = ctx.input(|input| input.viewport().close_requested());
+        if close_requested {
+            self.flush_camera_state();
+        }
+        if close_requested && self.is_dirty() && !self.close_authorized {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.close_confirmation_requested = true;
         }
@@ -542,10 +597,10 @@ impl eframe::App for SmsEditorApp {
             return;
         }
 
-        if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Z)) {
+        if ctx.input(|i| i.modifiers.ctrl && !i.modifiers.shift && i.key_pressed(egui::Key::Z)) {
             self.undo();
         }
-        if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Y)) {
+        if ctx.input(|i| i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::Z)) {
             self.redo();
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Delete)) {
@@ -578,28 +633,29 @@ impl eframe::App for SmsEditorApp {
         self.refresh_scene_browser_if_needed();
 
         egui::Panel::top("toolbar")
-            .default_size(48.0)
+            .default_size(34.0)
             .show(root_ui, |ui| self.toolbar(ui));
-
-        egui::Panel::left("left_dock")
-            .resizable(true)
-            .default_size(350.0)
-            .show(root_ui, |ui| self.left_dock(ui));
 
         egui::Panel::right("right_dock")
             .resizable(true)
-            .default_size(390.0)
+            .default_size(360.0)
             .show(root_ui, |ui| self.right_dock(ui));
 
-        egui::Panel::bottom("console")
+        egui::Panel::bottom("content_dock")
             .resizable(true)
-            .default_size(150.0)
-            .show(root_ui, |ui| self.console(ui));
+            .default_size(300.0)
+            .show(root_ui, |ui| self.bottom_dock(ui));
 
-        egui::CentralPanel::default().show(root_ui, |ui| self.viewport(ui));
+        egui::CentralPanel::default().show(root_ui, |ui| {
+            self.viewport_toolbar(ui);
+            ui.separator();
+            self.viewport(ui);
+        });
         if self.undo_transaction.is_some() && !root_ui.input(|input| input.pointer.primary_down()) {
             self.commit_undo_transaction("Updated transform");
         }
+        self.project_settings_window(root_ui.ctx());
+        self.issues_window(root_ui.ctx());
         self.unsaved_changes_dialog(root_ui.ctx());
     }
 }
@@ -608,6 +664,17 @@ impl SmsEditorApp {
     // Panel implementations live in ui_panels.rs.
 
     // Viewport interaction and painting live in viewport_ui.rs.
+
+    fn sync_window_title(&mut self, ctx: &egui::Context) {
+        let desired = self.current_project.as_ref().map_or_else(
+            || "SMS Editor".to_string(),
+            |project| format!("{} - SMS Editor", project.descriptor.name),
+        );
+        if self.applied_window_title != desired {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(desired.clone()));
+            self.applied_window_title = desired;
+        }
+    }
 
     fn generate_schema(&mut self) {
         if self.background_receiver.is_some() {
@@ -701,6 +768,7 @@ impl SmsEditorApp {
     }
 
     fn request_open_stage(&mut self, stage_id: String) {
+        self.flush_camera_state();
         if self.is_dirty() {
             self.pending_stage_open = Some(stage_id);
         } else {
@@ -961,6 +1029,7 @@ impl SmsEditorApp {
         self.redo_stack.clear();
         self.undo_transaction = None;
         self.reset_camera();
+        self.restore_project_camera_state();
         self.apply_startup_camera_focus();
     }
 
@@ -2225,14 +2294,6 @@ fn project_base_hash(base_root: &std::path::Path) -> u64 {
         .fold(FNV_OFFSET, |hash, byte| {
             (hash ^ u64::from(byte)).wrapping_mul(FNV_PRIME)
         })
-}
-
-fn command_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Response {
-    ui.add_enabled(
-        enabled,
-        egui::Button::new(egui::RichText::new(label).strong())
-            .fill(egui::Color32::from_rgb(48, 56, 54)),
-    )
 }
 
 mod preview_assets;
@@ -3638,6 +3699,30 @@ fn vector_drag(ui: &mut egui::Ui, values: &mut [f32; 3], speed: f32) -> VectorDr
     edit
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ContentBrowserLayout {
+    columns: usize,
+    card_width: f32,
+}
+
+fn content_browser_layout(available_width: f32, item_count: usize) -> ContentBrowserLayout {
+    const MIN_CARD_WIDTH: f32 = 150.0;
+    const MAX_CARD_WIDTH: f32 = 260.0;
+    const GAP: f32 = 8.0;
+
+    let available_width = available_width.max(MIN_CARD_WIDTH);
+    let maximum_columns =
+        (((available_width + GAP) / (MIN_CARD_WIDTH + GAP)).floor() as usize).max(1);
+    let columns = item_count.max(1).min(maximum_columns);
+    let used_gaps = GAP * columns.saturating_sub(1) as f32;
+    let card_width =
+        ((available_width - used_gaps) / columns as f32).clamp(MIN_CARD_WIDTH, MAX_CARD_WIDTH);
+    ContentBrowserLayout {
+        columns,
+        card_width,
+    }
+}
+
 fn runtime_yaw_degrees_per_frame(object: &SceneObject) -> f32 {
     let factory = object.factory_name.as_str();
     let class = object.class_name.as_deref().unwrap_or_default();
@@ -3689,24 +3774,6 @@ fn runtime_rotated_transform(
         + elapsed_seconds.max(0.0) * SMS_ANIMATION_FRAMES_PER_SECOND * yaw_degrees_per_frame)
         .rem_euclid(360.0);
     transform
-}
-
-fn snap_transform(transform: &mut Transform, translation: f32, rotation: f32, scale: f32) {
-    if translation > f32::EPSILON {
-        for value in &mut transform.translation {
-            *value = snap_value(*value, translation);
-        }
-    }
-    if rotation > f32::EPSILON {
-        for value in &mut transform.rotation_degrees {
-            *value = snap_value(*value, rotation);
-        }
-    }
-    if scale > f32::EPSILON {
-        for value in &mut transform.scale {
-            *value = snap_value(*value, scale).max(0.001);
-        }
-    }
 }
 
 fn snap_value(value: f32, step: f32) -> f32 {
