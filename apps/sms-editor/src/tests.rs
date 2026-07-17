@@ -9,6 +9,7 @@ fn editor_layout_defaults_to_the_unreal_style_workspace() {
     assert!(!app.show_issues);
     assert!(!app.show_console);
     assert!(!app.show_stats);
+    assert!(app.show_effects);
 }
 
 #[test]
@@ -21,6 +22,19 @@ fn content_browser_layout_wraps_to_the_available_width() {
     assert!(wide.columns > narrow.columns);
     assert_eq!(sparse.columns, 3);
     assert!((150.0..=260.0).contains(&wide.card_width));
+}
+
+#[test]
+fn window_title_includes_the_project_and_open_level() {
+    assert_eq!(
+        editor_window_title(Some("Sunshine US"), Some("bianco3")),
+        "Sunshine US - bianco3 - SMS Editor"
+    );
+    assert_eq!(
+        editor_window_title(Some("Sunshine US"), None),
+        "Sunshine US - SMS Editor"
+    );
+    assert_eq!(editor_window_title(None, None), "SMS Editor");
 }
 
 fn assert_vec3_close(actual: [f32; 3], expected: [f32; 3]) {
@@ -1598,6 +1612,22 @@ fn authored_water_reflections_follow_environment_visibility() {
         preview_render_layer_for_model_path(reflect_sky),
         PreviewRenderLayer::MirrorScene
     );
+}
+
+#[test]
+fn shimmer_models_are_controlled_by_effect_visibility() {
+    let path = "stage.szs!/mapobj/shimmerhi.bmd";
+
+    assert_eq!(
+        preview_render_layer_for_model_path(path),
+        PreviewRenderLayer::Heatwave
+    );
+    assert!(preview_render_layer_is_effect(PreviewRenderLayer::Heatwave));
+    assert!(preview_render_layer_is_effect(PreviewRenderLayer::Particle));
+    assert!(preview_render_layer_is_effect(
+        PreviewRenderLayer::ParticleDistortion
+    ));
+    assert!(!preview_render_layer_is_effect(PreviewRenderLayer::Main));
 }
 
 #[test]

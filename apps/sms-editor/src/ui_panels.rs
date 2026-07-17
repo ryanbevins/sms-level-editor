@@ -377,17 +377,21 @@ impl SmsEditorApp {
             .changed();
         let goop_changed = ui.checkbox(&mut self.show_goop_meshes, "Goop").changed();
         let effects_changed = ui
-            .checkbox(&mut self.show_effect_meshes, "Effects")
+            .checkbox(&mut self.show_effects, "Effects")
+            .on_hover_text("Show particle systems and effect-only scene models")
             .changed();
         if environment_changed || goop_changed || effects_changed {
-            let model_preview = self.document.as_ref().and_then(|document| {
-                SmsEditorApp::build_model_preview(document, self.preview_visibility())
-            });
-            self.model_preview = model_preview;
-            self.last_level_transform_progress_bits = u32::MAX;
-            self.rebuild_gpu_viewport_scene();
-            self.clear_viewport_preview_cache();
-            self.reset_camera();
+            self.rebuild_model_preview_from_document();
+            if effects_changed {
+                self.log.push(format!(
+                    "Effect previews {}.",
+                    if self.show_effects {
+                        "enabled"
+                    } else {
+                        "hidden"
+                    }
+                ));
+            }
         }
         ui.add(egui::Slider::new(&mut self.viewport_zoom, 0.35..=2.5).text("Zoom"));
         ui.add(egui::Slider::new(&mut self.camera_speed, 0.01..=8.0).text("Speed"))
@@ -554,58 +558,38 @@ impl SmsEditorApp {
 
         let mut open_archive = None;
         egui::ScrollArea::vertical().show(ui, |ui| {
-            let mut start = 0;
-            while start < archives.len() {
-                let group = archives[start].group.clone();
-                let end = archives[start..]
-                    .iter()
-                    .position(|archive| archive.group != group)
-                    .map_or(archives.len(), |offset| start + offset);
-                let layout = content_browser_layout(ui.available_width(), end - start);
-                ui.add_space(5.0);
-                ui.label(
-                    egui::RichText::new(if group.is_empty() {
-                        "Ungrouped"
-                    } else {
-                        group.as_str()
-                    })
-                    .strong()
-                    .color(egui::Color32::from_rgb(159, 208, 201)),
-                );
-                ui.add_space(3.0);
-                egui::Grid::new(("content-browser-grid", group.as_str()))
-                    .num_columns(layout.columns)
-                    .min_col_width(layout.card_width)
-                    .max_col_width(layout.card_width)
-                    .spacing(egui::vec2(8.0, 8.0))
-                    .show(ui, |ui| {
-                        for (index, archive) in archives[start..end].iter().enumerate() {
-                            let selected = self.stage_id.eq_ignore_ascii_case(&archive.stage_id);
-                            let label = format!(
+            let layout = content_browser_layout(ui.available_width(), archives.len());
+            egui::Grid::new("content-browser-grid")
+                .num_columns(layout.columns)
+                .min_col_width(layout.card_width)
+                .max_col_width(layout.card_width)
+                .spacing(egui::vec2(8.0, 8.0))
+                .show(ui, |ui| {
+                    for (index, archive) in archives.iter().enumerate() {
+                        let selected = self.stage_id.eq_ignore_ascii_case(&archive.stage_id);
+                        let label = format!(
+                            "{}\n{}",
+                            archive.stage_id,
+                            format_bytes_short(archive.size_bytes)
+                        );
+                        let response = ui
+                            .add_sized(
+                                [layout.card_width, 52.0],
+                                egui::Button::selectable(selected, label),
+                            )
+                            .on_hover_text(format!(
                                 "{}\n{}",
-                                archive.stage_id,
-                                format_bytes_short(archive.size_bytes)
-                            );
-                            let response = ui
-                                .add_sized(
-                                    [layout.card_width, 52.0],
-                                    egui::Button::selectable(selected, label),
-                                )
-                                .on_hover_text(format!(
-                                    "{}\n{}",
-                                    archive.relative_path.display(),
-                                    archive.path.display()
-                                ));
-                            if response.clicked() {
-                                open_archive = Some(archive.clone());
-                            }
-                            if (index + 1) % layout.columns == 0 {
-                                ui.end_row();
-                            }
+                                archive.relative_path.display(),
+                                archive.path.display()
+                            ));
+                        if response.clicked() {
+                            open_archive = Some(archive.clone());
                         }
-                    });
-                start = end;
-            }
+                        if (index + 1) % layout.columns == 0 {
+                            ui.end_row();
+                        }
+                    }
+                });
 
             if archives.is_empty() {
                 if self.background_receiver.is_some() {
@@ -685,49 +669,87 @@ impl SmsEditorApp {
     }
 
     pub(super) fn outliner_panel(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Hierarchy");
         ui.horizontal(|ui| {
-            if ui
-                .add_enabled(
-                    self.selected_object_id.is_some(),
-                    egui::Button::new("Duplicate"),
-                )
-                .clicked()
-            {
-                self.duplicate_selected();
-            }
-            if ui
-                .add_enabled(
-                    self.selected_object_id.is_some(),
-                    egui::Button::new("Delete"),
-                )
-                .clicked()
-            {
-                self.delete_selected();
-            }
-        });
-        ui.separator();
-
-        let selected_id = self.selected_object_id.as_deref();
-        let mut clicked_id = None;
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            let Some(document) = &self.document else {
-                return;
-            };
-            for object in &document.objects {
-                let selected = selected_id == Some(object.id.as_str());
+            ui.heading("Hierarchy");
+            let object_count = self
+                .document
+                .as_ref()
+                .map_or(0, |document| document.objects.len());
+            ui.label(
+                egui::RichText::new(format!("{object_count} objects"))
+                    .small()
+                    .color(egui::Color32::GRAY),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
-                    .selectable_label(selected, &object.factory_name)
+                    .add_enabled(
+                        self.selected_object_id.is_some(),
+                        egui::Button::new("Delete").small(),
+                    )
+                    .on_hover_text("Delete the selected object")
                     .clicked()
                 {
-                    clicked_id = Some(object.id.clone());
+                    self.delete_selected();
                 }
-                ui.small(format!(
-                    "{}  {}",
-                    object.id,
-                    object.class_name.as_deref().unwrap_or("Unknown")
-                ));
-                ui.separator();
+                if ui
+                    .add_enabled(
+                        self.selected_object_id.is_some(),
+                        egui::Button::new("Duplicate").small(),
+                    )
+                    .on_hover_text("Duplicate the selected object")
+                    .clicked()
+                {
+                    self.duplicate_selected();
+                }
+            });
+        });
+        ui.add(
+            egui::TextEdit::singleline(&mut self.outliner_filter)
+                .hint_text("Search hierarchy...")
+                .desired_width(f32::INFINITY),
+        );
+
+        let selected_id = self.selected_object_id.as_deref();
+        let tree = self
+            .document
+            .as_ref()
+            .map(|document| build_outliner_tree(document, &self.outliner_filter));
+        if let Some(tree) = tree.as_ref() {
+            if !self.outliner_filter.trim().is_empty() {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Showing {} of {} objects",
+                        tree.visible_objects, tree.total_objects
+                    ))
+                    .small()
+                    .color(egui::Color32::GRAY),
+                );
+            }
+        }
+        ui.separator();
+
+        let mut clicked_id = None;
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            let Some(tree) = tree.as_ref() else {
+                ui.add_space(16.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(egui::RichText::new("No level open").color(egui::Color32::GRAY));
+                    ui.small("Open a level to browse its scene hierarchy.");
+                });
+                return;
+            };
+            clicked_id = show_outliner_tree(
+                ui,
+                tree,
+                selected_id,
+                !self.outliner_filter.trim().is_empty(),
+            );
+            if tree.visible_objects == 0 {
+                ui.add_space(16.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(egui::RichText::new("No matching objects").strong());
+                    ui.small("Try a factory, class, object name, or identifier.");
+                });
             }
         });
         if let Some(id) = clicked_id {

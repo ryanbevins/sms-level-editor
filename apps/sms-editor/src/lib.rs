@@ -30,11 +30,13 @@ use sms_schema::{ObjectDefinition, ObjectRegistry, ParticleBindingTarget, Schema
 mod camera;
 mod document_commands;
 mod gpu_viewport;
+mod outliner;
 mod project;
 mod project_ui;
 mod ui_panels;
 mod viewport_ui;
 
+use outliner::*;
 use project::*;
 use project_ui::{path_display_row, NewProjectDraft};
 
@@ -377,7 +379,8 @@ struct SmsEditorApp {
     snap_scale: f32,
     show_environment_meshes: bool,
     show_goop_meshes: bool,
-    show_effect_meshes: bool,
+    show_effects: bool,
+    outliner_filter: String,
     startup_camera_focus: Option<[f32; 3]>,
     startup_focus_object: Option<String>,
     startup_camera_distance: Option<f32>,
@@ -526,7 +529,8 @@ impl Default for SmsEditorApp {
             snap_scale: 0.1,
             show_environment_meshes: true,
             show_goop_meshes: true,
-            show_effect_meshes: false,
+            show_effects: true,
+            outliner_filter: String::new(),
             startup_camera_focus: args.camera_focus,
             startup_focus_object: args.focus_object,
             startup_camera_distance: args.camera_distance,
@@ -666,9 +670,12 @@ impl SmsEditorApp {
     // Viewport interaction and painting live in viewport_ui.rs.
 
     fn sync_window_title(&mut self, ctx: &egui::Context) {
-        let desired = self.current_project.as_ref().map_or_else(
-            || "SMS Editor".to_string(),
-            |project| format!("{} - SMS Editor", project.descriptor.name),
+        let active_stage = (!self.show_project_hub).then_some(self.stage_id.as_str());
+        let desired = editor_window_title(
+            self.current_project
+                .as_ref()
+                .map(|project| project.descriptor.name.as_str()),
+            active_stage,
         );
         if self.applied_window_title != desired {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(desired.clone()));
@@ -1066,6 +1073,14 @@ impl SmsEditorApp {
                 )
             })
             .collect();
+        let has_default_preview_models = models.iter().any(|asset| {
+            is_default_preview_model_path(
+                &asset.path.to_string_lossy().replace('\\', "/"),
+                true,
+                true,
+                true,
+            )
+        });
         let preferred: Vec<_> = models
             .iter()
             .copied()
@@ -1079,7 +1094,7 @@ impl SmsEditorApp {
                 )
             })
             .collect();
-        let models = if preferred.is_empty() {
+        let models = if preferred.is_empty() && !has_default_preview_models {
             models
         } else {
             preferred
@@ -1100,7 +1115,11 @@ impl SmsEditorApp {
         let mut level_transform_models = Vec::new();
         let mut level_transform_particles = Vec::new();
         let mut actor_particles = Vec::new();
-        let actor_particle_effects = load_actor_particle_effects(document);
+        let actor_particle_effects = if visibility.effects {
+            load_actor_particle_effects(document)
+        } else {
+            BTreeMap::new()
+        };
         let mut next_packet_index = 0usize;
         let mut bounds_min = [f32::INFINITY; 3];
         let mut bounds_max = [f32::NEG_INFINITY; 3];
@@ -1121,6 +1140,9 @@ impl SmsEditorApp {
             let asset_path = asset.path.to_string_lossy().replace('\\', "/");
             let include_in_camera_bounds = is_camera_bounds_model_path(&asset_path);
             let model_render_layer = preview_render_layer_for_model_path(&asset_path);
+            if !visibility.effects && preview_render_layer_is_effect(model_render_layer) {
+                continue;
+            }
             let is_sky = model_render_layer == PreviewRenderLayer::Sky;
             let bytes = match read_stage_asset_bytes(&asset.path) {
                 Ok(bytes) => bytes,
@@ -1467,6 +1489,9 @@ impl SmsEditorApp {
                 .or_else(|| actor_model_loader_flags(object))
                 .unwrap_or_else(|| model_loader_flags_for_path(&model_path));
             let object_render_layer = preview_render_layer_for_model_path(&model_path);
+            if !visibility.effects && preview_render_layer_is_effect(object_render_layer) {
+                continue;
+            }
             let object_preview_transform = if object_render_layer == PreviewRenderLayer::Heatwave {
                 shimmer_preview_transform(object.transform)
             } else {
@@ -1937,14 +1962,16 @@ impl SmsEditorApp {
             })
             .collect();
 
-        push_level_transform_particle_previews(
-            document,
-            &level_transform_models,
-            &mut textures,
-            &mut triangles,
-            &mut next_packet_index,
-            &mut level_transform_particles,
-        );
+        if visibility.effects {
+            push_level_transform_particle_previews(
+                document,
+                &level_transform_models,
+                &mut textures,
+                &mut triangles,
+                &mut next_packet_index,
+                &mut level_transform_particles,
+            );
+        }
         let level_transform_duration_frames =
             level_transform_duration_frames(&level_transform_particles);
         let level_transform_particle_end_frames =
@@ -2032,7 +2059,7 @@ impl SmsEditorApp {
         PreviewVisibility {
             environment: self.show_environment_meshes,
             goop: self.show_goop_meshes,
-            effects: self.show_effect_meshes,
+            effects: self.show_effects,
         }
     }
 
@@ -3079,6 +3106,15 @@ fn preview_render_layer_for_model_path(path: &str) -> PreviewRenderLayer {
     }
 }
 
+fn preview_render_layer_is_effect(layer: PreviewRenderLayer) -> bool {
+    matches!(
+        layer,
+        PreviewRenderLayer::Heatwave
+            | PreviewRenderLayer::Particle
+            | PreviewRenderLayer::ParticleDistortion
+    )
+}
+
 fn path_is_shimmer_model_path(path: &str) -> bool {
     let path = path.replace('\\', "/").to_ascii_lowercase();
     path.rsplit('/').next().is_some_and(|name| {
@@ -3720,6 +3756,17 @@ fn content_browser_layout(available_width: f32, item_count: usize) -> ContentBro
     ContentBrowserLayout {
         columns,
         card_width,
+    }
+}
+
+fn editor_window_title(project_name: Option<&str>, stage_id: Option<&str>) -> String {
+    let project_name = project_name.map(str::trim).filter(|name| !name.is_empty());
+    let stage_id = stage_id.map(str::trim).filter(|stage| !stage.is_empty());
+    match (project_name, stage_id) {
+        (Some(project), Some(stage)) => format!("{project} - {stage} - SMS Editor"),
+        (Some(project), None) => format!("{project} - SMS Editor"),
+        (None, Some(stage)) => format!("{stage} - SMS Editor"),
+        (None, None) => "SMS Editor".to_string(),
     }
 }
 
