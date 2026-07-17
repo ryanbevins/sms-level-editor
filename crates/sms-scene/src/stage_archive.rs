@@ -722,10 +722,15 @@ mod tests {
                 Err(error) => failures.push(format!("{}: {error}", archive.path.display())),
             }
         }
-        assert_eq!(archives.len(), 107);
+        let expected_count = if archives.iter().any(|archive| archive.stage_id == "test11") {
+            108
+        } else {
+            107
+        };
+        assert_eq!(archives.len(), expected_count);
         assert!(
             failures.is_empty(),
-            "{} stage rebuild failure(s), {rebuilt}/107 exact:\n{}",
+            "{} stage rebuild failure(s), {rebuilt}/{expected_count} exact:\n{}",
             failures.len(),
             failures
                 .into_iter()
@@ -733,7 +738,7 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n")
         );
-        eprintln!("source-free stage archive census rebuilt {rebuilt}/107 exactly");
+        eprintln!("source-free stage archive census rebuilt {rebuilt}/{expected_count} exactly");
     }
 
     #[test]

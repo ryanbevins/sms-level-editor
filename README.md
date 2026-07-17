@@ -166,6 +166,24 @@ value must exist in the semantic document to reproduce the file. The strict
 contract is that output bytes come from typed fields or deterministic writers;
 no writer can fall back to a retained source file.
 
+## Regression Testing
+
+Run the complete local regression gate from the workspace root:
+
+```powershell
+cargo regression
+```
+
+This runs formatting, Clippy, every workspace test, a release build, and the
+source-free byte-identical rebuild census across all 108 US retail stages,
+including `test11.szs`. On Windows it prefers
+`%USERPROFILE%\Downloads\SunshineUSExport` when that folder exists, then falls
+back to `SMS_BASE_ROOT`. A different unmodified US extraction can be selected
+explicitly with `cargo regression --base-root <path>`.
+
+CI and machines without retail data can run `cargo regression --code-only`.
+Retail assets are never copied into the repository or build output.
+
 Project output is deliberately required to live outside the extracted base game
 directory. Even with that safeguard, the project format is unstable and may
 change or be replaced before the first release.

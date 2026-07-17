@@ -2,6 +2,7 @@
 members = [
     "apps/sms-cli",
     "apps/sms-editor",
+    "apps/xtask",
     "crates/sms-formats",
     "crates/sms-render",
     "crates/sms-scene",

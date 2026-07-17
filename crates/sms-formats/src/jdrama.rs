@@ -1142,7 +1142,7 @@ fn parse_actor_tail(cursor: &mut StrictCursor<'_>, short_type: &str) -> Result<V
         "WoodBox" | "MapObjNail" | "WaterHitHideObj" | "HipDropHideObj" | "MiniWindmill"
         | "Billboard" | "FruitBasketEvent" | "FruitHitHideObj" | "PosterTeresa"
         | "DolWeathercock" | "WatermelonBlock" | "BellWatermill" | "BrickBlock"
-        | "PictureTeresa" | "SuperHipDropBlock" => {
+        | "PictureTeresa" | "SuperHipDropBlock" | "BreakableBlock" => {
             vec![
                 field("resource_name", JDramaFieldValue::String(cursor.string()?)),
                 field("event_id", JDramaFieldValue::I32(cursor.i32()?)),
@@ -1330,7 +1330,7 @@ fn parse_actor_tail(cursor: &mut StrictCursor<'_>, short_type: &str) -> Result<V
         | "FruitsBoatD" | "BossPakkun" | "Koopa" | "KoopaJr" | "LimitKoopaJr" | "BathtubPeach"
         | "HamukuriLauncher" | "BossTelesa" | "BossGesso" | "BossEel" | "KBossPakkun" | "Kukku"
         | "Cannon" | "BossHanachan" | "SleepBossHanachan" | "BossWanwan" | "TinKoopa"
-        | "RiccoHook" => {
+        | "RiccoHook" | "HinoKuri2" => {
             vec![
                 field("manager_name", JDramaFieldValue::String(cursor.string()?)),
                 field("graph_name", JDramaFieldValue::String(cursor.string()?)),
@@ -1506,7 +1506,11 @@ fn actor_single_string_tail(short_type: &str) -> bool {
             | "ResetFruit"
             | "CoverFruit"
             | "NormalBlock"
+            | "WatermelonStatic"
+            | "WaterMoveBlock"
             | "Fence"
+            | "IceCar"
+            | "Football"
             | "CasinoRoulette"
             | "PalmOugi"
             | "SlotDrum"
@@ -3236,6 +3240,57 @@ mod tests {
     fn put_len_string(bytes: &mut Vec<u8>, value: &[u8]) {
         bytes.extend_from_slice(&(value.len() as u16).to_be_bytes());
         bytes.extend_from_slice(value);
+    }
+
+    #[test]
+    fn parses_us_only_actor_tails() {
+        for (actor_type, resource_name) in [
+            ("WatermelonStatic", "WatermelonStatic"),
+            ("WaterMoveBlock", "water_roll_block"),
+            ("IceCar", "ice_car"),
+            ("Football", "football"),
+        ] {
+            let mut bytes = Vec::new();
+            put_len_string(&mut bytes, resource_name.as_bytes());
+            let len = bytes.len();
+            let mut cursor = StrictCursor::new(&bytes, 0, len);
+            let fields = parse_actor_tail(&mut cursor, actor_type).unwrap();
+            assert!(cursor.is_done(), "{actor_type}");
+            assert_eq!(
+                fields,
+                [field(
+                    "resource_name",
+                    JDramaFieldValue::String(resource_name.to_string())
+                )],
+                "{actor_type}"
+            );
+        }
+
+        let mut breakable = Vec::new();
+        put_len_string(&mut breakable, b"breakable_block");
+        breakable.extend_from_slice(&(-1_i32).to_be_bytes());
+        breakable.extend_from_slice(&100.0_f32.to_be_bytes());
+        breakable.extend_from_slice(&(-1.0_f32).to_be_bytes());
+        breakable.extend_from_slice(&120_i32.to_be_bytes());
+        let breakable_len = breakable.len();
+        let mut cursor = StrictCursor::new(&breakable, 0, breakable_len);
+        let fields = parse_actor_tail(&mut cursor, "BreakableBlock").unwrap();
+        assert!(cursor.is_done());
+        assert_eq!(fields[0].name, "resource_name");
+        assert_eq!(fields[1].value, JDramaFieldValue::I32(-1));
+        assert_eq!(fields[2].value, JDramaFieldValue::F32(100.0));
+        assert_eq!(fields[3].value, JDramaFieldValue::F32(-1.0));
+        assert_eq!(fields[4].value, JDramaFieldValue::I32(120));
+
+        let mut hinokuri = Vec::new();
+        put_len_string(&mut hinokuri, b"hinokuri_manager");
+        put_len_string(&mut hinokuri, b"hinokuri");
+        let hinokuri_len = hinokuri.len();
+        let mut cursor = StrictCursor::new(&hinokuri, 0, hinokuri_len);
+        let fields = parse_actor_tail(&mut cursor, "HinoKuri2").unwrap();
+        assert!(cursor.is_done());
+        assert_eq!(fields[0].name, "manager_name");
+        assert_eq!(fields[1].name, "graph_name");
     }
 
     #[test]
