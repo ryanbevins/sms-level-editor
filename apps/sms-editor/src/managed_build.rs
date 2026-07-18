@@ -6,8 +6,10 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
+use sms_formats::{parse_jdrama_scenario_archive_entries, JDramaScenarioArchiveEntry};
 use sms_scene::StageDocument;
 
+use crate::direct_boot::{patch_sms_direct_boot_dol, RuntimeStageTarget};
 use crate::project::{normalized_absolute_with_missing_tail, path_is_same_or_child, OpenProject};
 
 const MANAGED_BUILD_MARKER_NAME: &str = ".smsbuild-owner.toml";
@@ -16,7 +18,6 @@ const MANAGED_BUILD_MARKER_VERSION: u32 = 1;
 #[cfg(test)]
 const MOD_ROOT_NAME: &str = "mod-root";
 const RUN_ROOT_NAME: &str = "run-root";
-const DOLPHIN_USER_NAME: &str = "dolphin-user";
 const MAX_MARKER_BYTES: u64 = 64 * 1024;
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -57,7 +58,6 @@ pub(super) struct ManagedRunMirrorOutcome {
     pub(super) build_root: PathBuf,
     pub(super) run_root: PathBuf,
     pub(super) run_main_dol: PathBuf,
-    pub(super) dolphin_user_dir: PathBuf,
     pub(super) source_relative_path: PathBuf,
     pub(super) stage_output_path: PathBuf,
     pub(super) stage_size_bytes: usize,
@@ -70,6 +70,24 @@ pub(super) struct ManagedRunMirrorOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ManagedGameBuildOutcome {
     pub(super) run: ManagedRunMirrorOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ManagedDirectBootOutcome {
+    pub(super) launch_dol: PathBuf,
+    pub(super) target: RuntimeStageTarget,
+    pub(super) matching_contexts: usize,
+    pub(super) size_bytes: usize,
+    pub(super) reused: bool,
+    pub(super) hook_address: u32,
+    pub(super) movie_hook_address: u32,
+    pub(super) stub_address: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ManagedGameLaunchOutcome {
+    pub(super) run: ManagedRunMirrorOutcome,
+    pub(super) direct_boot: ManagedDirectBootOutcome,
 }
 
 #[derive(Debug)]
@@ -165,6 +183,224 @@ pub(super) fn build_managed_game(
     Ok(ManagedGameBuildOutcome { run })
 }
 
+pub(super) fn prepare_managed_game_launch(
+    build: ManagedGameBuildOutcome,
+    cancelled: &AtomicBool,
+) -> Result<ManagedGameLaunchOutcome, String> {
+    check_cancelled(cancelled)?;
+    let direct_boot = prepare_managed_direct_boot(&build.run, cancelled)?;
+    Ok(ManagedGameLaunchOutcome {
+        run: build.run,
+        direct_boot,
+    })
+}
+
+fn prepare_managed_direct_boot(
+    run: &ManagedRunMirrorOutcome,
+    cancelled: &AtomicBool,
+) -> Result<ManagedDirectBootOutcome, String> {
+    check_cancelled(cancelled)?;
+    let stage_table = find_case_insensitive_path(
+        &run.run_root,
+        &["files", "data", "stageArc.bin"],
+        "runtime stage archive table",
+    )?;
+    let stage_table_bytes = fs::read(&stage_table).map_err(|error| {
+        format!(
+            "Could not read runtime stage archive table '{}': {error}",
+            stage_table.display()
+        )
+    })?;
+    check_cancelled(cancelled)?;
+    let entries = parse_jdrama_scenario_archive_entries(&stage_table_bytes).map_err(|error| {
+        format!(
+            "Could not parse runtime stage archive table '{}': {error}",
+            stage_table.display()
+        )
+    })?;
+    let (target, matching_contexts) =
+        resolve_runtime_stage_target(&entries, &run.source_relative_path)?;
+
+    let source_dol = fs::read(&run.run_main_dol).map_err(|error| {
+        format!(
+            "Could not read managed game executable '{}': {error}",
+            run.run_main_dol.display()
+        )
+    })?;
+    check_cancelled(cancelled)?;
+    let patched = patch_sms_direct_boot_dol(&source_dol, &target).map_err(|error| {
+        format!(
+            "Could not prepare version-independent direct boot from '{}': {error}",
+            run.run_main_dol.display()
+        )
+    })?;
+    check_cancelled(cancelled)?;
+
+    // Dolphin recognizes an extracted directory as a mounted game only when
+    // the executable is named exactly `sys/main.dol`. This path is an
+    // independent managed copy: the build immediately before every launch
+    // refreshes it from the configured base executable, then this atomic
+    // replacement installs the target-specific launch image. The extracted
+    // base executable is never opened for modification.
+    let launch_dol = run.run_main_dol.clone();
+    let reused = atomic_write_if_changed_with_cancel(&launch_dol, &patched.bytes, cancelled)
+        .map_err(|error| {
+            if is_cancelled_error(&error.to_string()) {
+                error.to_string()
+            } else {
+                format!(
+                    "Could not install managed direct-boot executable '{}': {error}",
+                    launch_dol.display()
+                )
+            }
+        })?;
+    check_cancelled(cancelled)?;
+
+    Ok(ManagedDirectBootOutcome {
+        launch_dol,
+        target,
+        matching_contexts,
+        size_bytes: patched.bytes.len(),
+        reused,
+        hook_address: patched.hook_address,
+        movie_hook_address: patched.movie_hook_address,
+        stub_address: patched.stub_address,
+    })
+}
+
+fn resolve_runtime_stage_target(
+    entries: &[JDramaScenarioArchiveEntry],
+    source_relative_path: &Path,
+) -> Result<(RuntimeStageTarget, usize), String> {
+    let source_stem = source_relative_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .ok_or_else(|| {
+            format!(
+                "Stage source has no Unicode archive stem: {}",
+                source_relative_path.display()
+            )
+        })?;
+    let matching = entries
+        .iter()
+        .filter(|entry| {
+            runtime_archive_stem(&entry.archive_name)
+                .is_some_and(|stem| stem.eq_ignore_ascii_case(source_stem))
+        })
+        .collect::<Vec<_>>();
+    let first = matching.first().ok_or_else(|| {
+        format!(
+            "Stage archive '{}' is not mapped by the staged game's stageArc.bin",
+            source_relative_path.display()
+        )
+    })?;
+    let area_index = u8::try_from(first.area_index).map_err(|_| {
+        format!(
+            "Runtime area index {} for '{}' does not fit Sunshine's u8 game sequence",
+            first.area_index, first.archive_name
+        )
+    })?;
+    let scenario_index = u8::try_from(first.scenario_index).map_err(|_| {
+        format!(
+            "Runtime scenario index {} for '{}' does not fit Sunshine's u8 game sequence",
+            first.scenario_index, first.archive_name
+        )
+    })?;
+    Ok((
+        RuntimeStageTarget {
+            area_index,
+            scenario_index,
+            archive_name: first.archive_name.clone(),
+        },
+        matching.len(),
+    ))
+}
+
+fn runtime_archive_stem(archive_name: &str) -> Option<&str> {
+    let file_name = archive_name
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|name| !name.is_empty())?;
+    let stem = file_name
+        .rsplit_once('.')
+        .map_or(file_name, |(stem, extension)| {
+            if extension.eq_ignore_ascii_case("arc") || extension.eq_ignore_ascii_case("szs") {
+                stem
+            } else {
+                file_name
+            }
+        });
+    if stem.is_empty() {
+        None
+    } else {
+        Some(stem)
+    }
+}
+
+fn find_case_insensitive_path(
+    root: &Path,
+    components: &[&str],
+    description: &str,
+) -> Result<PathBuf, String> {
+    let mut current = root.to_path_buf();
+    for (index, expected) in components.iter().enumerate() {
+        let entries = fs::read_dir(&current).map_err(|error| {
+            format!(
+                "Could not enumerate {description} parent '{}': {error}",
+                current.display()
+            )
+        })?;
+        let mut matches = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                format!(
+                    "Could not enumerate an entry in {description} parent '{}': {error}",
+                    current.display()
+                )
+            })?;
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(expected)
+            {
+                matches.push(entry);
+            }
+        }
+        matches.sort_by_key(fs::DirEntry::file_name);
+        if matches.len() != 1 {
+            return Err(if matches.is_empty() {
+                format!(
+                    "Could not find {description} component '{}' beneath '{}'",
+                    expected,
+                    current.display()
+                )
+            } else {
+                format!(
+                    "Found multiple case-insensitive {description} components named '{}' beneath '{}'",
+                    expected,
+                    current.display()
+                )
+            });
+        }
+        current = matches.remove(0).path();
+        let metadata = fs::symlink_metadata(&current).map_err(|error| {
+            format!(
+                "Could not inspect {description} component '{}': {error}",
+                current.display()
+            )
+        })?;
+        reject_link_or_reparse(&metadata, &current, description)?;
+        let is_last = index + 1 == components.len();
+        if (!is_last && !metadata.is_dir()) || (is_last && !metadata.is_file()) {
+            return Err(format!(
+                "{description} component has the wrong file type: {}",
+                current.display()
+            ));
+        }
+    }
+    Ok(current)
+}
+
 #[cfg(test)]
 fn prepare_managed_run_mirror_from_source(
     project: &OpenProject,
@@ -212,7 +448,6 @@ fn prepare_managed_run_mirror_from_source_with_cancel(
             base_root.join(&main_relative).display()
         ));
     }
-
     let build_root = ensure_owned_build_root(project)?;
     let run_root = ensure_child_directory(&build_root, Path::new(RUN_ROOT_NAME))?;
     let mut stats = MirrorStats::default();
@@ -274,12 +509,10 @@ fn prepare_managed_run_mirror_from_source_with_cancel(
                 )
             }
         })?;
-    let dolphin_user_dir = ensure_child_directory(&build_root, Path::new(DOLPHIN_USER_NAME))?;
     Ok(ManagedRunMirrorOutcome {
         build_root,
         run_root,
         run_main_dol,
-        dolphin_user_dir,
         source_relative_path,
         stage_output_path,
         stage_size_bytes: archive_bytes.len(),
@@ -1164,6 +1397,51 @@ fn paths_equal_normalized(left: &Path, right: &Path) -> bool {
     path_is_same_or_child(left, right) && path_is_same_or_child(right, left)
 }
 
+fn atomic_write_if_changed_with_cancel(
+    path: &Path,
+    bytes: &[u8],
+    cancelled: &AtomicBool,
+) -> io::Result<bool> {
+    check_cancelled_io(cancelled)?;
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink()
+                || metadata_is_windows_reparse_point(&metadata)
+                || !metadata.is_file()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "existing managed output is not a regular non-link file: {}",
+                        path.display()
+                    ),
+                ));
+            }
+            if metadata.len() == bytes.len() as u64 {
+                let mut input = fs::File::open(path)?;
+                let mut compared = 0_usize;
+                let mut buffer = [0_u8; 64 * 1024];
+                while compared < bytes.len() {
+                    check_cancelled_io(cancelled)?;
+                    let chunk = (bytes.len() - compared).min(buffer.len());
+                    input.read_exact(&mut buffer[..chunk])?;
+                    if buffer[..chunk] != bytes[compared..compared + chunk] {
+                        break;
+                    }
+                    compared += chunk;
+                }
+                if compared == bytes.len() {
+                    return Ok(true);
+                }
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    atomic_write_with_cancel(path, bytes, cancelled)?;
+    Ok(false)
+}
+
 fn atomic_write_with_cancel(path: &Path, bytes: &[u8], cancelled: &AtomicBool) -> io::Result<bool> {
     check_cancelled_io(cancelled)?;
     let replaced = match fs::symlink_metadata(path) {
@@ -1353,6 +1631,74 @@ mod tests {
     }
 
     #[test]
+    fn runtime_target_uses_staged_table_order_without_region_assumptions() {
+        let entries = vec![
+            JDramaScenarioArchiveEntry {
+                area_index: 7,
+                scenario_index: 4,
+                archive_name: "mods/scenes/PINNABEACH4.ARC".to_string(),
+            },
+            JDramaScenarioArchiveEntry {
+                area_index: 7,
+                scenario_index: 6,
+                archive_name: "pinnaBeach4.arc".to_string(),
+            },
+        ];
+
+        let (target, count) =
+            resolve_runtime_stage_target(&entries, Path::new("files/data/scene/pinnaBeach4.szs"))
+                .unwrap();
+
+        assert_eq!(count, 2);
+        assert_eq!(target.area_index, 7);
+        assert_eq!(target.scenario_index, 4);
+        assert_eq!(target.archive_name, "mods/scenes/PINNABEACH4.ARC");
+    }
+
+    #[test]
+    fn runtime_target_rejects_missing_and_unrepresentable_mappings() {
+        let missing = resolve_runtime_stage_target(
+            &[JDramaScenarioArchiveEntry {
+                area_index: 2,
+                scenario_index: 0,
+                archive_name: "bianco0.arc".to_string(),
+            }],
+            Path::new("files/data/scene/mare0.szs"),
+        )
+        .unwrap_err();
+        assert!(missing.contains("not mapped"));
+
+        let too_large = resolve_runtime_stage_target(
+            &[JDramaScenarioArchiveEntry {
+                area_index: 256,
+                scenario_index: 0,
+                archive_name: "mare0.arc".to_string(),
+            }],
+            Path::new("files/data/scene/MARE0.SZS"),
+        )
+        .unwrap_err();
+        assert!(too_large.contains("does not fit"));
+    }
+
+    #[test]
+    fn unchanged_atomic_launch_output_is_reused() {
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("launch.dol");
+        let cancelled = AtomicBool::new(false);
+
+        assert!(!atomic_write_if_changed_with_cancel(&output, b"first", &cancelled).unwrap());
+        let first_modified = fs::metadata(&output).unwrap().modified().unwrap();
+        assert!(atomic_write_if_changed_with_cancel(&output, b"first", &cancelled).unwrap());
+        assert_eq!(fs::read(&output).unwrap(), b"first");
+        assert_eq!(
+            fs::metadata(&output).unwrap().modified().unwrap(),
+            first_modified
+        );
+        assert!(!atomic_write_if_changed_with_cancel(&output, b"second", &cancelled).unwrap());
+        assert_eq!(fs::read(output).unwrap(), b"second");
+    }
+
+    #[test]
     fn runnable_mirror_preserves_base_and_uses_independent_file_copies() {
         let fixture = fixture();
         let base_stage_before = fs::read(&fixture.source_path).unwrap();
@@ -1376,11 +1722,6 @@ mod tests {
             &outcome.run_main_dol,
             &fs::metadata(&outcome.run_main_dol).unwrap(),
         ));
-        assert_eq!(
-            outcome.dolphin_user_dir,
-            outcome.build_root.join("dolphin-user")
-        );
-        assert!(outcome.dolphin_user_dir.is_dir());
         assert!(outcome.stage_replaced);
         assert_eq!(
             fs::read(&outcome.stage_output_path).unwrap(),
@@ -1416,7 +1757,7 @@ mod tests {
         let stale_file = first.run_root.join("stale").join("obsolete.bin");
         fs::create_dir_all(stale_file.parent().unwrap()).unwrap();
         fs::write(&stale_file, b"stale").unwrap();
-
+        fs::write(&first.run_main_dol, b"target-specific direct-boot patch").unwrap();
         let second = prepare_managed_run_mirror_from_source(
             &fixture.project,
             &fixture.base_root,
@@ -1436,7 +1777,13 @@ mod tests {
             fs::read(&fixture.source_path).unwrap(),
             b"retail-source-must-not-change"
         );
-        assert!(second.reused_files >= 2);
+        assert_eq!(fs::read(&second.run_main_dol).unwrap(), b"retail-main-dol");
+        assert_eq!(
+            fs::read(fixture.base_root.join("sys/main.dol")).unwrap(),
+            b"retail-main-dol"
+        );
+        assert!(second.reused_files >= 1);
+        assert!(second.copied_files >= 2);
     }
 
     #[test]

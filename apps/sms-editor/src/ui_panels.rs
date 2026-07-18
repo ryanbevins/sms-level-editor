@@ -55,10 +55,10 @@ impl SmsEditorApp {
                 if ui
                     .add_enabled(
                         build_enabled && !self.dolphin_path.trim().is_empty(),
-                        egui::Button::new("Build & Launch"),
+                        egui::Button::new("Launch in Dolphin"),
                     )
                     .on_hover_text(
-                        "Prepare an isolated runnable game mirror, install the authored level, and launch it in Dolphin",
+                        "Save current changes, update the isolated runnable game mirror, and boot directly into the open scene in Dolphin",
                     )
                     .clicked()
                 {
@@ -518,13 +518,13 @@ impl SmsEditorApp {
         ui.heading("Dolphin");
         let choose_dolphin =
             path_display_row(ui, "Executable", &self.dolphin_path, "Browse...", true);
-        ui.small(
-            "Build & Launch uses the managed runnable mirror above and its own isolated Dolphin user directory.",
-        );
-        ui.label("Legacy external launch (optional)");
-        let choose_game = path_display_row(ui, "Game", &self.game_path, "Browse...", true);
         let choose_user_dir =
             path_display_row(ui, "User Dir", &self.dolphin_user_dir, "Browse...", true);
+        ui.small(
+            "Launch in Dolphin refreshes the managed runnable mirror and boots the open scene directly. Leave User Dir blank to use your normal Dolphin profile and controller configuration.",
+        );
+        ui.label("Legacy external game launch (optional)");
+        let choose_game = path_display_row(ui, "Game", &self.game_path, "Browse...", true);
         if choose_dolphin {
             self.choose_dolphin_executable();
         }

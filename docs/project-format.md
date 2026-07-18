@@ -62,7 +62,7 @@ identity and lossless-save safeguards.
 ## Managed build tree
 
 Saving a project updates only its managed data; it does not create a playable
-mod. **Build Game** and **Build & Launch** use the separate project-owned
+mod. **Build Game** and **Launch in Dolphin** use the separate project-owned
 managed build root:
 
 ```text
@@ -71,7 +71,6 @@ Isle Delfino.smsbuild/
   run-root/
     sys/main.dol
     files/...
-  dolphin-user/
 ```
 
 The ownership marker binds the build root to the project identity. The editor
@@ -81,14 +80,20 @@ refuses an unowned or mismatched directory instead of taking it over.
 extracted game, preserving the
 stage archive's exact game-relative path. Every run-root file has independent
 file identity; byte-identical copies are reused on later builds. The rebuilt
-stage is installed atomically. **Build & Launch** performs the same build and
-then launches the copied `sys/main.dol` with the isolated `dolphin-user/`
-directory. The extracted base is never opened for modification.
+stage is installed atomically. **Launch in Dolphin** performs the same build,
+resolves the open archive through the staged game's own `stageArc.bin`, and
+atomically patches the managed `sys/main.dol` copy. Its behavior-based PowerPC
+patch boots the resolved area and scenario directly while preserving the
+executable's regional or modded code. Keeping the launch executable at that
+exact path lets Dolphin mount the surrounding extracted game directory. Dolphin
+uses its normal user profile by default, preserving the user's controller
+configuration. If `launch.dolphin_user_directory` is set, Dolphin uses that
+profile instead. The extracted base is never opened for modification; the next managed build refreshes the copy
+from its configured base executable before preparing another launch.
 
-Managed **Build & Launch** requires `launch.dolphin_executable`. The optional
-`launch.game_image` and `launch.dolphin_user_directory` fields belong to the
-legacy external Dolphin launch action and are not used for the managed run
-mirror.
+Managed **Launch in Dolphin** requires `launch.dolphin_executable`. The optional
+`launch.dolphin_user_directory` applies to both managed and legacy launches.
+`launch.game_image` belongs only to the legacy external Dolphin launch action.
 
 ## Recent projects
 

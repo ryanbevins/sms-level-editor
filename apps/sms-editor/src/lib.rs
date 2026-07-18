@@ -29,6 +29,7 @@ use sms_scene::{
 use sms_schema::{ObjectDefinition, ObjectRegistry, ParticleBindingTarget, SchemaGenerator};
 
 mod camera;
+mod direct_boot;
 mod document_commands;
 mod gpu_viewport;
 mod managed_build;
@@ -198,7 +199,7 @@ enum BackgroundResult {
     },
     Open(Result<Box<LoadedStage>, String>),
     Build(Result<managed_build::ManagedGameBuildOutcome, String>),
-    BuildAndRun(Result<managed_build::ManagedGameBuildOutcome, String>),
+    BuildAndRun(Result<managed_build::ManagedGameLaunchOutcome, String>),
 }
 
 mod preview_types;
@@ -1185,12 +1186,36 @@ impl SmsEditorApp {
                                 "Managed game directory: '{}'. The extracted base game was not modified.",
                                 outcome.run.run_root.display(),
                             ));
-                            self.launch_managed_dolphin(&outcome.run);
+                            self.log.push(format!(
+                                "Prepared {} {}-byte direct-boot executable '{}' for '{}' at runtime area {}, scenario {} (hook 0x{:08X}, movie hook 0x{:08X}, stub 0x{:08X}).",
+                                if outcome.direct_boot.reused {
+                                    "unchanged"
+                                } else {
+                                    "updated"
+                                },
+                                outcome.direct_boot.size_bytes,
+                                outcome.direct_boot.launch_dol.display(),
+                                outcome.direct_boot.target.archive_name,
+                                outcome.direct_boot.target.area_index,
+                                outcome.direct_boot.target.scenario_index,
+                                outcome.direct_boot.hook_address,
+                                outcome.direct_boot.movie_hook_address,
+                                outcome.direct_boot.stub_address,
+                            ));
+                            if outcome.direct_boot.matching_contexts > 1 {
+                                self.log.push(format!(
+                                    "The archive has {} runtime contexts in stageArc.bin; direct boot uses the first table entry (area {}, scenario {}).",
+                                    outcome.direct_boot.matching_contexts,
+                                    outcome.direct_boot.target.area_index,
+                                    outcome.direct_boot.target.scenario_index,
+                                ));
+                            }
+                            self.launch_managed_dolphin(&outcome);
                         }
                         Err(err) if managed_build::is_cancelled_error(&err) => {
-                            self.log.push(format!("Build and launch cancelled: {err}"))
+                            self.log.push(format!("Launch in Dolphin cancelled: {err}"))
                         }
-                        Err(err) => self.log.push(format!("Build and launch failed: {err}")),
+                        Err(err) => self.log.push(format!("Launch in Dolphin failed: {err}")),
                     },
                 }
             }

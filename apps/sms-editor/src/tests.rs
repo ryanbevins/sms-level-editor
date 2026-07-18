@@ -2902,7 +2902,6 @@ fn completed_stage_build_reports_the_managed_game_relative_output() {
                     build_root: PathBuf::from("project.smsbuild"),
                     run_root: PathBuf::from("project.smsbuild/run-root"),
                     run_main_dol: PathBuf::from("project.smsbuild/run-root/sys/main.dol"),
-                    dolphin_user_dir: PathBuf::from("project.smsbuild/dolphin-user"),
                     source_relative_path: PathBuf::from("files/data/scene/dolpic0.szs"),
                     stage_output_path: PathBuf::from(
                         "project.smsbuild/run-root/files/data/scene/dolpic0.szs",
@@ -2937,6 +2936,113 @@ fn completed_stage_build_reports_the_managed_game_relative_output() {
         .log
         .iter()
         .any(|message| message.contains("extracted base game was not modified")));
+}
+
+#[test]
+fn completed_managed_launch_reports_the_resolved_direct_boot_target() {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    sender
+        .send(BackgroundResult::BuildAndRun(Ok(
+            managed_build::ManagedGameLaunchOutcome {
+                run: managed_build::ManagedRunMirrorOutcome {
+                    build_root: PathBuf::from("project.smsbuild"),
+                    run_root: PathBuf::from("project.smsbuild/run-root"),
+                    run_main_dol: PathBuf::from("project.smsbuild/run-root/sys/main.dol"),
+                    source_relative_path: PathBuf::from("files/data/scene/pinnaBeach4.szs"),
+                    stage_output_path: PathBuf::from(
+                        "project.smsbuild/run-root/files/data/scene/pinnaBeach4.szs",
+                    ),
+                    stage_size_bytes: 4321,
+                    stage_replaced: true,
+                    copied_files: 1,
+                    reused_files: 2,
+                    removed_entries: 0,
+                },
+                direct_boot: managed_build::ManagedDirectBootOutcome {
+                    launch_dol: PathBuf::from("project.smsbuild/run-root/sys/main.dol"),
+                    target: direct_boot::RuntimeStageTarget {
+                        area_index: 5,
+                        scenario_index: 4,
+                        archive_name: "pinnaBeach4.arc".to_string(),
+                    },
+                    matching_contexts: 4,
+                    size_bytes: 9876,
+                    reused: false,
+                    hook_address: 0x800F_9B4C,
+                    movie_hook_address: 0x800F_A000,
+                    stub_address: 0x8042_0000,
+                },
+            },
+        )))
+        .unwrap();
+    let mut app = SmsEditorApp {
+        background_receiver: Some(receiver),
+        background_label: Some("Preparing and launching current scene".to_string()),
+        ..SmsEditorApp::default()
+    };
+
+    app.poll_background_task(&egui::Context::default());
+
+    assert!(app.background_receiver.is_none());
+    assert!(app.background_label.is_none());
+    assert!(app.log.iter().any(|message| {
+        message.contains("9876-byte")
+            && message.contains("pinnaBeach4.arc")
+            && message.contains("runtime area 5, scenario 4")
+    }));
+    assert!(app
+        .log
+        .iter()
+        .any(|message| message.contains("4 runtime contexts")));
+    assert!(app
+        .log
+        .iter()
+        .any(|message| message.contains("Dolphin executable is not configured")));
+}
+
+#[test]
+fn managed_dolphin_exec_keeps_the_extracted_directory_mount_path() {
+    let run_root = std::path::Path::new("project.smsbuild/run-root");
+    assert!(document_commands::managed_dolphin_exec_is_directory_main(
+        run_root,
+        std::path::Path::new("project.smsbuild/run-root/sys/main.dol")
+    ));
+    assert!(!document_commands::managed_dolphin_exec_is_directory_main(
+        run_root,
+        std::path::Path::new("project.smsbuild/run-root/sys/direct-boot.dol")
+    ));
+}
+
+#[test]
+fn blank_dolphin_user_directory_uses_dolphins_normal_profile() {
+    let mut command = Command::new("Dolphin");
+
+    let configured = SmsEditorApp::configure_dolphin_user_directory(&mut command, "  ");
+
+    assert_eq!(configured, None);
+    assert!(command.get_args().next().is_none());
+}
+
+#[test]
+fn configured_dolphin_user_directory_is_forwarded_to_dolphin() {
+    let mut command = Command::new("Dolphin");
+
+    let configured = SmsEditorApp::configure_dolphin_user_directory(
+        &mut command,
+        r"C:\DolphinProfiles\SMS-Modding",
+    );
+
+    assert_eq!(
+        configured,
+        Some(PathBuf::from(r"C:\DolphinProfiles\SMS-Modding"))
+    );
+    assert_eq!(
+        command.get_args().collect::<Vec<_>>(),
+        [
+            std::ffi::OsStr::new("-u"),
+            std::ffi::OsStr::new(r"C:\DolphinProfiles\SMS-Modding")
+        ]
+    );
 }
 
 #[test]

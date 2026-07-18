@@ -236,7 +236,7 @@ impl SmsEditorApp {
         }
         if launch_after_build && self.dolphin_path.trim().is_empty() {
             self.log
-                .push("Build and launch requires a Dolphin executable.".to_string());
+                .push("Launch in Dolphin requires a Dolphin executable.".to_string());
             return;
         }
         if self.document.is_none() {
@@ -313,6 +313,9 @@ impl SmsEditorApp {
                 managed_build::build_managed_game(&project, &document, &archive_bytes, &task_cancel)
             });
             if launch_after_build {
+                let result = result.and_then(|build| {
+                    managed_build::prepare_managed_game_launch(build, &task_cancel)
+                });
                 let _ = sender.send(BackgroundResult::BuildAndRun(result));
             } else {
                 let _ = sender.send(BackgroundResult::Build(result));
@@ -321,7 +324,7 @@ impl SmsEditorApp {
         self.background_receiver = Some(receiver);
         self.active_build_cancel = Some(build_cancel);
         self.background_label = Some(if launch_after_build {
-            "Building and launching managed game".to_string()
+            "Preparing and launching current scene".to_string()
         } else {
             "Building managed game".to_string()
         });
@@ -329,7 +332,7 @@ impl SmsEditorApp {
             "Building stage from semantic documents and {} placed model instance(s) into the project's managed game directory{}...",
             model_instance_count,
             if launch_after_build {
-                ", then launching Dolphin"
+                ", then preparing direct scene boot in Dolphin"
             } else {
                 ""
             }
@@ -350,7 +353,7 @@ impl SmsEditorApp {
 
     pub(super) fn launch_managed_dolphin(
         &mut self,
-        outcome: &managed_build::ManagedRunMirrorOutcome,
+        outcome: &managed_build::ManagedGameLaunchOutcome,
     ) {
         if self.dolphin_path.trim().is_empty() {
             self.log.push(
@@ -359,21 +362,38 @@ impl SmsEditorApp {
             );
             return;
         }
+        if !managed_dolphin_exec_is_directory_main(
+            &outcome.run.run_root,
+            &outcome.direct_boot.launch_dol,
+        ) {
+            self.log.push(format!(
+                "Refusing managed Dolphin launch because its executable must be the managed directory mount point '{}': got '{}'.",
+                outcome.run.run_root.join("sys").join("main.dol").display(),
+                outcome.direct_boot.launch_dol.display()
+            ));
+            return;
+        }
 
         let mut command = Command::new(&self.dolphin_path);
+        let configured_user_dir =
+            Self::configure_dolphin_user_directory(&mut command, &self.dolphin_user_dir);
         command
-            .current_dir(&outcome.run_root)
-            .arg("-u")
-            .arg(&outcome.dolphin_user_dir)
+            .current_dir(&outcome.run.run_root)
             .arg("-b")
             .arg("-e")
-            .arg(&outcome.run_main_dol);
+            .arg(&outcome.direct_boot.launch_dol);
 
         match command.spawn() {
             Ok(_) => self.log.push(format!(
-                "Launched Dolphin with managed game '{}' and isolated user directory '{}'.",
-                outcome.run_main_dol.display(),
-                outcome.dolphin_user_dir.display()
+                "Launched Dolphin directly into '{}' (runtime area {}, scenario {}) with managed game '{}' using {}.",
+                outcome.direct_boot.target.archive_name,
+                outcome.direct_boot.target.area_index,
+                outcome.direct_boot.target.scenario_index,
+                outcome.direct_boot.launch_dol.display(),
+                configured_user_dir
+                    .as_ref()
+                    .map(|path| format!("configured Dolphin user directory '{}'", path.display()))
+                    .unwrap_or_else(|| "Dolphin's normal user profile".to_string())
             )),
             Err(err) => self
                 .log
@@ -389,15 +409,27 @@ impl SmsEditorApp {
         }
 
         let mut command = Command::new(&self.dolphin_path);
-        if !self.dolphin_user_dir.trim().is_empty() {
-            command.arg("-u").arg(&self.dolphin_user_dir);
-        }
+        Self::configure_dolphin_user_directory(&mut command, &self.dolphin_user_dir);
         command.arg("-b").arg("-e").arg(&self.game_path);
 
         match command.spawn() {
             Ok(_) => self.log.push("Launched Dolphin.".to_string()),
             Err(err) => self.log.push(format!("Failed to launch Dolphin: {err}")),
         }
+    }
+
+    pub(super) fn configure_dolphin_user_directory(
+        command: &mut Command,
+        configured: &str,
+    ) -> Option<PathBuf> {
+        let configured = configured.trim();
+        if configured.is_empty() {
+            return None;
+        }
+
+        let path = PathBuf::from(configured);
+        command.arg("-u").arg(&path);
+        Some(path)
     }
 
     pub(super) fn spawn_object_at(&mut self, factory_name: String, translation: [f32; 3]) {
@@ -1077,6 +1109,13 @@ impl SmsEditorApp {
             ));
         }
     }
+}
+
+pub(super) fn managed_dolphin_exec_is_directory_main(
+    run_root: &std::path::Path,
+    launch_dol: &std::path::Path,
+) -> bool {
+    launch_dol == run_root.join("sys").join("main.dol")
 }
 
 #[cfg(test)]

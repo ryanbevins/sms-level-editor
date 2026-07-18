@@ -177,7 +177,7 @@ the open scene, and slots with compiled `mHold` model/joint or `mMove`
 BCK/joint dependencies are excluded because replacing only their BMD/COL would
 leave those dependencies unsatisfied.
 
-### Build Game and Build & Launch
+### Build Game and Launch in Dolphin
 
 **Build Game** saves the project, rebuilds the stage from semantic documents,
 and prepares `<managed-build-root>/run-root/` as a complete runnable extracted
@@ -186,13 +186,28 @@ is atomically installed at its exact game-relative path.
 The managed build root defaults to a `.smsbuild` sibling of the `.sms`
 descriptor and is protected by a project-identity marker.
 
-**Build & Launch** performs that same build and then launches its `sys/main.dol`
-in Dolphin with the isolated `<managed-build-root>/dolphin-user/` directory.
-Subsequent builds reuse byte-identical independent copies and replace changed
-files atomically.
+**Launch in Dolphin** performs that same freshness pass, resolves the open
+archive's runtime area and scenario from the staged game's own
+`files/data/stageArc.bin`, and atomically patches the managed copy at
+`run-root/sys/main.dol`. The patcher
+recognizes the game's post-logo transition by PowerPC behavior instead of a
+regional address or known executable hash, so retail, source-built, and modded
+executables retain their own code and stage mappings. Dolphin runs the launch
+DOL with its normal user profile by default, preserving the user's controller
+configuration, or with the project-configured Dolphin user directory when one
+is set. It enters the open scene without file select, Delfino Plaza, or scenario selection. An
+automatic movie is bypassed for that initial transition only; later
+transitions keep normal game behavior.
+
+When one archive has several runtime contexts, the first entry in that game's
+`stageArc.bin` is used deterministically and the complete match count is
+reported in the console. Subsequent builds reuse byte-identical independent
+copies; changed files and the target-specific launch executable are replaced
+atomically.
 
 Both workflows reject build locations that overlap the extracted base game or
-managed project data. The extracted base remains read-only.
+managed project data. The extracted base and its original `main.dol` remain
+read-only.
 
 The experimental `rebuild-stage` CLI command audits the binary authoring
 pipeline. It imports every stage resource into typed documents, discards the
