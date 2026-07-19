@@ -78,7 +78,8 @@ fn is_skybox_resource_path(path: &str) -> bool {
     };
     directory.eq_ignore_ascii_case("map/map")
         && file_name.split_once('.').is_some_and(|(stem, extension)| {
-            !extension.is_empty() && stem.eq_ignore_ascii_case("sky")
+            !extension.is_empty()
+                && (stem.eq_ignore_ascii_case("sky") || stem.eq_ignore_ascii_case("reflectsky"))
         })
 }
 
@@ -297,7 +298,8 @@ mod tests {
     fn skybox_resource_index_is_exact_to_map_map_sky_stem() {
         assert!(is_skybox_resource_path("map/map/sky.bmd"));
         assert!(is_skybox_resource_path("MAP/MAP/SKY.BTK"));
-        assert!(!is_skybox_resource_path("map/map/reflectsky.bmd"));
+        assert!(is_skybox_resource_path("map/map/reflectsky.bmd"));
+        assert!(is_skybox_resource_path("MAP/MAP/REFLECTSKY.BTK"));
         assert!(!is_skybox_resource_path("mapobj/sky.bmd"));
     }
 

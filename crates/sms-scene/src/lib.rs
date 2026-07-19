@@ -26,11 +26,12 @@ mod stage_export;
 mod validation;
 
 pub use blank_stage::{
-    blank_stage_mario_record, blank_stage_sky_record, BlankStageBootstrapKind,
-    BlankStageBootstrapManifest, BlankStageBootstrapRequirement, BlankStageBootstrapResource,
-    BlankStageLightingPreset, BlankStagePreset, BlankStageSkyboxPreset, BlankStageTargetMetadata,
-    BLANK_STAGE_BOOTSTRAP_REQUIREMENTS, BLANK_STAGE_CAMERA_DIRECTORY_MARKER_PATH,
-    BLANK_STAGE_COIN_PARTICLE_PATH, BLANK_STAGE_PRESET_VERSION, DEFAULT_BLANK_STAGE_TARGET_SLOT,
+    blank_stage_mario_record, blank_stage_sky_record, runtime_sky_material_table,
+    BlankStageBootstrapKind, BlankStageBootstrapManifest, BlankStageBootstrapRequirement,
+    BlankStageBootstrapResource, BlankStageLightingPreset, BlankStagePreset,
+    BlankStageSkyboxPreset, BlankStageTargetMetadata, BLANK_STAGE_BOOTSTRAP_REQUIREMENTS,
+    BLANK_STAGE_CAMERA_DIRECTORY_MARKER_PATH, BLANK_STAGE_COIN_PARTICLE_PATH,
+    BLANK_STAGE_PRESET_VERSION, DEFAULT_BLANK_STAGE_TARGET_SLOT,
 };
 pub use stage_archive::{
     SourceFreeStageArchive, StageCompression, StageObjectPlacement, StageOrigin, StageResource,

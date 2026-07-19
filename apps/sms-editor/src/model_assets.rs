@@ -1653,9 +1653,6 @@ impl SmsEditorApp {
         archive: Option<&SourceFreeStageArchive>,
         registry: Option<&ObjectRegistry>,
     ) -> Result<sms_scene::StageArchiveEdits, String> {
-        if instances.is_empty() {
-            return Ok(base.clone());
-        }
         let assets = Self::load_model_asset_snapshot(content_root, instances)?;
         Self::stage_edits_with_model_instances_from_snapshot(
             &assets, instances, base, archive, registry,
@@ -1733,8 +1730,10 @@ impl SmsEditorApp {
         cancelled: Option<&AtomicBool>,
     ) -> Result<sms_scene::StageArchiveEdits, String> {
         check_model_export_cancelled(cancelled)?;
+        let mut edits = base.clone();
         if instances.is_empty() {
-            return Ok(base.clone());
+            synchronize_runtime_sky_reflection_bundle(archive, &mut edits)?;
+            return Ok(edits);
         }
         let mut separate = Vec::new();
         let mut stock = Vec::new();
@@ -1775,7 +1774,6 @@ impl SmsEditorApp {
             }
         }
 
-        let mut edits = base.clone();
         if !separate.is_empty() {
             for resolved in &separate {
                 check_model_export_cancelled(cancelled)?;
@@ -2153,6 +2151,7 @@ impl SmsEditorApp {
                 edits.append_collision(b"map/map.col".to_vec(), collision);
             }
         }
+        synchronize_runtime_sky_reflection_bundle(archive, &mut edits)?;
         Ok(edits)
     }
 
@@ -3458,6 +3457,168 @@ fn authored_sky_record(placement: &ModelInstancePlacement) -> Result<JDramaRecor
     .map_err(|error| format!("could not author typed TSky record: {error}"))
 }
 
+fn synchronize_runtime_sky_reflection_bundle(
+    archive: Option<&SourceFreeStageArchive>,
+    edits: &mut sms_scene::StageArchiveEdits,
+) -> Result<(), String> {
+    let sky_changed = edits
+        .resource_removals
+        .iter()
+        .any(|path| runtime_sky_resource_stem(path) == Some("sky"))
+        || edits
+            .resources
+            .iter()
+            .any(|edit| runtime_sky_resource_stem(&edit.raw_resource_path) == Some("sky"))
+        || edits
+            .models
+            .iter()
+            .any(|edit| runtime_sky_resource_stem(&edit.raw_resource_path) == Some("sky"));
+    if !sky_changed {
+        return Ok(());
+    }
+
+    let mut effective = BTreeMap::<Vec<u8>, StageResourceDocument>::new();
+    if let Some(archive) = archive {
+        effective.extend(
+            archive
+                .resources()
+                .iter()
+                .map(|resource| (resource.raw_path.clone(), resource.document.clone())),
+        );
+    }
+    for path in &edits.resource_removals {
+        effective.retain(|candidate, _| !candidate.eq_ignore_ascii_case(path));
+    }
+    for edit in &edits.resources {
+        effective.retain(|candidate, _| !candidate.eq_ignore_ascii_case(&edit.raw_resource_path));
+        effective.insert(edit.raw_resource_path.clone(), edit.document.clone());
+    }
+    for edit in &edits.models {
+        effective.retain(|candidate, _| !candidate.eq_ignore_ascii_case(&edit.raw_resource_path));
+        effective.insert(
+            edit.raw_resource_path.clone(),
+            StageResourceDocument::Model(edit.document.clone()),
+        );
+    }
+
+    let sky_model = effective
+        .iter()
+        .find_map(|(path, document)| {
+            runtime_sky_resource_path_is(path, "sky", "bmd").then_some(document)
+        })
+        .and_then(|document| match document {
+            StageResourceDocument::Model(model) => Some(model.clone()),
+            _ => None,
+        });
+    let Some(sky_model) = sky_model else {
+        for path in effective
+            .keys()
+            .filter(|path| runtime_sky_resource_stem(path) == Some("reflectsky"))
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            edits.remove_resource(path);
+        }
+        return Ok(());
+    };
+
+    if !effective
+        .keys()
+        .any(|path| runtime_sky_resource_path_is(path, "sky", "bmt"))
+    {
+        let table = sms_scene::runtime_sky_material_table(&sky_model)
+            .map_err(|error| format!("could not derive shared sky.bmt: {error}"))?;
+        edits.upsert_model(b"map/map/sky.bmt".to_vec(), table);
+    }
+
+    let reflection_model_explicit = edits.resources.iter().any(|edit| {
+        runtime_sky_resource_path_is(&edit.raw_resource_path, "reflectsky", "bmd")
+            && matches!(&edit.document, StageResourceDocument::Model(_))
+    }) || edits
+        .models
+        .iter()
+        .any(|edit| runtime_sky_resource_path_is(&edit.raw_resource_path, "reflectsky", "bmd"));
+    if reflection_model_explicit {
+        return Ok(());
+    }
+
+    // Legacy project overlays changed only sky.*. Replace the old helper and
+    // its animations with source-free derivatives of that effective sky so a
+    // managed build cannot keep reflecting the previous stage environment.
+    for path in effective
+        .keys()
+        .filter(|path| runtime_sky_resource_stem(path) == Some("reflectsky"))
+        .cloned()
+        .collect::<Vec<_>>()
+    {
+        edits.remove_resource(path);
+    }
+    edits.upsert_model(b"map/map/reflectsky.bmd".to_vec(), sky_model);
+    for (path, document) in &effective {
+        let Some(extension) = runtime_sky_visual_animation_extension(path, "sky") else {
+            continue;
+        };
+        let StageResourceDocument::Animation(animation) = document else {
+            continue;
+        };
+        edits.upsert_resource(
+            format!("map/map/reflectsky.{extension}").into_bytes(),
+            StageResourceDocument::Animation(animation.clone()),
+        );
+    }
+    Ok(())
+}
+
+fn runtime_sky_resource_stem(path: &[u8]) -> Option<&'static str> {
+    let normalized = String::from_utf8_lossy(path).replace('\\', "/");
+    let (directory, file_name) = normalized.rsplit_once('/')?;
+    if !directory.eq_ignore_ascii_case("map/map") {
+        return None;
+    }
+    let (stem, extension) = file_name.rsplit_once('.')?;
+    if extension.is_empty() {
+        return None;
+    }
+    if stem.eq_ignore_ascii_case("sky") {
+        Some("sky")
+    } else if stem.eq_ignore_ascii_case("reflectsky") {
+        Some("reflectsky")
+    } else {
+        None
+    }
+}
+
+fn runtime_sky_resource_path_is(
+    path: &[u8],
+    expected_stem: &str,
+    expected_extension: &str,
+) -> bool {
+    let normalized = String::from_utf8_lossy(path).replace('\\', "/");
+    let Some((directory, file_name)) = normalized.rsplit_once('/') else {
+        return false;
+    };
+    let Some((stem, extension)) = file_name.rsplit_once('.') else {
+        return false;
+    };
+    directory.eq_ignore_ascii_case("map/map")
+        && stem.eq_ignore_ascii_case(expected_stem)
+        && extension.eq_ignore_ascii_case(expected_extension)
+}
+
+fn runtime_sky_visual_animation_extension(path: &[u8], expected_stem: &str) -> Option<String> {
+    let normalized = String::from_utf8_lossy(path).replace('\\', "/");
+    let (directory, file_name) = normalized.rsplit_once('/')?;
+    let (stem, extension) = file_name.rsplit_once('.')?;
+    if !directory.eq_ignore_ascii_case("map/map") || !stem.eq_ignore_ascii_case(expected_stem) {
+        return None;
+    }
+    matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "bck" | "bpk" | "btp" | "brk" | "btk"
+    )
+    .then(|| extension.to_ascii_lowercase())
+}
+
 fn stock_map_obj_base_record(
     placement: &ModelInstancePlacement,
     resource_name: &str,
@@ -4643,8 +4804,20 @@ mod tests {
             Some(&runtime_export_test_archive()),
         )
         .unwrap();
-        assert_eq!(edits.models.len(), 1);
-        assert_eq!(edits.models[0].raw_resource_path, b"map/map/sky.bmd");
+        assert_eq!(
+            edits
+                .models
+                .iter()
+                .map(|edit| edit.raw_resource_path.as_slice())
+                .collect::<Vec<_>>(),
+            [
+                b"map/map/sky.bmd".as_slice(),
+                b"map/map/sky.bmt",
+                b"map/map/reflectsky.bmd",
+            ]
+        );
+        assert_eq!(edits.models[1].document.file_type, *b"bmt3");
+        assert_eq!(edits.models[2].document, edits.models[0].document);
         assert!(edits.collisions.is_empty());
         assert_eq!(edits.placement_inserts.len(), 1);
         assert_eq!(edits.placement_inserts[0].record.type_name, "Sky");
@@ -4652,6 +4825,57 @@ mod tests {
             edits.placement_inserts[0].raw_resource_path,
             b"map/scene.bin"
         );
+    }
+
+    #[test]
+    fn legacy_sky_only_project_edit_derives_the_runtime_reflection_bundle() {
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+            "../../crates/sms-authoring/tests/fixtures/gltf/valid/minimal-external/model.gltf",
+        );
+        let sky =
+            sms_authoring::import_model(source, &sms_authoring::ModelImportOptions::default())
+                .unwrap()
+                .asset
+                .compile_bmd_document()
+                .unwrap();
+        let old_reflection = sms_authoring::built_in_blank_stage_proxy(b"old-reflection")
+            .compile_bmd_document()
+            .unwrap();
+        let mut archive = runtime_export_test_archive();
+        archive
+            .insert_resource(
+                b"map/map/reflectsky.bmd".to_vec(),
+                StageResourceDocument::Model(old_reflection),
+            )
+            .unwrap();
+
+        let mut base = sms_scene::StageArchiveEdits::default();
+        base.upsert_resource(
+            b"map/map/sky.bmd".to_vec(),
+            StageResourceDocument::Model(sky.clone()),
+        );
+        base.remove_resource(b"map/map/sky.bmt".to_vec());
+
+        let edits = SmsEditorApp::stage_edits_with_model_instances_from_snapshot(
+            &BTreeMap::new(),
+            &[],
+            &base,
+            Some(&archive),
+            None,
+        )
+        .unwrap();
+        let material_table = edits
+            .models
+            .iter()
+            .find(|edit| edit.raw_resource_path == b"map/map/sky.bmt")
+            .expect("derived shared sky material table");
+        assert_eq!(material_table.document.file_type, *b"bmt3");
+        let reflection = edits
+            .models
+            .iter()
+            .find(|edit| edit.raw_resource_path == b"map/map/reflectsky.bmd")
+            .expect("derived ReflectSky helper");
+        assert_eq!(reflection.document, sky);
     }
 
     #[test]

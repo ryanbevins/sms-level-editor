@@ -4,9 +4,10 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 use sms_formats::{
-    compile_static_bmd3, ColFile, FormatError, GxMaterial, J3dRebuildDocument, JDramaDocument,
-    JDramaField, JDramaFieldValue, JDramaLightMap, JDramaRecord, JDramaRecordPayload,
-    JDramaTransform, JpaxDocument, StaticModel, StaticModelMesh, StaticModelVertex,
+    compile_static_bmd3, ColFile, FormatError, GxMaterial, J3dRebuildDocument,
+    J3dRebuildSectionData, JDramaDocument, JDramaField, JDramaFieldValue, JDramaLightMap,
+    JDramaRecord, JDramaRecordPayload, JDramaTransform, JpaxDocument, StaticModel, StaticModelMesh,
+    StaticModelVertex,
 };
 
 use crate::stage_archive::parse_resource;
@@ -129,10 +130,11 @@ impl BlankStageBootstrapManifest {
 
 /// A source-free skybox selection copied from a complete typed stage archive.
 ///
-/// Sunshine's `TSky` actor always opens `map/map/sky.bmd`, then starts every
-/// same-stem animation available to the stage model manager. Keeping the actor
-/// and the entire typed resource bundle together prevents a visually plausible
-/// model-only selection from producing a stage the runtime cannot reproduce.
+/// Sunshine's `TSky` actor always opens `map/map/sky.bmd`, while water mirrors
+/// draw the separate `map/map/reflectsky.bmd` helper. Keeping both models,
+/// their same-stem animations, and the shared `sky.bmt` together prevents a
+/// visually plausible sky selection from retaining the previous stage's
+/// reflection in a managed build.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BlankStageSkyboxPreset {
     sky_actor: JDramaRecord,
@@ -140,8 +142,10 @@ pub struct BlankStageSkyboxPreset {
 }
 
 impl BlankStageSkyboxPreset {
-    /// Clones the canonical `Sky` actor and every typed `map/map/sky.*`
-    /// resource from an imported stage archive.
+    /// Clones the canonical `Sky` actor and its complete typed runtime bundle.
+    /// Retail reflection helpers are retained when present. Stages without a
+    /// dedicated helper use the main sky as the reflection fallback, matching
+    /// the selected sky instead of silently retaining an unrelated proxy.
     pub fn from_archive(archive: &SourceFreeStageArchive) -> Result<Self> {
         let placement = canonical_placement_document(archive)?;
         let sky_actor = unique_record(placement, "Sky", "sky actor")?.clone();
@@ -151,6 +155,41 @@ impl BlankStageSkyboxPreset {
             .filter(|resource| is_skybox_resource_path(&resource.raw_path))
             .cloned()
             .collect::<Vec<_>>();
+
+        if !resources
+            .iter()
+            .any(|resource| raw_path_eq_ignore_ascii_case(&resource.raw_path, b"map/map/sky.bmt"))
+        {
+            let sky_model = resources
+                .iter()
+                .find_map(|resource| {
+                    raw_path_eq_ignore_ascii_case(&resource.raw_path, b"map/map/sky.bmd")
+                        .then_some(&resource.document)
+                })
+                .and_then(|document| match document {
+                    StageResourceDocument::Model(model) => Some(model),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    blank_stage_error(
+                        "skybox preset cannot derive sky.bmt without a typed map/map/sky.bmd",
+                    )
+                })?;
+            resources.push(StageResource {
+                raw_path: b"map/map/sky.bmt".to_vec(),
+                document: StageResourceDocument::Model(runtime_sky_material_table(sky_model)?),
+            });
+        }
+
+        if !resources.iter().any(|resource| {
+            raw_path_eq_ignore_ascii_case(&resource.raw_path, b"map/map/reflectsky.bmd")
+        }) {
+            let fallbacks = resources
+                .iter()
+                .filter_map(reflection_fallback_resource)
+                .collect::<Vec<_>>();
+            resources.extend(fallbacks);
+        }
         resources.sort_by(|left, right| left.raw_path.cmp(&right.raw_path));
 
         let preset = Self {
@@ -180,6 +219,8 @@ impl BlankStageSkyboxPreset {
 
         let mut paths = BTreeSet::new();
         let mut model_count = 0_usize;
+        let mut material_table_count = 0_usize;
+        let mut reflection_model_count = 0_usize;
         for resource in &self.resources {
             if !paths.insert(resource.raw_path.clone()) {
                 return Err(blank_stage_error(format!(
@@ -207,6 +248,20 @@ impl BlankStageSkyboxPreset {
                     ));
                 }
                 model_count += 1;
+            } else if raw_path_eq_ignore_ascii_case(&resource.raw_path, b"map/map/sky.bmt") {
+                if !matches!(&resource.document, StageResourceDocument::Model(_)) {
+                    return Err(blank_stage_error(
+                        "map/map/sky.bmt is not a typed J3D material table",
+                    ));
+                }
+                material_table_count += 1;
+            } else if raw_path_eq_ignore_ascii_case(&resource.raw_path, b"map/map/reflectsky.bmd") {
+                if !matches!(&resource.document, StageResourceDocument::Model(_)) {
+                    return Err(blank_stage_error(
+                        "map/map/reflectsky.bmd is not a typed J3D model",
+                    ));
+                }
+                reflection_model_count += 1;
             }
         }
         if model_count != 1 {
@@ -214,8 +269,86 @@ impl BlankStageSkyboxPreset {
                 "skybox preset requires exactly one typed map/map/sky.bmd resource, found {model_count}"
             )));
         }
+        if material_table_count != 1 {
+            return Err(blank_stage_error(format!(
+                "skybox preset requires exactly one typed map/map/sky.bmt resource, found {material_table_count}"
+            )));
+        }
+        if reflection_model_count != 1 {
+            return Err(blank_stage_error(format!(
+                "skybox preset requires exactly one typed map/map/reflectsky.bmd resource, found {reflection_model_count}"
+            )));
+        }
         Ok(())
     }
+}
+
+/// Builds the material table copied by Sunshine onto both `TSky` and
+/// `ReflectSky`. The result is detached typed J3D data, not cached source
+/// bytes, so it remains safe for project overlays and semantic rebuilds.
+pub fn runtime_sky_material_table(model: &J3dRebuildDocument) -> Result<J3dRebuildDocument> {
+    let sections = model
+        .sections
+        .iter()
+        .filter(|section| {
+            matches!(
+                section.data,
+                J3dRebuildSectionData::Materials(_) | J3dRebuildSectionData::Textures(_)
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if !sections
+        .iter()
+        .any(|section| matches!(section.data, J3dRebuildSectionData::Materials(_)))
+    {
+        return Err(blank_stage_error(
+            "sky model has no MAT3 section for the shared runtime material table",
+        ));
+    }
+    Ok(J3dRebuildDocument {
+        file_type: *b"bmt3",
+        version_tag: model.version_tag,
+        reserved_words: model.reserved_words,
+        declared_section_count: sections.len() as u32,
+        sections,
+    })
+}
+
+fn reflection_fallback_resource(resource: &StageResource) -> Option<StageResource> {
+    let reflected_path = reflection_resource_path(&resource.raw_path)?;
+    Some(StageResource {
+        raw_path: reflected_path,
+        document: resource.document.clone(),
+    })
+}
+
+fn reflection_resource_path(raw_path: &[u8]) -> Option<Vec<u8>> {
+    let separator = raw_path.iter().rposition(|byte| *byte == b'/')?;
+    if !raw_path_eq_ignore_ascii_case(&raw_path[..separator], b"map/map") {
+        return None;
+    }
+    let file_name = &raw_path[separator + 1..];
+    let extension = file_name.iter().rposition(|byte| *byte == b'.')?;
+    if !raw_path_eq_ignore_ascii_case(&file_name[..extension], b"sky") {
+        return None;
+    }
+    let extension = &file_name[extension + 1..];
+    if !matches_ignore_ascii_case(
+        extension,
+        &[b"bmd".as_slice(), b"bck", b"bpk", b"btp", b"brk", b"btk"],
+    ) {
+        return None;
+    }
+    let mut path = b"map/map/reflectsky.".to_vec();
+    path.extend_from_slice(extension);
+    Some(path)
+}
+
+fn matches_ignore_ascii_case(value: &[u8], candidates: &[&[u8]]) -> bool {
+    candidates
+        .iter()
+        .any(|candidate| raw_path_eq_ignore_ascii_case(value, candidate))
 }
 
 /// The complete stage-global lighting records used by Sunshine's runtime.
@@ -1198,7 +1331,7 @@ fn is_skybox_resource_path(raw_path: &[u8]) -> bool {
     };
     extension > 0
         && extension + 1 < file_name.len()
-        && raw_path_eq_ignore_ascii_case(&file_name[..extension], b"sky")
+        && matches_ignore_ascii_case(&file_name[..extension], &[b"sky".as_slice(), b"reflectsky"])
 }
 
 fn raw_path_eq_ignore_ascii_case(left: &[u8], right: &[u8]) -> bool {
@@ -1560,7 +1693,11 @@ mod tests {
                 .iter()
                 .map(|resource| resource.raw_path.as_slice())
                 .collect::<Vec<_>>(),
-            [b"map/map/sky.bmd".as_slice(), b"map/map/sky.bmt"]
+            [
+                b"map/map/reflectsky.bmd".as_slice(),
+                b"map/map/sky.bmd",
+                b"map/map/sky.bmt",
+            ]
         );
 
         let target = BlankStagePreset {
