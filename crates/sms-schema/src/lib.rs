@@ -163,6 +163,12 @@ pub struct ObjectRegistry {
     /// Map-object slots instantiated directly by actor and manager runtime methods.
     #[serde(default)]
     pub runtime_map_obj_dependencies: Vec<RuntimeMapObjDependencyDefinition>,
+    /// Fixed JDrama name lookups issued by actor runtime methods.
+    ///
+    /// These are extracted from decomp callsites so authoring can expose actor
+    /// links and transplant support records without per-object tables.
+    #[serde(default)]
+    pub runtime_name_references: Vec<RuntimeNameReferenceDefinition>,
     #[serde(default)]
     pub enemy_actors: Vec<EnemyActorDefinition>,
     #[serde(default)]
@@ -665,6 +671,22 @@ pub struct RuntimeMapObjDependencyDefinition {
     pub source_file: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RuntimeNameReferenceTarget {
+    Actor { factory_name: String },
+    PlacementRecord { type_name: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct RuntimeNameReferenceDefinition {
+    pub factory_name: String,
+    pub target: RuntimeNameReferenceTarget,
+    pub required: bool,
+    pub record_name: String,
+    pub source_file: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnemyActorDefinition {
     pub factory_name: String,
@@ -856,6 +878,8 @@ impl SchemaGenerator {
         let mut manager_parameter_paths = BTreeMap::<String, String>::new();
         let mut manager_animation_folders = BTreeMap::<String, Vec<(String, String)>>::new();
         let mut runtime_map_obj_dependencies = BTreeMap::<String, Vec<(String, String)>>::new();
+        let mut runtime_name_references =
+            BTreeMap::<String, Vec<ExtractedRuntimeNameReference>>::new();
         let mut inheritance = BTreeMap::<String, String>::new();
         let mut tev_color_bindings = Vec::new();
         let mut init_tev_colors = BTreeMap::new();
@@ -952,6 +976,27 @@ impl SchemaGenerator {
             "enemy/animal/strategic C++ sources",
         )?;
 
+        // Fixed actor-name lookups are a game-wide authoring contract, not an
+        // enemy-specific one. Scan every gameplay source while keeping the
+        // owning class and source provenance decomp-derived.
+        for file in sources.files_under_any(&["src/", "include/"]) {
+            if !matches!(file.extension(), "cpp" | "hpp" | "h") {
+                continue;
+            }
+            let text = file.text();
+            extract_class_inheritance(text, &mut inheritance);
+            if file.extension() != "cpp" {
+                continue;
+            }
+            let source_file = file.relative_path().to_string();
+            for (class_name, references) in extract_runtime_name_references(text, &source_file) {
+                runtime_name_references
+                    .entry(class_name)
+                    .or_default()
+                    .extend(references);
+            }
+        }
+
         // A few retail-only manager subclasses are declared beside their
         // factory registrations rather than in public headers.
         for file_name in ["MarNameRefGen_Enemy.cpp", "MarNameRefGen_BossEnemy.cpp"] {
@@ -978,6 +1023,21 @@ impl SchemaGenerator {
                         resource_name,
                         source_file,
                     }
+                }),
+            );
+            registry.runtime_name_references.extend(
+                inherited_actor_models_union(
+                    &object.class_name,
+                    &runtime_name_references,
+                    &inheritance,
+                )
+                .into_iter()
+                .map(|reference| RuntimeNameReferenceDefinition {
+                    factory_name: object.factory_name.clone(),
+                    target: reference.target,
+                    required: reference.required,
+                    record_name: reference.record_name,
+                    source_file: reference.source_file,
                 }),
             );
         }
@@ -2192,6 +2252,122 @@ fn extract_runtime_map_obj_dependencies(
     by_class
         .into_iter()
         .map(|(class_name, dependencies)| (class_name, dependencies.into_iter().collect()))
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ExtractedRuntimeNameReference {
+    target: RuntimeNameReferenceTarget,
+    required: bool,
+    record_name: String,
+    source_file: String,
+}
+
+fn extract_runtime_name_references(
+    text: &str,
+    source_file: &str,
+) -> Vec<(String, Vec<ExtractedRuntimeNameReference>)> {
+    let method_re = Regex::new(
+        r"(?m)^[^\r\n{};]*\b([A-Za-z_][A-Za-z0-9_]*)::[A-Za-z_][A-Za-z0-9_]*\s*\([^;{}]*\)\s*(?:const\s*)?\{",
+    )
+    .expect("valid runtime name-reference method regex");
+    let shine_demo_re =
+        Regex::new(r#"(?s)makeShineAppearWithDemo(?:Offset)?\s*\(\s*"([^"]+)"\s*,\s*"([^"]+)""#)
+            .expect("valid Shine demo dependency regex");
+    let shine_time_re = Regex::new(r#"(?s)makeShineAppearWithTime(?:Offset)?\s*\(\s*"([^"]+)""#)
+        .expect("valid timed Shine dependency regex");
+    let mut by_class = BTreeMap::<String, BTreeSet<ExtractedRuntimeNameReference>>::new();
+    let nerve_re = Regex::new(r"(?m)^\s*DEFINE_NERVE\s*\([^)]*\)\s*\{")
+        .expect("valid nerve implementation regex");
+    let nerve_body_re = Regex::new(
+        r"([A-Za-z_][A-Za-z0-9_]*)\s*\*\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\*\s*\)\s*spine->getBody\s*\(",
+    )
+    .expect("valid nerve body actor regex");
+
+    for method in method_re.captures_iter(text) {
+        let Some(whole) = method.get(0) else {
+            continue;
+        };
+        let Some(body) = braced_body(text, whole.end() - 1) else {
+            continue;
+        };
+        let references = by_class.entry(method[1].to_string()).or_default();
+        for call in shine_demo_re.captures_iter(body) {
+            references.insert(ExtractedRuntimeNameReference {
+                target: RuntimeNameReferenceTarget::Actor {
+                    factory_name: "Shine".to_string(),
+                },
+                required: false,
+                record_name: call[1].to_string(),
+                source_file: source_file.to_string(),
+            });
+            references.insert(ExtractedRuntimeNameReference {
+                target: RuntimeNameReferenceTarget::PlacementRecord {
+                    type_name: "CameraMapInfo".to_string(),
+                },
+                required: false,
+                record_name: call[2].to_string(),
+                source_file: source_file.to_string(),
+            });
+        }
+        for call in shine_time_re.captures_iter(body) {
+            references.insert(ExtractedRuntimeNameReference {
+                target: RuntimeNameReferenceTarget::Actor {
+                    factory_name: "Shine".to_string(),
+                },
+                required: false,
+                record_name: call[1].to_string(),
+                source_file: source_file.to_string(),
+            });
+        }
+    }
+
+    // State-machine implementations are emitted through DEFINE_NERVE rather than
+    // ordinary Class::method definitions. Attribute a name lookup to the actor
+    // type recovered from the nerve body's checked getBody cast.
+    for nerve in nerve_re.find_iter(text) {
+        let Some(body) = braced_body(text, nerve.end() - 1) else {
+            continue;
+        };
+        let Some(actor) = nerve_body_re.captures(body) else {
+            continue;
+        };
+        if actor[1] != actor[2] {
+            continue;
+        }
+        let references = by_class.entry(actor[1].to_string()).or_default();
+        for call in shine_demo_re.captures_iter(body) {
+            references.insert(ExtractedRuntimeNameReference {
+                target: RuntimeNameReferenceTarget::Actor {
+                    factory_name: "Shine".to_string(),
+                },
+                required: true,
+                record_name: call[1].to_string(),
+                source_file: source_file.to_string(),
+            });
+            references.insert(ExtractedRuntimeNameReference {
+                target: RuntimeNameReferenceTarget::PlacementRecord {
+                    type_name: "CameraMapInfo".to_string(),
+                },
+                required: true,
+                record_name: call[2].to_string(),
+                source_file: source_file.to_string(),
+            });
+        }
+        for call in shine_time_re.captures_iter(body) {
+            references.insert(ExtractedRuntimeNameReference {
+                target: RuntimeNameReferenceTarget::Actor {
+                    factory_name: "Shine".to_string(),
+                },
+                required: true,
+                record_name: call[1].to_string(),
+                source_file: source_file.to_string(),
+            });
+        }
+    }
+    by_class
+        .into_iter()
+        .map(|(class_name, references)| (class_name, references.into_iter().collect()))
         .collect()
 }
 
@@ -3696,6 +3872,8 @@ fn dedup_registry(registry: &mut ObjectRegistry) -> Result<()> {
     registry
         .runtime_map_obj_dependencies
         .dedup_by(|a, b| a.factory_name == b.factory_name && a.resource_name == b.resource_name);
+    registry.runtime_name_references.sort();
+    registry.runtime_name_references.dedup();
 
     registry.enemy_manager_animation_folders.sort_by(|a, b| {
         a.factory_name
@@ -3814,6 +3992,46 @@ fn validate_registry(registry: &ObjectRegistry) -> Result<()> {
                     dependency.factory_name, dependency.resource_name
                 ),
             });
+        }
+    }
+
+    for reference in &registry.runtime_name_references {
+        if reference.record_name.is_empty() || reference.source_file.is_empty() {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!(
+                    "factory {} has a runtime name reference without a name or provenance",
+                    reference.factory_name
+                ),
+            });
+        }
+        if !objects.contains_key(reference.factory_name.as_str()) {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!(
+                    "runtime name reference {:?} has no registered owner factory {}",
+                    reference.record_name, reference.factory_name
+                ),
+            });
+        }
+        match &reference.target {
+            RuntimeNameReferenceTarget::Actor { factory_name }
+                if !objects.contains_key(factory_name.as_str()) =>
+            {
+                return Err(SchemaError::RegistryInvariant {
+                    detail: format!(
+                        "runtime name reference {:?} targets unknown actor factory {}",
+                        reference.record_name, factory_name
+                    ),
+                });
+            }
+            RuntimeNameReferenceTarget::PlacementRecord { type_name } if type_name.is_empty() => {
+                return Err(SchemaError::RegistryInvariant {
+                    detail: format!(
+                        "runtime name reference {:?} has an empty placement-record type",
+                        reference.record_name
+                    ),
+                });
+            }
+            _ => {}
         }
     }
 
@@ -4448,6 +4666,44 @@ mod tests {
                 ),
             ]
         );
+    }
+    #[test]
+    fn extracts_runtime_shine_and_demo_camera_name_references() {
+        let text = r#"
+            DEFINE_NERVE(TNerveFixtureBossDie, TLiveActor) {
+                TFixtureBoss* boss = (TFixtureBoss*)spine->getBody();
+                gpItemManager->makeShineAppearWithDemo(
+                    "reward shine", "reward camera", 1.0f, 2.0f, 3.0f);
+            }
+
+            void TTimedActor::finish() {
+                gpItemManager->makeShineAppearWithTime(
+                    "timed reward", 60, 1.0f, 2.0f, 3.0f, 0, 0, 0);
+            }
+        "#;
+        let extracted = extract_runtime_name_references(text, "src/Enemy/fixture.cpp")
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+
+        assert!(extracted["TFixtureBoss"].iter().any(|reference| {
+            reference.required
+                && reference.record_name == "reward shine"
+                && matches!(
+                    &reference.target,
+                    RuntimeNameReferenceTarget::Actor { factory_name }
+                        if factory_name == "Shine"
+                )
+        }));
+        assert!(extracted["TFixtureBoss"].iter().any(|reference| {
+            reference.record_name == "reward camera"
+                && matches!(
+                    &reference.target,
+                    RuntimeNameReferenceTarget::PlacementRecord { type_name }
+                        if type_name == "CameraMapInfo"
+                )
+        }));
+        assert_eq!(extracted["TTimedActor"][0].record_name, "timed reward");
+        assert!(!extracted["TTimedActor"][0].required);
     }
 
     #[test]

@@ -1288,6 +1288,65 @@ fn apply_placement_inserts(
     }
     Ok(inserted_roots)
 }
+fn resolve_runtime_actor_names(objects: &[SceneObject]) -> Result<BTreeMap<String, String>> {
+    let by_id = objects
+        .iter()
+        .map(|object| (object.id.as_str(), object))
+        .collect::<BTreeMap<_, _>>();
+    let mut by_target = BTreeMap::<String, String>::new();
+    let mut by_runtime_name = BTreeMap::<String, String>::new();
+
+    for owner in objects {
+        for reference in &owner.runtime_references {
+            let Some(target_id) = reference.target_object_id.as_deref() else {
+                if reference.required {
+                    return Err(stage_export_error(format!(
+                        "object '{}' requires a {} actor for runtime lookup {:?}, but no target is selected",
+                        owner.id, reference.required_factory_name, reference.runtime_name
+                    )));
+                }
+                continue;
+            };
+            let target = by_id.get(target_id).ok_or_else(|| {
+                stage_export_error(format!(
+                    "object '{}' runtime lookup {:?} references missing object '{}'",
+                    owner.id, reference.runtime_name, target_id
+                ))
+            })?;
+            if target.factory_name != reference.required_factory_name {
+                return Err(stage_export_error(format!(
+                    "object '{}' runtime lookup {:?} requires factory '{}', but target '{}' is '{}'",
+                    owner.id,
+                    reference.runtime_name,
+                    reference.required_factory_name,
+                    target.id,
+                    target.factory_name
+                )));
+            }
+            if let Some(existing_name) =
+                by_target.insert(target.id.clone(), reference.runtime_name.clone())
+            {
+                if existing_name != reference.runtime_name {
+                    return Err(stage_export_error(format!(
+                        "target object '{}' cannot satisfy both runtime names {:?} and {:?}",
+                        target.id, existing_name, reference.runtime_name
+                    )));
+                }
+            }
+            if let Some(existing_target) =
+                by_runtime_name.insert(reference.runtime_name.clone(), target.id.clone())
+            {
+                if existing_target != target.id {
+                    return Err(stage_export_error(format!(
+                        "runtime name {:?} is assigned to both '{}' and '{}'",
+                        reference.runtime_name, existing_target, target.id
+                    )));
+                }
+            }
+        }
+    }
+    Ok(by_target)
+}
 
 fn reconcile_scene_objects(
     archive: &mut SourceFreeStageArchive,
@@ -1295,6 +1354,7 @@ fn reconcile_scene_objects(
     inserted_placement_roots: &[PlacementAddress],
     registry: Option<&ObjectRegistry>,
 ) -> Result<()> {
+    let runtime_actor_names = resolve_runtime_actor_names(objects)?;
     let baseline = archive
         .object_placements()
         .into_iter()
@@ -1355,6 +1415,9 @@ fn reconcile_scene_objects(
                     object,
                     crate::ParameterApplyMode::AllCanonical,
                 )?;
+                if let Some(runtime_name) = runtime_actor_names.get(&object.id) {
+                    record.name.clone_from(runtime_name);
+                }
                 match binding {
                     PlacementBinding::Existing(_) => {
                         if existing.insert(address.clone(), (object, record)).is_some() {
@@ -1380,6 +1443,9 @@ fn reconcile_scene_objects(
                     object,
                     crate::ParameterApplyMode::AllCanonical,
                 )?;
+                if let Some(runtime_name) = runtime_actor_names.get(&object.id) {
+                    record.name.clone_from(runtime_name);
+                }
                 authored.push((placement, object, record));
             }
         }
@@ -2287,8 +2353,71 @@ mod tests {
 
     use crate::{
         AuthoredPlacement, AuthoredPlacementDependency, AuthoredPlacementDependencyTarget,
-        PlacementBinding, Transform,
+        PlacementBinding, SceneRuntimeReferenceBinding, Transform,
     };
+
+    #[test]
+    fn runtime_actor_link_binds_the_selected_arbitrary_shine_instance() {
+        let mut archive = authoring_strategy_archive(Vec::new());
+
+        let mut owner_record = actor_record("reward trigger", [0.0; 3]);
+        owner_record.type_name = "FixtureTrigger".to_string();
+        let mut owner = authored_test_object("owner", owner_record, 7, Vec::new());
+        owner.runtime_references = vec![SceneRuntimeReferenceBinding {
+            required_factory_name: "Shine".to_string(),
+            runtime_name: "runtime reward name".to_string(),
+            required: true,
+            target_object_id: Some("shine-selected".to_string()),
+        }];
+
+        let mut first_record = actor_record("first authored shine", [10.0, 0.0, 0.0]);
+        first_record.type_name = "Shine".to_string();
+        let first = authored_test_object("shine-unselected", first_record, 7, Vec::new());
+
+        let mut selected_record = actor_record("second authored shine", [20.0, 0.0, 0.0]);
+        selected_record.type_name = "Shine".to_string();
+        let selected = authored_test_object("shine-selected", selected_record, 7, Vec::new());
+
+        reconcile_scene_objects(&mut archive, &[owner, first, selected], &[], None).unwrap();
+
+        let mut shine_names = archive
+            .object_placements()
+            .into_iter()
+            .filter(|placement| placement.type_name == "Shine")
+            .map(|placement| placement.name)
+            .collect::<Vec<_>>();
+        shine_names.sort();
+        assert_eq!(shine_names, ["first authored shine", "runtime reward name"]);
+    }
+
+    #[test]
+    fn runtime_actor_link_rejects_an_unassigned_target_before_export() {
+        let mut owner = SceneObject::new("owner", "FixtureTrigger");
+        owner.runtime_references = vec![SceneRuntimeReferenceBinding {
+            required_factory_name: "Shine".to_string(),
+            runtime_name: "runtime reward name".to_string(),
+            required: true,
+            target_object_id: None,
+        }];
+
+        let error = resolve_runtime_actor_names(&[owner])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no target is selected"), "{error}");
+    }
+
+    #[test]
+    fn optional_runtime_actor_link_may_remain_unassigned() {
+        let mut owner = SceneObject::new("owner", "FixtureTrigger");
+        owner.runtime_references = vec![SceneRuntimeReferenceBinding {
+            required_factory_name: "Shine".to_string(),
+            runtime_name: "optional reward name".to_string(),
+            required: false,
+            target_object_id: None,
+        }];
+
+        assert!(resolve_runtime_actor_names(&[owner]).unwrap().is_empty());
+    }
 
     #[test]
     fn authored_stage_lighting_rewrites_typed_records_by_stable_order_and_name() {

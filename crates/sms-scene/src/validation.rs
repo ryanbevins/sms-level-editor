@@ -63,9 +63,85 @@ fn validate_quick_shine_camera(document: &StageDocument) -> Option<ValidationIss
         },
     ))
 }
+fn validate_runtime_actor_links(document: &StageDocument, issues: &mut Vec<ValidationIssue>) {
+    let by_id = document
+        .objects
+        .iter()
+        .map(|object| (object.id.as_str(), object))
+        .collect::<BTreeMap<_, _>>();
+    let mut runtime_names = BTreeMap::<&str, &str>::new();
+    let mut target_names = BTreeMap::<&str, &str>::new();
+
+    for owner in &document.objects {
+        for reference in &owner.runtime_references {
+            let Some(target_id) = reference.target_object_id.as_deref() else {
+                if reference.required {
+                    issues.push(ValidationIssue::error(
+                        "missing-runtime-actor-link",
+                        format!(
+                            "{} requires a {} actor for runtime lookup {:?}; place one and select it in Runtime Links",
+                            owner.id, reference.required_factory_name, reference.runtime_name
+                        ),
+                    ));
+                }
+                continue;
+            };
+            let Some(target) = by_id.get(target_id) else {
+                issues.push(ValidationIssue::error(
+                    "missing-runtime-actor-target",
+                    format!(
+                        "{} runtime lookup {:?} references missing object {}",
+                        owner.id, reference.runtime_name, target_id
+                    ),
+                ));
+                continue;
+            };
+            if target.factory_name != reference.required_factory_name {
+                issues.push(ValidationIssue::error(
+                    "incompatible-runtime-actor-target",
+                    format!(
+                        "{} runtime lookup {:?} requires {}, but {} is {}",
+                        owner.id,
+                        reference.runtime_name,
+                        reference.required_factory_name,
+                        target.id,
+                        target.factory_name
+                    ),
+                ));
+            }
+            if let Some(existing_name) =
+                target_names.insert(target.id.as_str(), reference.runtime_name.as_str())
+            {
+                if existing_name != reference.runtime_name {
+                    issues.push(ValidationIssue::error(
+                        "conflicting-runtime-actor-name",
+                        format!(
+                            "{} is assigned incompatible runtime names {:?} and {:?}",
+                            target.id, existing_name, reference.runtime_name
+                        ),
+                    ));
+                }
+            }
+            if let Some(existing_target) =
+                runtime_names.insert(reference.runtime_name.as_str(), target.id.as_str())
+            {
+                if existing_target != target.id {
+                    issues.push(ValidationIssue::error(
+                        "duplicate-runtime-actor-name",
+                        format!(
+                            "runtime lookup {:?} is assigned to both {} and {}",
+                            reference.runtime_name, existing_target, target.id
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+}
 
 pub(super) fn validate_document(document: &StageDocument) -> Vec<ValidationIssue> {
     let mut issues = document.load_issues.clone();
+    validate_runtime_actor_links(document, &mut issues);
 
     if !document.base_root.exists() {
         issues.push(ValidationIssue::error(
@@ -109,6 +185,13 @@ pub(super) fn validate_document(document: &StageDocument) -> Vec<ValidationIssue
 
     let mut object_ids = BTreeSet::new();
     let mut authored_shines_by_flag = BTreeMap::<i32, Vec<String>>::new();
+    let runtime_target_ids = document
+        .objects
+        .iter()
+        .flat_map(|owner| owner.runtime_references.iter())
+        .filter_map(|reference| reference.target_object_id.as_deref())
+        .collect::<BTreeSet<_>>();
+
     let mut has_quick_authored_shine = false;
     for object in &document.objects {
         if object.id.trim().is_empty() {
@@ -172,6 +255,7 @@ pub(super) fn validate_document(document: &StageDocument) -> Vec<ValidationIssue
         match object.raw_param("collection_type") {
             Some("normal") => {}
             Some("quickly") => has_quick_authored_shine = true,
+            Some(_) if runtime_target_ids.contains(object.id.as_str()) => {}
             Some(mode) => issues.push(ValidationIssue::warning(
                 "shine-requires-external-trigger",
                 format!(

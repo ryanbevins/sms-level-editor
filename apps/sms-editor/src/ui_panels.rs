@@ -1144,6 +1144,85 @@ impl SmsEditorApp {
                 }
             });
 
+            if !object.runtime_references.is_empty() {
+                ui.separator();
+                ui.heading("Runtime Links");
+                ui.small(
+                    "Choose the placed actors used by fixed runtime name lookups. Export binds their runtime identities without changing the editor labels.",
+                );
+                for (index, reference) in object.runtime_references.iter().enumerate() {
+                    let candidates = self
+                        .document
+                        .as_ref()
+                        .into_iter()
+                        .flat_map(|document| document.objects.iter())
+                        .filter(|candidate| {
+                            candidate.id != object.id
+                                && candidate.factory_name == reference.required_factory_name
+                        })
+                        .map(|candidate| {
+                            let label = candidate
+                                .raw_param("name")
+                                .filter(|name| !name.is_empty())
+                                .map_or_else(
+                                    || candidate.id.clone(),
+                                    |name| format!("{name} ({})", candidate.id),
+                                );
+                            (candidate.id.clone(), label)
+                        })
+                        .collect::<Vec<_>>();
+                    let mut selected = reference.target_object_id.clone();
+                    ui.label(format!(
+                        "{}Triggered {}",
+                        if reference.required { "" } else { "Optional " },
+                        reference.required_factory_name
+                    ));
+                    let selected_label = selected
+                        .as_ref()
+                        .and_then(|selected_id| {
+                            candidates
+                                .iter()
+                                .find(|(id, _)| id == selected_id)
+                                .map(|(_, label)| label.as_str())
+                        })
+                        .unwrap_or("Select an actor...");
+                    let response = egui::ComboBox::from_id_salt((
+                        "runtime-reference",
+                        object.id.as_str(),
+                        index,
+                    ))
+                    .selected_text(selected_label)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut selected, None, "Unassigned");
+                        for (candidate_id, label) in &candidates {
+                            ui.selectable_value(&mut selected, Some(candidate_id.clone()), label);
+                        }
+                    });
+                    response.response.on_hover_text(format!(
+                        "{} runtime lookup {:?}; only compatible {} actors are listed.",
+                        if reference.required {
+                            "Required"
+                        } else {
+                            "Optional"
+                        },
+                        reference.runtime_name,
+                        reference.required_factory_name
+                    ));
+                    if selected != reference.target_object_id {
+                        self.update_selected_runtime_reference(index, selected);
+                    }
+                    if candidates.is_empty() && reference.required {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(255, 180, 90),
+                            format!(
+                                "Place a {} actor in this stage, then select it here.",
+                                reference.required_factory_name
+                            ),
+                        );
+                    }
+                }
+            }
+
             ui.separator();
             ui.heading("Params");
             let editable_parameters = self

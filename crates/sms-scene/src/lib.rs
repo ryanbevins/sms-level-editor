@@ -37,8 +37,8 @@ pub use blank_stage::{
 };
 pub use object_authoring::{
     ObjectAuthoringCatalog, ObjectAuthoringCatalogBuild, ObjectAuthoringCatalogWarning,
-    ObjectAuthoringDependency, ObjectAuthoringResource, ObjectAuthoringTableDependency,
-    ObjectAuthoringTemplate, SHINE_QUICK_CAMERA_NAME,
+    ObjectAuthoringDependency, ObjectAuthoringResource, ObjectAuthoringRuntimeActorReference,
+    ObjectAuthoringTableDependency, ObjectAuthoringTemplate, SHINE_QUICK_CAMERA_NAME,
 };
 pub(crate) use object_parameters::validate_object_parameter_links;
 pub use object_parameters::{
@@ -1008,6 +1008,9 @@ pub struct SceneObject {
     /// retain clone capacity requirements without regenerating the registry.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub manager_capacity_dependencies: Vec<String>,
+    /// Editor-selected actors that satisfy fixed runtime name lookups.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runtime_references: Vec<SceneRuntimeReferenceBinding>,
     /// Version of editor-owned safe defaults applied to an authored record.
     ///
     /// Retail/imported objects remain zero. Missing values in older project
@@ -1015,6 +1018,27 @@ pub struct SceneObject {
     /// distinguish legacy authored objects from deliberate current settings.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub authoring_defaults_version: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SceneRuntimeReferenceBinding {
+    pub required_factory_name: String,
+    pub runtime_name: String,
+    #[serde(
+        default = "runtime_reference_required_default",
+        skip_serializing_if = "is_true"
+    )]
+    pub required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_object_id: Option<String>,
+}
+
+fn runtime_reference_required_default() -> bool {
+    true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
 }
 
 fn is_zero_u32(value: &u32) -> bool {
@@ -1099,6 +1123,7 @@ impl SceneObject {
             asset_hints: Vec::new(),
             manager_capacity_dependencies: Vec::new(),
             authoring_defaults_version: 0,
+            runtime_references: Vec::new(),
         }
     }
 

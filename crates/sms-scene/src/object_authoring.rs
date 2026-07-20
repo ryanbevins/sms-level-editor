@@ -9,7 +9,7 @@ use sms_formats::{
 };
 use sms_schema::{
     EnemyActorDefinition, EnemyManagerDefinition, ObjectDefinition, ObjectRegistry,
-    ObjectResourceBinding,
+    ObjectResourceBinding, RuntimeNameReferenceTarget,
 };
 
 use crate::AuthoredPlacementDependencyTarget;
@@ -240,6 +240,8 @@ pub struct ObjectAuthoringTemplate {
     /// Named records outside `map/scene.bin` that the actor reaches through
     /// fixed runtime lookups rather than serialized actor fields.
     pub table_dependencies: Vec<ObjectAuthoringTableDependency>,
+    /// Actor slots reached by fixed runtime name lookups.
+    pub runtime_actor_references: Vec<ObjectAuthoringRuntimeActorReference>,
     pub required_graph_names: Vec<String>,
     pub resources: Vec<ObjectAuthoringResource>,
     pub preview_resource_path: Option<Vec<u8>>,
@@ -257,6 +259,13 @@ pub struct ObjectAuthoringDependency {
 pub struct ObjectAuthoringTableDependency {
     pub target: AuthoredPlacementDependencyTarget,
     pub record: JDramaRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ObjectAuthoringRuntimeActorReference {
+    pub required_factory_name: String,
+    pub runtime_name: String,
+    pub required: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -339,20 +348,21 @@ struct ResolvedCharacterRecords {
 
 fn resolve_runtime_table_dependencies(
     factory_name: &str,
+    preferred_source_stage: &str,
     sources: &[&CatalogSource],
+    registry: &ObjectRegistry,
 ) -> Result<Vec<ObjectAuthoringTableDependency>, String> {
     fn collect_matches(
         parent: &JDramaRecord,
-        spec: &RuntimeTableDependencySpec,
+        record_type: &str,
+        record_name: &str,
         out: &mut Vec<ObjectAuthoringTableDependency>,
     ) {
         let JDramaRecordPayload::Group { children, .. } = &parent.payload else {
             return;
         };
         for child in children {
-            if semantic_type_name(&child.type_name) == spec.record_type
-                && child.name == spec.record_name
-            {
+            if semantic_type_name(&child.type_name) == record_type && child.name == record_name {
                 out.push(ObjectAuthoringTableDependency {
                     target: AuthoredPlacementDependencyTarget::NamedGroup {
                         type_name: parent.type_name.clone(),
@@ -361,25 +371,59 @@ fn resolve_runtime_table_dependencies(
                     record: child.clone(),
                 });
             }
-            collect_matches(child, spec, out);
+            collect_matches(child, record_type, record_name, out);
         }
     }
 
-    let specs = runtime_table_dependency_specs(factory_name);
+    let mut specs = runtime_table_dependency_specs(factory_name)
+        .iter()
+        .map(|spec| (spec.record_type.to_string(), spec.record_name.to_string()))
+        .collect::<BTreeSet<_>>();
+    specs.extend(
+        registry
+            .runtime_name_references
+            .iter()
+            .filter(|reference| reference.factory_name == factory_name)
+            .filter_map(|reference| match &reference.target {
+                RuntimeNameReferenceTarget::PlacementRecord { type_name } => {
+                    Some((type_name.clone(), reference.record_name.clone()))
+                }
+                RuntimeNameReferenceTarget::Actor { .. } => None,
+            }),
+    );
+
     let mut resolved = Vec::new();
-    for spec in specs {
+    for (record_type, record_name) in specs {
         let mut matches = Vec::new();
-        for source in sources {
+        for source in sources
+            .iter()
+            .copied()
+            .filter(|source| source.source_stage == preferred_source_stage)
+        {
             for document in &source.documents {
-                if normalized_path(&document.raw_resource_path) == "map/tables.bin" {
-                    collect_matches(&document.document.root, spec, &mut matches);
+                collect_matches(
+                    &document.document.root,
+                    &record_type,
+                    &record_name,
+                    &mut matches,
+                );
+            }
+        }
+        if matches.is_empty() {
+            for source in sources {
+                for document in &source.documents {
+                    collect_matches(
+                        &document.document.root,
+                        &record_type,
+                        &record_name,
+                        &mut matches,
+                    );
                 }
             }
         }
         let Some(first) = matches.first().cloned() else {
             return Err(format!(
-                "retail catalog has no {} record named {:?} required by {factory_name}",
-                spec.record_type, spec.record_name
+                "retail catalog has no {record_type} record named {record_name:?} required by {factory_name}"
             ));
         };
         if matches
@@ -387,13 +431,35 @@ fn resolve_runtime_table_dependencies(
             .any(|candidate| candidate.target != first.target || candidate.record != first.record)
         {
             return Err(format!(
-                "retail catalog has incompatible {} records named {:?} required by {factory_name}",
-                spec.record_type, spec.record_name
+                "retail catalog has incompatible {record_type} records named {record_name:?} required by {factory_name}"
             ));
         }
         resolved.push(first);
     }
     Ok(resolved)
+}
+
+fn runtime_actor_references(
+    factory_name: &str,
+    registry: &ObjectRegistry,
+) -> Vec<ObjectAuthoringRuntimeActorReference> {
+    registry
+        .runtime_name_references
+        .iter()
+        .filter(|reference| reference.factory_name == factory_name)
+        .filter_map(|reference| match &reference.target {
+            RuntimeNameReferenceTarget::Actor {
+                factory_name: required_factory_name,
+            } => Some(ObjectAuthoringRuntimeActorReference {
+                required: reference.required,
+                required_factory_name: required_factory_name.clone(),
+                runtime_name: reference.record_name.clone(),
+            }),
+            RuntimeNameReferenceTarget::PlacementRecord { .. } => None,
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn parse_common_character_document(
@@ -617,25 +683,31 @@ fn build_from_sources_with_common(
                 continue;
             }
         };
-        let table_dependencies =
-            match resolve_runtime_table_dependencies(&candidate.factory_name, &sources) {
-                Ok(dependencies) => dependencies,
-                Err(reason) => {
-                    warnings.push(ObjectAuthoringCatalogWarning {
-                        source_stage: candidate.source_stage.clone(),
-                        source_asset_path: Some(candidate.source_asset_path.clone()),
-                        message: format!(
-                            "Omitted unsafe authoring candidate '{}': {reason}",
-                            candidate.factory_name
-                        ),
-                    });
-                    continue;
-                }
-            };
+        let table_dependencies = match resolve_runtime_table_dependencies(
+            &candidate.factory_name,
+            &candidate.source_stage,
+            &sources,
+            registry,
+        ) {
+            Ok(dependencies) => dependencies,
+            Err(reason) => {
+                warnings.push(ObjectAuthoringCatalogWarning {
+                    source_stage: candidate.source_stage.clone(),
+                    source_asset_path: Some(candidate.source_asset_path.clone()),
+                    message: format!(
+                        "Omitted unsafe authoring candidate '{}': {reason}",
+                        candidate.factory_name
+                    ),
+                });
+                continue;
+            }
+        };
+        let runtime_actor_references = runtime_actor_references(&candidate.factory_name, registry);
         let preview_resource_path = preview_resource_path(&candidate, &resources, registry);
         templates.insert(
             factory_name,
             ObjectAuthoringTemplate {
+                runtime_actor_references,
                 factory_name: candidate.factory_name,
                 group_index: candidate.group_index,
                 record: candidate.record,
@@ -3456,6 +3528,7 @@ mod tests {
             "BossGesso",
             "BossEel",
             "BossHanachan",
+            "BossPakkun",
         ] {
             assert!(
                 build.catalog.find(factory_name).is_some(),
@@ -3480,6 +3553,36 @@ mod tests {
             "BossGesso promoted retail null graph sentinels into dependencies: {:?}",
             boss_gesso.required_graph_names
         );
+        let boss_pakkun = build
+            .catalog
+            .find("BossPakkun")
+            .expect("BossPakkun retail template");
+        assert!(
+            boss_pakkun
+                .runtime_actor_references
+                .iter()
+                .any(|reference| {
+                    reference.required_factory_name == "Shine" && reference.required
+                }),
+            "BossPakkun omitted its decomp-derived runtime Shine reference"
+        );
+        assert!(
+            boss_pakkun.table_dependencies.iter().any(|dependency| {
+                semantic_type_name(&dependency.record.type_name) == "CameraMapInfo"
+            }),
+            "BossPakkun omitted the support record for its decomp-derived runtime lookup"
+        );
+        let coin_blue = build
+            .catalog
+            .find("CoinBlue")
+            .expect("CoinBlue retail template");
+        assert!(
+            coin_blue.runtime_actor_references.iter().any(|reference| {
+                reference.required_factory_name == "Shine" && !reference.required
+            }),
+            "CoinBlue should expose its inherited conditional reward as an optional link"
+        );
+
         let poihana = build
             .catalog
             .find("PoiHana")

@@ -489,6 +489,7 @@ fn catalog_resource_edit_deltas(
 #[derive(Default)]
 struct CatalogResourceRepair {
     resource_writes: usize,
+    runtime_links_added: usize,
     repaired_factories: Vec<String>,
     errors: Vec<String>,
 }
@@ -499,6 +500,42 @@ fn repair_authored_catalog_resources(
 ) -> CatalogResourceRepair {
     let mut repair = CatalogResourceRepair::default();
     for template in templates {
+        let mut added_links = false;
+        for object in document
+            .objects
+            .iter_mut()
+            .filter(|object| object.factory_name == template.factory_name)
+        {
+            for reference in &template.runtime_actor_references {
+                if let Some(existing) = object.runtime_references.iter_mut().find(|existing| {
+                    existing.required_factory_name == reference.required_factory_name
+                        && existing.runtime_name == reference.runtime_name
+                }) {
+                    if existing.required != reference.required {
+                        existing.required = reference.required;
+                        repair.runtime_links_added += 1;
+                        added_links = true;
+                    }
+                    continue;
+                }
+                object
+                    .runtime_references
+                    .push(sms_scene::SceneRuntimeReferenceBinding {
+                        required_factory_name: reference.required_factory_name.clone(),
+                        runtime_name: reference.runtime_name.clone(),
+                        required: reference.required,
+                        target_object_id: None,
+                    });
+                repair.runtime_links_added += 1;
+                added_links = true;
+            }
+        }
+        if added_links {
+            repair
+                .repaired_factories
+                .push(template.factory_name.clone());
+        }
+
         let preflight = match preflight_catalog_resources(document, template) {
             Ok(preflight) => preflight,
             Err(error) => {
@@ -522,6 +559,8 @@ fn repair_authored_catalog_resources(
         }
         .apply_forward(document);
     }
+    repair.repaired_factories.sort();
+    repair.repaired_factories.dedup();
     repair
 }
 
@@ -1260,6 +1299,16 @@ fn object_from_catalog_template(
     reset_catalog_prototype_transform(&mut prototype, translation)?;
     let uses_versioned_defaults = apply_new_authored_shine_defaults(&mut prototype, &id)?;
     let mut object = SceneObject::new(id, factory_name);
+    object.runtime_references = template
+        .runtime_actor_references
+        .iter()
+        .map(|reference| sms_scene::SceneRuntimeReferenceBinding {
+            required_factory_name: reference.required_factory_name.clone(),
+            runtime_name: reference.runtime_name.clone(),
+            required: reference.required,
+            target_object_id: None,
+        })
+        .collect();
     object.transform = Transform {
         translation,
         ..Transform::default()
@@ -1339,6 +1388,9 @@ fn duplicate_object_for_spawn(
     translation: [f32; 3],
     registry: Option<&ObjectRegistry>,
 ) -> SceneObject {
+    for reference in &mut source.runtime_references {
+        reference.target_object_id = None;
+    }
     if let Some(registry) = registry {
         source.refresh_manager_capacity_dependencies(registry);
     }
@@ -1776,7 +1828,10 @@ impl SmsEditorApp {
                 "Could not repair authored object runtime resources: {error}"
             ));
         }
-        if repair.resource_writes == 0 && migrated_shines.is_empty() {
+        if repair.resource_writes == 0
+            && repair.runtime_links_added == 0
+            && migrated_shines.is_empty()
+        {
             return;
         }
         if let (Some(document), Some(registry)) = (&mut self.document, self.registry.clone()) {
@@ -1796,6 +1851,13 @@ impl SmsEditorApp {
             self.log.push(format!(
                 "Repaired {} missing runtime resource(s) for existing authored class(es): {}. Save the project before launching.",
                 repair.resource_writes,
+                repair.repaired_factories.join(", ")
+            ));
+        }
+        if repair.runtime_links_added > 0 {
+            self.log.push(format!(
+                "Reconciled {} decomp-derived runtime actor link(s) for existing authored class(es): {}. Select required targets in the inspector and save before launching.",
+                repair.runtime_links_added,
                 repair.repaired_factories.join(", ")
             ));
         }
@@ -2270,6 +2332,78 @@ impl SmsEditorApp {
             },
         );
     }
+    pub(super) fn update_selected_runtime_reference(
+        &mut self,
+        reference_index: usize,
+        target_object_id: Option<String>,
+    ) {
+        let Some(before) = self.selected_object().cloned() else {
+            return;
+        };
+        let Some(reference) = before.runtime_references.get(reference_index) else {
+            return;
+        };
+        if let Some(target_id) = target_object_id.as_deref() {
+            let Some(target) = self.document.as_ref().and_then(|document| {
+                document
+                    .objects
+                    .iter()
+                    .find(|object| object.id == target_id)
+            }) else {
+                self.log.push(format!(
+                    "Could not bind runtime reference {:?}: target '{}' no longer exists.",
+                    reference.runtime_name, target_id
+                ));
+                return;
+            };
+            if target.factory_name != reference.required_factory_name {
+                self.log.push(format!(
+                    "Could not bind runtime reference {:?}: '{}' is {}, expected {}.",
+                    reference.runtime_name,
+                    target.id,
+                    target.factory_name,
+                    reference.required_factory_name
+                ));
+                return;
+            }
+            if let Some(conflicting) = self.document.as_ref().and_then(|document| {
+                document
+                    .objects
+                    .iter()
+                    .flat_map(|owner| owner.runtime_references.iter())
+                    .find(|binding| {
+                        binding.target_object_id.as_deref() == Some(target_id)
+                            && binding.runtime_name != reference.runtime_name
+                    })
+            }) {
+                self.log.push(format!(
+                    "Could not bind runtime reference {:?}: '{}' already satisfies incompatible runtime lookup {:?}. Choose another {} actor or unassign the optional link.",
+                    reference.runtime_name,
+                    target_id,
+                    conflicting.runtime_name,
+                    reference.required_factory_name
+                ));
+                return;
+            }
+        }
+        if reference.target_object_id == target_object_id {
+            return;
+        }
+
+        let mut after = before.clone();
+        after.runtime_references[reference_index].target_object_id = target_object_id;
+        self.apply_object_edit(
+            "Updated runtime actor link",
+            ObjectUndoRecord {
+                deltas: vec![ObjectDelta::Update {
+                    before: Box::new(before),
+                    after: Box::new(after),
+                }],
+                resource_deltas: Vec::new(),
+            },
+        );
+    }
+
     #[cfg(test)]
     pub(super) fn mutate_document(&mut self, label: &str, mutate: impl FnOnce(&mut StageDocument)) {
         let in_transaction = self.undo_transaction.is_some();
@@ -2996,6 +3130,7 @@ mod tests {
             dependencies: Vec::new(),
             character_records: Vec::new(),
             table_dependencies: Vec::new(),
+            runtime_actor_references: Vec::new(),
             required_graph_names: Vec::new(),
             resources: Vec::new(),
             preview_resource_path: None,
@@ -3271,6 +3406,7 @@ mod tests {
             transform: Transform::default(),
             raw_params: BTreeMap::new(),
             asset_hints: Vec::new(),
+            runtime_references: Vec::new(),
             manager_capacity_dependencies: Vec::new(),
             authoring_defaults_version: 0,
         });
@@ -3387,6 +3523,7 @@ mod tests {
                 record: dependency_record,
             }],
             character_records: Vec::new(),
+            runtime_actor_references: Vec::new(),
             table_dependencies: Vec::new(),
             required_graph_names: Vec::new(),
             resources: Vec::new(),
@@ -3729,6 +3866,7 @@ mod tests {
             group_index: 4,
             record: prototype,
             dependencies: Vec::new(),
+            runtime_actor_references: Vec::new(),
             character_records: Vec::new(),
             table_dependencies: Vec::new(),
             required_graph_names: vec!["route_a".to_string()],
@@ -3805,6 +3943,11 @@ mod tests {
             factory_name: "FixtureEnemy".to_string(),
             group_index: 4,
             record: prototype,
+            runtime_actor_references: vec![sms_scene::ObjectAuthoringRuntimeActorReference {
+                required_factory_name: "Shine".to_string(),
+                runtime_name: "fixture reward".to_string(),
+                required: true,
+            }],
             dependencies: Vec::new(),
             character_records: Vec::new(),
             table_dependencies: Vec::new(),
@@ -3821,6 +3964,16 @@ mod tests {
         let repair =
             repair_authored_catalog_resources(&mut document, std::slice::from_ref(&template));
         assert_eq!(repair.resource_writes, 1);
+        assert_eq!(repair.runtime_links_added, 1);
+        assert_eq!(
+            document.objects[0].runtime_references,
+            [sms_scene::SceneRuntimeReferenceBinding {
+                required_factory_name: "Shine".to_string(),
+                runtime_name: "fixture reward".to_string(),
+                required: true,
+                target_object_id: None,
+            }]
+        );
         assert_eq!(repair.repaired_factories, ["FixtureEnemy"]);
         assert!(
             document.has_effective_resource(b"fixtureanm/runtime.prm"),
@@ -3830,6 +3983,7 @@ mod tests {
         let second =
             repair_authored_catalog_resources(&mut document, std::slice::from_ref(&template));
         assert_eq!(second.resource_writes, 0);
+        assert_eq!(second.runtime_links_added, 0);
         assert!(second.repaired_factories.is_empty());
         assert_eq!(document.archive_edits.resources.len(), 1);
     }
@@ -3856,6 +4010,7 @@ mod tests {
             dependencies: Vec::new(),
             character_records: Vec::new(),
             table_dependencies: Vec::new(),
+            runtime_actor_references: Vec::new(),
             required_graph_names: Vec::new(),
             resources: vec![sms_scene::ObjectAuthoringResource {
                 raw_resource_path: raw_resource_path.clone(),
@@ -3947,6 +4102,7 @@ mod tests {
 
         let template = sms_scene::ObjectAuthoringTemplate {
             factory_name: "Coin".to_string(),
+            runtime_actor_references: Vec::new(),
             group_index: 4,
             record: JDramaRecord::new("Coin", "coin", JDramaRecordPayload::Empty).unwrap(),
             dependencies: Vec::new(),
@@ -4070,6 +4226,7 @@ mod tests {
 
         let template = sms_scene::ObjectAuthoringTemplate {
             factory_name: "FixtureEnemy".to_string(),
+            runtime_actor_references: Vec::new(),
             group_index: 7,
             record: JDramaRecord::new("FixtureEnemy", "fixture enemy", JDramaRecordPayload::Empty)
                 .unwrap(),
@@ -4381,6 +4538,7 @@ mod tests {
             }],
             character_records: Vec::new(),
             table_dependencies: Vec::new(),
+            runtime_actor_references: Vec::new(),
             required_graph_names: vec!["manager_route".to_string()],
             resources: Vec::new(),
             preview_resource_path: None,
