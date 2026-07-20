@@ -9,6 +9,7 @@ sms-project.toml
 *.arc
 /mods/
 /sms-editor-project/
+/graffito-editor-project/
 /cache/
 
 # Local agent guidance is intentionally not published.

@@ -249,7 +249,7 @@ enum Commands {
         base_root: PathBuf,
         #[arg(long)]
         stage: String,
-        /// Optional SMS Editor project whose object overlay should be applied.
+        /// Optional Graffito-Editor project whose object overlay should be applied.
         #[arg(long)]
         project_root: Option<PathBuf>,
         /// Project Content directory containing `.sms-model-instances.json` and `.smsmodel` assets.
@@ -639,7 +639,7 @@ fn main() -> Result<()> {
                 document.load_project_folder(&project_root)?;
                 if document.loaded_project.is_none() {
                     bail!(
-                        "no SMS Editor project manifest was found at {}",
+                        "no Graffito-Editor project manifest was found at {}",
                         project_root.display()
                     );
                 }

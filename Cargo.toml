@@ -15,7 +15,7 @@ resolver = "2"
 edition = "2021"
 rust-version = "1.95"
 license = "MIT"
-repository = "https://github.com/ryanbevins/sms-level-editor"
+repository = "https://github.com/ryanbevins/Graffito-Editor"
 
 [workspace.dependencies]
 anyhow = "1.0"

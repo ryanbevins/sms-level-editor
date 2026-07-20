@@ -62,7 +62,7 @@ const VIEWPORT_NEAR_CLIP: f32 = 8.0;
 pub fn run() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("SMS Editor")
+            .with_title("Graffito-Editor")
             .with_inner_size([1560.0, 940.0]),
         renderer: eframe::Renderer::Wgpu,
         depth_buffer: 24,
@@ -70,7 +70,7 @@ pub fn run() -> eframe::Result<()> {
     };
 
     eframe::run_native(
-        "SMS Editor",
+        "Graffito-Editor",
         options,
         Box::new(|cc| {
             install_style(&cc.egui_ctx);
@@ -3083,7 +3083,7 @@ fn regional_project_roots(
     base_root: &std::path::Path,
     manifest_base: &std::path::Path,
 ) -> Vec<PathBuf> {
-    const DEFAULT_PROJECT_NAME: &str = "sms-editor-project";
+    const DEFAULT_PROJECT_NAME: &str = "graffito-editor-project";
     let parent = requested
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -3121,9 +3121,9 @@ fn external_project_roots_for_base(base_root: &std::path::Path) -> Vec<PathBuf> 
         .unwrap_or_else(|| std::path::Path::new("."));
     let slug = project_base_slug(base_root);
     vec![
-        parent.join(format!("{slug}-sms-editor-project")),
+        parent.join(format!("{slug}-graffito-editor-project")),
         parent.join(format!(
-            "{slug}-sms-editor-project-{:08x}",
+            "{slug}-graffito-editor-project-{:08x}",
             project_base_hash(base_root) as u32
         )),
     ]
@@ -4742,10 +4742,10 @@ fn editor_window_title(project_name: Option<&str>, stage_id: Option<&str>) -> St
     let project_name = project_name.map(str::trim).filter(|name| !name.is_empty());
     let stage_id = stage_id.map(str::trim).filter(|stage| !stage.is_empty());
     match (project_name, stage_id) {
-        (Some(project), Some(stage)) => format!("{project} - {stage} - SMS Editor"),
-        (Some(project), None) => format!("{project} - SMS Editor"),
-        (None, Some(stage)) => format!("{stage} - SMS Editor"),
-        (None, None) => "SMS Editor".to_string(),
+        (Some(project), Some(stage)) => format!("{project} - {stage} - Graffito-Editor"),
+        (Some(project), None) => format!("{project} - Graffito-Editor"),
+        (None, Some(stage)) => format!("{stage} - Graffito-Editor"),
+        (None, None) => "Graffito-Editor".to_string(),
     }
 }
 

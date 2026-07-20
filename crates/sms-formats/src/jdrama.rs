@@ -2133,7 +2133,7 @@ fn author_jdrama_scenario_archive_slot(
     })?;
     let scenario = JDramaRecord::new(
         "ScenarioArchiveName",
-        format!("SMS Editor {requested_stem}"),
+        format!("Graffito-Editor {requested_stem}"),
         JDramaRecordPayload::Fields {
             fields: vec![field(
                 "archive_name",

@@ -384,7 +384,7 @@ fn validate_standalone_actor_model_budget(
         return Ok(());
     }
     Err(format!(
-        "model instance {} (asset {}) compiles to a {}-byte BMD3 with a {}-byte TEX1, exceeding the SMS Editor standalone {target} safety budget ({} bytes total / {} bytes TEX1) for Sunshine's 24 MiB MEM1. This is an editor safety budget, not a BMD format limit; prune unused textures, downsize them, or use map-terrain mode when the model is intentionally the stage terrain",
+        "model instance {} (asset {}) compiles to a {}-byte BMD3 with a {}-byte TEX1, exceeding the Graffito-Editor standalone {target} safety budget ({} bytes total / {} bytes TEX1) for Sunshine's 24 MiB MEM1. This is an editor safety budget, not a BMD format limit; prune unused textures, downsize them, or use map-terrain mode when the model is intentionally the stage terrain",
         placement.instance_id,
         placement.asset_id,
         total_size,

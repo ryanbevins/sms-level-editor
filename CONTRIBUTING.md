@@ -12,7 +12,7 @@ Run the same checks used by CI before requesting review:
 cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace
-cargo build --locked --release -p sms-editor
+cargo build --locked --release -p graffito-editor
 ```
 
 Format changes must preserve unsupported data byte-for-byte. Rendering changes

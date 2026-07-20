@@ -1,4 +1,4 @@
-# SMS Level Editor
+# Graffito-Editor
 
 > [!WARNING]
 > **This project is experimental, unfinished, and not ready for use.** There is
@@ -11,7 +11,7 @@ implementation, and contribute to the project. Its presence on GitHub should
 not be treated as an end-user release, a compatibility promise, or an indication
 that the editor is currently suitable for mod creation.
 
-SMS Level Editor is a Rust-native research and development project for browsing,
+Graffito-Editor is a Rust-native research and development project for browsing,
 previewing, and eventually editing stages from *Super Mario Sunshine*. It uses
 `egui` for the desktop interface and `wgpu` for the viewport. Format and
 rendering behavior is developed against the
@@ -371,31 +371,31 @@ Dolphin and `nodtool` are optional and are only needed for their corresponding
 development commands.
 
 ```powershell
-git clone https://github.com/ryanbevins/sms-level-editor.git
-cd sms-level-editor
-cargo build --release -p sms-editor
+git clone https://github.com/ryanbevins/Graffito-Editor.git
+cd Graffito-Editor
+cargo build --release -p graffito-editor
 ```
 
-The executable is written to `target\release\sms-editor.exe`.
+The executable is written to `target\release\graffito-editor.exe`.
 
 Launch the development UI at the recent-project hub:
 
 ```powershell
-cargo run --release -p sms-editor
+cargo run --release -p graffito-editor
 ```
 
 Pass a `.sms` descriptor to reopen it directly (the stored last stage is opened
 automatically):
 
 ```powershell
-cargo run --release -p sms-editor -- "C:\Mods\Isle Delfino.sms"
+cargo run --release -p graffito-editor -- "C:\Mods\Isle Delfino.sms"
 ```
 
 Development and diagnostic sessions can also prefill an extracted root, decomp
 root, and stage:
 
 ```powershell
-cargo run --release -p sms-editor -- `
+cargo run --release -p graffito-editor -- `
   --repo-root C:\path\to\sms-decomp `
   --base-root C:\path\to\extracted-game `
   --stage dolpic0
@@ -405,7 +405,7 @@ cargo run --release -p sms-editor -- `
 
 | Package | Current responsibility |
 | --- | --- |
-| `sms-editor` | Desktop UI, object interactions, preview preparation, and GPU viewport |
+| `graffito-editor` | Desktop UI, object interactions, preview preparation, and GPU viewport |
 | `sms-cli` | Extraction helpers, inspection, validation, diagnostics, project export, and Dolphin launch |
 | `sms-formats` | Checked preview readers plus strict source-free semantic readers/writers for supported SMS/GameCube formats |
 | `sms-schema` | Object and preview metadata generated from the SMS decompilation source |
@@ -420,7 +420,7 @@ Development checks used by the repository are:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-cargo build --release -p sms-editor
+cargo build --release -p graffito-editor
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow. Do not

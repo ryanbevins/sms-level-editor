@@ -1,9 +1,9 @@
-# SMS Editor Project Format
+# Graffito-Editor Project Format
 
 > [!WARNING]
 > This format is experimental and may change before the first public release.
 
-An SMS Editor project is identified by one UTF-8 TOML descriptor with the
+A Graffito-Editor project is identified by one UTF-8 TOML descriptor with the
 `.sms` extension. The descriptor is intentionally small and contains no retail
 game assets. It points to an extracted, read-only copy of *Super Mario
 Sunshine* and to a separate managed project-data folder.
@@ -31,7 +31,7 @@ dolphin_user_directory = "C:\\DolphinProfiles\\SMS-Modding"
 Required fields are:
 
 - `format_version`: currently `1`;
-- `kind`: always `sms-editor-project`;
+- `kind`: always `sms-editor-project` (retained as a compatibility identifier);
 - `name`: the user-facing project name;
 - `project_id`: a stable identity generated when the descriptor is created;
 - `created_with`: the editor version that created the descriptor;
@@ -183,7 +183,7 @@ Both managed launch actions require `launch.dolphin_executable`. The optional
 
 The launch hub keeps a separate application-level index of up to 12 recent
 `.sms` descriptor paths. On Windows it is stored at
-`%APPDATA%\SMS Editor\recent-projects.toml`. This index is not part of a project
+`%APPDATA%\Graffito-Editor\recent-projects.toml`. This index is not part of a project
 and can be deleted without losing project data.
 
 ## Legacy folders

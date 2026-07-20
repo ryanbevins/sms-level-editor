@@ -90,12 +90,12 @@ pub enum SceneError {
     InvalidProjectRoot(PathBuf),
     #[error("project output folder overlaps the extracted base game directory: {0}")]
     ProjectOverlapsBase(PathBuf),
-    #[error("refusing to replace a directory that is not an owned SMS Editor project: {0}")]
+    #[error("refusing to replace a directory that is not an owned Graffito-Editor project: {0}")]
     UnownedProjectRoot(PathBuf),
-    #[error("unsupported SMS Editor project manifest at {path}: {reason}")]
+    #[error("unsupported Graffito-Editor project manifest at {path}: {reason}")]
     UnsupportedProjectManifest { path: PathBuf, reason: String },
     #[error(
-        "SMS Editor project manifest at {path} belongs to base root '{manifest_base}', not the open base root '{open_base}'"
+        "Graffito-Editor project manifest at {path} belongs to base root '{manifest_base}', not the open base root '{open_base}'"
     )]
     ProjectBaseMismatch {
         path: PathBuf,
@@ -2914,7 +2914,7 @@ mod tests {
     ) -> SceneObject {
         let prototype = JDramaRecord {
             type_name: "Shine".to_string(),
-            name: format!("SMS Editor Shine {id}"),
+            name: format!("Graffito-Editor Shine {id}"),
             payload: JDramaRecordPayload::Actor {
                 transform: sms_formats::JDramaTransform {
                     translation: [0.0; 3],

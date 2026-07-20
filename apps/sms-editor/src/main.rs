@@ -1,3 +1,3 @@
 fn main() -> eframe::Result<()> {
-    sms_editor::run()
+    graffito_editor::run()
 }

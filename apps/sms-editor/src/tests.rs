@@ -104,13 +104,13 @@ fn content_browser_cards_include_game_localized_stage_and_scenario_names() {
 fn window_title_includes_the_project_and_open_level() {
     assert_eq!(
         editor_window_title(Some("Sunshine US"), Some("bianco3")),
-        "Sunshine US - bianco3 - SMS Editor"
+        "Sunshine US - bianco3 - Graffito-Editor"
     );
     assert_eq!(
         editor_window_title(Some("Sunshine US"), None),
-        "Sunshine US - SMS Editor"
+        "Sunshine US - Graffito-Editor"
     );
-    assert_eq!(editor_window_title(None, None), "SMS Editor");
+    assert_eq!(editor_window_title(None, None), "Graffito-Editor");
 }
 
 fn assert_vec3_close(actual: [f32; 3], expected: [f32; 3]) {
@@ -2943,7 +2943,7 @@ fn project_folder_inside_the_base_is_moved_to_a_safe_sibling() {
 
     assert_eq!(
         PathBuf::from(&selection.project_root),
-        root.join("SunshineUSExtract-sms-editor-project")
+        root.join("SunshineUSExtract-graffito-editor-project")
     );
     assert!(selection
         .warning

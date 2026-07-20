@@ -8,7 +8,7 @@
 - [ ] `cargo fmt --all -- --check`
 - [ ] `cargo clippy --locked --workspace --all-targets -- -D warnings`
 - [ ] `cargo test --locked --workspace`
-- [ ] `cargo build --locked --release -p sms-editor`
+- [ ] `cargo build --locked --release -p graffito-editor`
 - [ ] Runtime visual behavior was checked when applicable, or is explicitly
       listed as awaiting manual verification
 

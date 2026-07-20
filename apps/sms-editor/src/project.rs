@@ -376,6 +376,17 @@ impl RecentProjects {
         let Some(config_path) = recent_projects_config_path() else {
             return Self::empty();
         };
+        if !config_path.is_file() {
+            if let Some(legacy_path) = legacy_recent_projects_config_path() {
+                if legacy_path.is_file() {
+                    let legacy = Self::load_from(legacy_path);
+                    return Self {
+                        config_path: Some(config_path),
+                        entries: legacy.entries,
+                    };
+                }
+            }
+        }
         Self::load_from(config_path)
     }
 
@@ -473,7 +484,7 @@ pub(super) fn ensure_sms_extension(path: &Path) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "SMS Editor projects must use the .{SMS_PROJECT_EXTENSION} extension: {}",
+            "Graffito-Editor projects must use the .{SMS_PROJECT_EXTENSION} extension: {}",
             path.display()
         ))
     }
@@ -546,6 +557,36 @@ pub(super) fn recent_age_label(last_opened_unix: u64) -> String {
 
 #[cfg(not(test))]
 fn recent_projects_config_path() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .map(|root| root.join("Graffito-Editor").join("recent-projects.toml"))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::env::var_os("HOME").map(PathBuf::from).map(|root| {
+            root.join("Library")
+                .join("Application Support")
+                .join("Graffito-Editor")
+                .join("recent-projects.toml")
+        })
+    }
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .map(|home| home.join(".config"))
+            })
+            .map(|root| root.join("graffito-editor").join("recent-projects.toml"))
+    }
+}
+
+#[cfg(not(test))]
+fn legacy_recent_projects_config_path() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     {
         std::env::var_os("APPDATA")

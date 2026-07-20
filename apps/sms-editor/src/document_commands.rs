@@ -997,7 +997,11 @@ fn apply_new_authored_shine_defaults(
     if semantic_record_type(&prototype.type_name) != "Shine" {
         return Ok(false);
     }
-    set_authored_shine_string_field(prototype, "name", format!("SMS Editor Shine {object_id}"))?;
+    set_authored_shine_string_field(
+        prototype,
+        "name",
+        format!("Graffito-Editor Shine {object_id}"),
+    )?;
     set_authored_shine_string_field(prototype, "collection_type", "normal".to_string())?;
     set_authored_shine_i32_field(prototype, "in_stage", -1)?;
     Ok(true)
@@ -1017,7 +1021,7 @@ fn migrate_legacy_authored_shine_defaults(object: &mut SceneObject) -> Result<bo
     // Older overlays deserialize their parameter values as clean source values. Read the overlay
     // first so this narrow migration never resets a user's Shine ID or other custom parameters to
     // the retail prototype that originally seeded the authored object.
-    let unique_name = format!("SMS Editor Shine {}", object.id);
+    let unique_name = format!("Graffito-Editor Shine {}", object.id);
     let collection_type = match object.raw_param("collection_type") {
         Some("demo") | None => "normal".to_string(),
         Some(value) => value.to_string(),
@@ -1404,7 +1408,7 @@ fn duplicate_object_for_spawn(
         &mut source.placement
     {
         if semantic_record_type(&authored.prototype.type_name) == "Shine" {
-            let unique_name = format!("SMS Editor Shine {}", source.id);
+            let unique_name = format!("Graffito-Editor Shine {}", source.id);
             set_authored_shine_string_field(&mut authored.prototype, "name", unique_name.clone())
                 .ok()
                 .map(|_| unique_name)
@@ -3278,7 +3282,7 @@ mod tests {
 
         assert_eq!(
             object.raw_param("name"),
-            Some("SMS Editor Shine fixture0-obj-0008")
+            Some("Graffito-Editor Shine fixture0-obj-0008")
         );
         assert_eq!(object.raw_param("collection_type"), Some("normal"));
         assert_eq!(object.raw_param("shine_id"), Some("104"));
@@ -3296,7 +3300,7 @@ mod tests {
         );
         assert_eq!(
             duplicate.raw_param("name"),
-            Some("SMS Editor Shine fixture0-obj-0009")
+            Some("Graffito-Editor Shine fixture0-obj-0009")
         );
         assert_eq!(duplicate.raw_param("collection_type"), Some("normal"));
         assert_eq!(duplicate.raw_param("shine_id"), Some("104"));
@@ -3363,7 +3367,7 @@ mod tests {
         assert_eq!(object.raw_param("in_stage"), Some("-1"));
         assert_eq!(
             object.raw_param("name"),
-            Some("SMS Editor Shine fixture0-obj-0008")
+            Some("Graffito-Editor Shine fixture0-obj-0008")
         );
         assert!(!migrate_legacy_authored_shine_defaults(&mut object).unwrap());
 

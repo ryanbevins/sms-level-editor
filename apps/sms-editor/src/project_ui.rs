@@ -34,7 +34,7 @@ impl SmsEditorApp {
         ui.vertical_centered(|ui| {
             ui.add_space((available.height() * 0.07).clamp(28.0, 72.0));
             ui.heading(
-                egui::RichText::new("SMS Editor")
+                egui::RichText::new("Graffito-Editor")
                     .size(34.0)
                     .color(egui::Color32::from_rgb(159, 218, 208)),
             );
@@ -592,7 +592,7 @@ impl SmsEditorApp {
 
     fn import_legacy_project_with_dialogs(&mut self) {
         let Some(legacy_root) = FileDialog::new()
-            .set_title("Choose Legacy SMS Editor Project Folder")
+            .set_title("Choose Legacy Graffito-Editor Project Folder")
             .pick_folder()
         else {
             return;
@@ -713,14 +713,14 @@ pub(super) fn path_display_row(
 
 fn project_open_dialog() -> FileDialog {
     FileDialog::new()
-        .set_title("Open SMS Editor Project")
-        .add_filter("SMS Editor project", &[SMS_PROJECT_EXTENSION])
+        .set_title("Open Graffito-Editor Project")
+        .add_filter("Graffito-Editor project", &[SMS_PROJECT_EXTENSION])
 }
 
 fn project_save_dialog() -> FileDialog {
     FileDialog::new()
-        .set_title("Choose SMS Editor Project File")
-        .add_filter("SMS Editor project", &[SMS_PROJECT_EXTENSION])
+        .set_title("Choose Graffito-Editor Project File")
+        .add_filter("Graffito-Editor project", &[SMS_PROJECT_EXTENSION])
 }
 
 fn folder_dialog(title: &str, current: &str) -> Option<PathBuf> {

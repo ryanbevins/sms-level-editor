@@ -75,7 +75,7 @@ fn run_regression(repo_root: &Path, options: RegressionOptions) -> Result<(), St
 
     run_cargo(
         repo_root,
-        &["build", "--locked", "--release", "-p", "sms-editor"],
+        &["build", "--locked", "--release", "-p", "graffito-editor"],
         None,
     )?;
     println!("\nAll requested regression gates passed.");
