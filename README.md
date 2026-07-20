@@ -269,15 +269,17 @@ descriptor and is protected by a project-identity marker.
 **Launch in Dolphin** performs that same freshness pass, resolves the open
 archive's runtime area and scenario from the staged game's own
 `files/data/stageArc.bin`, and atomically patches the managed copy at
-`run-root/sys/main.dol`. The patcher
-recognizes the game's post-logo transition by PowerPC behavior instead of a
-regional address or known executable hash, so retail, source-built, and modded
-executables retain their own code and stage mappings. Dolphin runs the launch
+`run-root/sys/main.dol`. The patcher recognizes the Nintendo-logo setup and
+post-logo transition by PowerPC behavior instead of a regional address or known
+executable hash, so retail, source-built, and modded executables retain their
+own code and stage mappings. The logo director is skipped, but the game still
+waits for its required background archive, audio, card, and stage-table setup
+before entering gameplay. Dolphin runs the launch
 DOL with its normal user profile by default, preserving the user's controller
 configuration, or with the project-configured Dolphin user directory when one
-is set. It enters the open scene without file select, Delfino Plaza, or scenario selection. An
-automatic movie is bypassed for that initial transition only; later
-transitions keep normal game behavior.
+is set. It enters the open scene without the Nintendo logo sequence, file
+select, Delfino Plaza, or scenario selection. An automatic movie is bypassed
+for that initial transition only; later transitions keep normal game behavior.
 
 When one archive has several runtime contexts, the first entry in that game's
 `stageArc.bin` is used deterministically and the complete match count is

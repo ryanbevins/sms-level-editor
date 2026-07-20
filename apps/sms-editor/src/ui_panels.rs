@@ -537,7 +537,7 @@ impl SmsEditorApp {
         let choose_user_dir =
             path_display_row(ui, "User Dir", &self.dolphin_user_dir, "Browse...", true);
         ui.small(
-            "Launch in Dolphin refreshes the managed runnable mirror and boots the open scene directly. Leave User Dir blank to use your normal Dolphin profile and controller configuration.",
+            "Launch in Dolphin refreshes the managed runnable mirror, skips the Nintendo logo sequence, and boots the open scene directly. Leave User Dir blank to use your normal Dolphin profile and controller configuration.",
         );
         ui.label("Legacy external game launch (optional)");
         let choose_game = path_display_row(ui, "Game", &self.game_path, "Browse...", true);

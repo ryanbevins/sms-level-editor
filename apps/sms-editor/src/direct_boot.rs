@@ -20,6 +20,7 @@ const FILE_ALIGNMENT: u32 = 0x20;
 const MIN_STACK_GAP: u32 = 0x100;
 const THIS_SEARCH_WORDS: usize = 0x100;
 const STATE_COMPARE_SEARCH_WORDS: usize = 0x40;
+const NLOGO_DIRECT_SEARCH_WORDS: usize = 0x40;
 const MOVIE_SEARCH_WORDS: usize = 0xc0;
 const ENTRY_BL_SEARCH_WORDS: usize = 0x40;
 const INIT_REGISTER_SEARCH_WORDS: usize = 0x40;
@@ -40,6 +41,7 @@ pub(super) struct RuntimeStageTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct DirectBootDol {
     pub(super) bytes: Vec<u8>,
+    pub(super) logo_bypass_address: u32,
     pub(super) hook_address: u32,
     pub(super) movie_hook_address: u32,
     pub(super) stub_address: u32,
@@ -117,6 +119,18 @@ struct NlogoHook {
 }
 
 #[derive(Debug, Clone, Copy)]
+struct NlogoDirectorBypass {
+    branch_anchor: WordAnchor,
+    completion_anchor: WordAnchor,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NlogoSetupBypass {
+    case_anchor: WordAnchor,
+    resume_address: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
 struct NextAreaSetter {
     anchor: WordAnchor,
     base_register: u8,
@@ -152,6 +166,8 @@ pub(super) fn patch_sms_direct_boot_dol(
 
     let image = parse_dol(source)?;
     let hook = find_nlogo_hook(source, &image)?;
+    let director_bypass = find_nlogo_director_bypass(source, hook)?;
+    let setup_bypass = find_nlogo_setup_bypass(source, &image, hook.this_register)?;
     let setter = find_next_area_setter(source, &image)?;
     let movie = find_movie_hook(source, &image, setter)?;
     if hook.this_register == hook.next_state_register {
@@ -199,6 +215,22 @@ pub(super) fn patch_sms_direct_boot_dol(
     )?;
 
     let mut bytes = source.to_vec();
+    let director_branch_address = director_bypass.branch_anchor.address()?;
+    write_be_u32(
+        &mut bytes,
+        director_bypass.branch_anchor.file_offset()?,
+        encode_branch(
+            director_branch_address,
+            director_bypass.completion_anchor.address()?,
+            false,
+        )?,
+    )?;
+    let setup_case_address = setup_bypass.case_anchor.address()?;
+    write_be_u32(
+        &mut bytes,
+        setup_bypass.case_anchor.file_offset()?,
+        encode_branch(setup_case_address, setup_bypass.resume_address, false)?,
+    )?;
     write_be_u32(
         &mut bytes,
         hook.anchor
@@ -231,6 +263,7 @@ pub(super) fn patch_sms_direct_boot_dol(
 
     Ok(DirectBootDol {
         bytes,
+        logo_bypass_address: setup_case_address,
         hook_address,
         movie_hook_address,
         stub_address: transition_address,
@@ -431,6 +464,160 @@ fn find_nlogo_hook(source: &[u8], image: &DolImage) -> Result<NlogoHook, String>
     })
 }
 
+fn find_nlogo_director_bypass(
+    source: &[u8],
+    hook: NlogoHook,
+) -> Result<NlogoDirectorBypass, String> {
+    let words = section_words(source, hook.anchor.section)?;
+    let search_start = hook
+        .anchor
+        .word_index
+        .saturating_sub(NLOGO_DIRECT_SEARCH_WORDS);
+    let mut candidates = Vec::new();
+    for word_index in search_start..hook.anchor.word_index.saturating_sub(13) {
+        let sequence = &words[word_index..word_index + 14];
+        let Some(flag_register) = decode_lwz_from_r13(sequence[0]) else {
+            continue;
+        };
+        let Some((director_register, director_base, director_offset)) =
+            decode_d_form(sequence[4], 32)
+        else {
+            continue;
+        };
+        if !is_li(sequence[1], 0)
+            || !is_low_bit_test(sequence[2], flag_register)
+            || !is_bne(sequence[3])
+            || director_base != hook.this_register
+            || director_offset != 4
+        {
+            continue;
+        }
+        let Some((vtable_register, vtable_base, vtable_offset)) = decode_d_form(sequence[5], 32)
+        else {
+            continue;
+        };
+        let Some((method_register, method_base, method_offset)) = decode_d_form(sequence[6], 32)
+        else {
+            continue;
+        };
+        if vtable_base != director_register
+            || vtable_offset != 0
+            || method_base != vtable_register
+            || method_offset != 0x64
+            || !is_mtctr(sequence[7], method_register)
+            || sequence[8] != 0x4e80_0021
+            || !is_cmpwi(sequence[9], 3, 4)
+            || !is_bne(sequence[10])
+            || decode_lwz_from_r13(sequence[11]) != Some(flag_register)
+            || !is_ori(sequence[12], flag_register, flag_register, 1)
+            || decode_d_form(sequence[13], 36)
+                != Some((flag_register, 13, immediate_i16(sequence[0])))
+        {
+            continue;
+        }
+        let sequence_anchor = WordAnchor {
+            section: hook.anchor.section,
+            word_index,
+        };
+        let skip_target =
+            decode_conditional_branch_target(sequence[3], sequence_anchor.address()? + 3 * 4)?;
+        let result_skip_target =
+            decode_conditional_branch_target(sequence[10], sequence_anchor.address()? + 10 * 4)?;
+        let expected_skip_target = sequence_anchor
+            .address()?
+            .checked_add(14 * 4)
+            .ok_or_else(|| "NLogo skip target overflows u32".to_string())?;
+        if skip_target != expected_skip_target || result_skip_target != expected_skip_target {
+            continue;
+        }
+        candidates.push(NlogoDirectorBypass {
+            branch_anchor: WordAnchor {
+                section: hook.anchor.section,
+                word_index: word_index + 3,
+            },
+            completion_anchor: WordAnchor {
+                section: hook.anchor.section,
+                word_index: word_index + 11,
+            },
+        });
+    }
+    require_unique_value(candidates, "NLogo director completion path")
+}
+
+fn find_nlogo_setup_bypass(
+    source: &[u8],
+    image: &DolImage,
+    this_register: u8,
+) -> Result<NlogoSetupBypass, String> {
+    let mut candidates = Vec::new();
+    for section in image
+        .sections
+        .iter()
+        .copied()
+        .filter(|section| section.text)
+    {
+        let words = section_words(source, section)?;
+        for word_index in 0..words.len().saturating_sub(13) {
+            let sequence = &words[word_index..word_index + 14];
+            let Some((display_register, display_base, display_offset)) =
+                decode_d_form(sequence[0], 32)
+            else {
+                continue;
+            };
+            if display_register != 3
+                || display_base != this_register
+                || display_offset != 0x1c
+                || !is_relative_bl(sequence[1])
+                || !is_li(sequence[2], 0x48)
+                || register_t(sequence[2]) != 3
+                || !is_relative_bl(sequence[3])
+            {
+                continue;
+            }
+            let Some(object_register) = decode_or_dot_same_source(sequence[4], 3) else {
+                continue;
+            };
+            if !is_beq(sequence[5])
+                || !is_mr(sequence[6], 3, object_register)
+                || !is_relative_bl(sequence[7])
+                || decode_d_form(sequence[8], 36) != Some((object_register, this_register, 4))
+                || !is_mr(sequence[9], 3, object_register)
+                || decode_d_form(sequence[10], 32) != Some((4, this_register, 0x1c))
+                || decode_d_form(sequence[11], 32) != Some((5, this_register, 0x20))
+                || !is_relative_bl(sequence[12])
+                || !is_unconditional_branch(sequence[13])
+            {
+                continue;
+            }
+            let case_anchor = WordAnchor {
+                section,
+                word_index,
+            };
+            let constructor_skip_address = case_anchor
+                .address()?
+                .checked_add(5 * 4)
+                .ok_or_else(|| "NLogo constructor-skip branch address overflows u32".to_string())?;
+            let constructor_skip_target =
+                decode_conditional_branch_target(sequence[5], constructor_skip_address)?;
+            if constructor_skip_target != case_anchor.address()? + 8 * 4 {
+                continue;
+            }
+            let branch_address = case_anchor
+                .address()?
+                .checked_add(13 * 4)
+                .ok_or_else(|| "NLogo setup resume branch address overflows u32".to_string())?;
+            let resume_address = decode_branch_target(sequence[13], branch_address)?;
+            if !address_is_in_text(&image.sections, resume_address, 4)? {
+                continue;
+            }
+            candidates.push(NlogoSetupBypass {
+                case_anchor,
+                resume_address,
+            });
+        }
+    }
+    require_unique_value(candidates, "NLogo setup case")
+}
 fn find_game_loop_this_register(words: &[u32], hook_word: usize) -> Result<u8, String> {
     let start = hook_word.saturating_sub(THIS_SEARCH_WORDS);
     let mut candidates = Vec::new();
@@ -1120,6 +1307,45 @@ fn is_relative_bl(word: u32) -> bool {
     opcode(word) == 18 && word & 3 == 1
 }
 
+fn decode_or_dot_same_source(word: u32, source_register: u8) -> Option<u8> {
+    (opcode(word) == 31
+        && ((word >> 1) & 0x3ff) == 444
+        && word & 1 == 1
+        && register_t(word) == source_register
+        && ((word >> 11) & 0x1f) as u8 == source_register)
+        .then(|| register_a(word))
+}
+
+fn is_mr(word: u32, target_register: u8, source_register: u8) -> bool {
+    opcode(word) == 31
+        && ((word >> 1) & 0x3ff) == 444
+        && word & 1 == 0
+        && register_t(word) == source_register
+        && register_a(word) == target_register
+        && ((word >> 11) & 0x1f) as u8 == source_register
+}
+
+fn is_mtctr(word: u32, source_register: u8) -> bool {
+    word & !0x03e0_0000 == 0x7c08_03a6 && register_t(word) == source_register
+}
+
+fn is_ori(word: u32, source_register: u8, target_register: u8, immediate: u16) -> bool {
+    opcode(word) == 24
+        && register_t(word) == source_register
+        && register_a(word) == target_register
+        && immediate_u16(word) == immediate
+}
+
+fn is_low_bit_test(word: u32, register: u8) -> bool {
+    opcode(word) == 21
+        && register_t(word) == register
+        && register_a(word) == register
+        && (word >> 11) & 0x1f == 0
+        && (word >> 6) & 0x1f == 31
+        && (word >> 1) & 0x1f == 31
+        && word & 1 == 1
+}
+
 fn is_mr_r3(word: u32, source_register: u8) -> bool {
     opcode(word) == 31
         && ((word >> 1) & 0x3ff) == 444
@@ -1313,6 +1539,52 @@ mod tests {
         install_alignment_cave(&mut words, 0x188, TRANSITION_CAVE_WORDS);
         install_alignment_cave(&mut words, 0x198, MOVIE_PRIMARY_CAVE_WORDS);
         install_alignment_cave(&mut words, 0x1a8, MOVIE_SECONDARY_CAVE_WORDS);
+        // The NLogo proc case constructs and sets up TGCLogoDir. Direct boot
+        // bypasses the case body so the display remains black while the
+        // required asynchronous game-data setup continues.
+        let setup_word = 0x20;
+        let setup_resume_word = 0x40;
+        words[setup_word] = encode_d_form(32, 3, 31, 0x1c);
+        words[setup_word + 1] =
+            encode_branch(address(setup_word + 1), address(0x1c0), true).unwrap();
+        words[setup_word + 2] = encode_li(3, 0x48);
+        words[setup_word + 3] =
+            encode_branch(address(setup_word + 3), address(0x1c1), true).unwrap();
+        words[setup_word + 4] = encode_mr(28, 3) | 1;
+        words[setup_word + 5] = 0x4182_000c; // beq +0xC
+        words[setup_word + 6] = encode_mr(3, 28);
+        words[setup_word + 7] =
+            encode_branch(address(setup_word + 7), address(0x1c2), true).unwrap();
+        words[setup_word + 8] = encode_d_form(36, 28, 31, 4);
+        words[setup_word + 9] = encode_mr(3, 28);
+        words[setup_word + 10] = encode_d_form(32, 4, 31, 0x1c);
+        words[setup_word + 11] = encode_d_form(32, 5, 31, 0x20);
+        words[setup_word + 12] =
+            encode_branch(address(setup_word + 12), address(0x1c3), true).unwrap();
+        words[setup_word + 13] =
+            encode_branch(address(setup_word + 13), address(setup_resume_word), false).unwrap();
+
+        // The NLogo game-loop path normally calls TGCLogoDir::direct until it
+        // returns DONE. The bypass marks that visual half complete immediately
+        // but retains the separate setup-thread completion check.
+        let director_word = layout.hook_word - 0x20;
+        let director_skip_word = director_word + 14;
+        words[director_word] = encode_d_form(32, 0, 13, -0x7000);
+        words[director_word + 1] = encode_li(29, 0);
+        words[director_word + 2] = 0x5400_07ff; // clrlwi. r0, r0, 31
+        words[director_word + 3] =
+            encode_bne(address(director_word + 3), address(director_skip_word)).unwrap();
+        words[director_word + 4] = encode_d_form(32, 3, 31, 4);
+        words[director_word + 5] = encode_d_form(32, 12, 3, 0);
+        words[director_word + 6] = encode_d_form(32, 12, 12, 0x64);
+        words[director_word + 7] = 0x7d88_03a6; // mtctr r12
+        words[director_word + 8] = 0x4e80_0021; // bctrl
+        words[director_word + 9] = 0x2c03_0004; // cmpwi r3, DONE
+        words[director_word + 10] =
+            encode_bne(address(director_word + 10), address(director_skip_word)).unwrap();
+        words[director_word + 11] = encode_d_form(32, 0, 13, -0x7000);
+        words[director_word + 12] = 0x6000_0001; // ori r0, r0, 1
+        words[director_word + 13] = encode_d_form(36, 0, 13, -0x7000);
 
         // Derive the application register from the nearby app-state 2/3
         // comparisons, independent of its absolute address.
@@ -1398,6 +1670,36 @@ mod tests {
     }
 
     #[test]
+    fn retail_nlogo_director_sequence_matches_semantic_helpers() {
+        let sequence = [
+            0x800d_9800,
+            0x3ba0_0000,
+            0x5400_07ff,
+            0x4082_002c,
+            0x807f_0004,
+            0x8183_0000,
+            0x818c_0064,
+            0x7d88_03a6,
+            0x4e80_0021,
+            0x2c03_0004,
+            0x4082_0010,
+            0x800d_9800,
+            0x6000_0001,
+            0x900d_9800,
+        ];
+        assert_eq!(decode_lwz_from_r13(sequence[0]), Some(0));
+        assert!(is_li(sequence[1], 0));
+        assert!(is_low_bit_test(sequence[2], 0));
+        assert_eq!(decode_d_form(sequence[4], 32), Some((3, 31, 4)));
+        assert_eq!(decode_d_form(sequence[5], 32), Some((12, 3, 0)));
+        assert_eq!(decode_d_form(sequence[6], 32), Some((12, 12, 0x64)));
+        assert!(is_mtctr(sequence[7], 12));
+        assert!(is_cmpwi(sequence[9], 3, 4));
+        assert_eq!(decode_lwz_from_r13(sequence[11]), Some(0));
+        assert!(is_ori(sequence[12], 0, 0, 1));
+        assert_eq!(decode_d_form(sequence[13], 36), Some((0, 13, -0x6800)));
+    }
+    #[test]
     fn semantic_patch_injects_target_and_one_shot_movie_bypass() {
         let layout = SyntheticLayout {
             text_address: 0x8000_1000,
@@ -1413,6 +1715,31 @@ mod tests {
         };
 
         let patched = patch_sms_direct_boot_dol(&source, &target).unwrap();
+        let setup_address = layout.text_address + 0x20 * 4;
+        assert_eq!(patched.logo_bypass_address, setup_address);
+        assert_eq!(
+            decode_branch_target(
+                read_be_u32(&patched.bytes, SYNTHETIC_TEXT_OFFSET + 0x20 * 4).unwrap(),
+                setup_address,
+            )
+            .unwrap(),
+            layout.text_address + 0x40 * 4
+        );
+        let director_branch_word = layout.hook_word - 0x20 + 3;
+        let director_branch_address =
+            layout.text_address + u32::try_from(director_branch_word * 4).unwrap();
+        assert_eq!(
+            decode_branch_target(
+                read_be_u32(
+                    &patched.bytes,
+                    SYNTHETIC_TEXT_OFFSET + director_branch_word * 4,
+                )
+                .unwrap(),
+                director_branch_address,
+            )
+            .unwrap(),
+            layout.text_address + u32::try_from((layout.hook_word - 0x20 + 11) * 4).unwrap()
+        );
 
         assert_eq!(
             patched.hook_address,

@@ -3001,6 +3001,7 @@ fn completed_managed_launch_reports_the_resolved_direct_boot_target() {
                     matching_contexts: 4,
                     size_bytes: 9876,
                     reused: false,
+                    logo_bypass_address: 0x800F_9DF4,
                     hook_address: 0x800F_9B4C,
                     movie_hook_address: 0x800F_A000,
                     stub_address: 0x8042_0000,
@@ -3022,6 +3023,7 @@ fn completed_managed_launch_reports_the_resolved_direct_boot_target() {
         message.contains("9876-byte")
             && message.contains("pinnaBeach4.arc")
             && message.contains("runtime area 5, scenario 4")
+            && message.contains("logo bypass 0x800F9DF4")
     }));
     assert!(app
         .log

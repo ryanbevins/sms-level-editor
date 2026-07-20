@@ -1610,7 +1610,7 @@ impl SmsEditorApp {
                                 outcome.run.run_root.display(),
                             ));
                             self.log.push(format!(
-                                "Prepared {} {}-byte direct-boot executable '{}' for '{}' at runtime area {}, scenario {} (hook 0x{:08X}, movie hook 0x{:08X}, stub 0x{:08X}).",
+                                "Prepared {} {}-byte direct-boot executable '{}' for '{}' at runtime area {}, scenario {} (logo bypass 0x{:08X}, hook 0x{:08X}, movie hook 0x{:08X}, stub 0x{:08X}).",
                                 if outcome.direct_boot.reused {
                                     "unchanged"
                                 } else {
@@ -1621,6 +1621,7 @@ impl SmsEditorApp {
                                 outcome.direct_boot.target.archive_name,
                                 outcome.direct_boot.target.area_index,
                                 outcome.direct_boot.target.scenario_index,
+                                outcome.direct_boot.logo_bypass_address,
                                 outcome.direct_boot.hook_address,
                                 outcome.direct_boot.movie_hook_address,
                                 outcome.direct_boot.stub_address,
