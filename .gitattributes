@@ -4,4 +4,6 @@
 *.jpg binary
 *.jpeg binary
 *.ico binary
-
+*.gltf text eol=lf
+*.glb binary
+*.bin binary

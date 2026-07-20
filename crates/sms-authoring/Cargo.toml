@@ -1,0 +1,21 @@
+[package]
+name = "sms-authoring"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+base64.workspace = true
+encoding_rs.workspace = true
+gltf.workspace = true
+image.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sms-formats.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3.23"

@@ -36,7 +36,7 @@ pub(super) fn build_procedural_wave_preview(
     }) else {
         return ProceduralWavePreview::default();
     };
-    let Ok(bytes) = read_stage_asset_bytes(&asset.path) else {
+    let Ok(bytes) = document.read_asset_bytes(&asset.path) else {
         return ProceduralWavePreview::default();
     };
     let Ok(mut texture) = decode_bti_texture(bytes) else {

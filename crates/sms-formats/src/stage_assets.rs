@@ -96,6 +96,45 @@ pub fn scan_stage_assets(base_root: impl AsRef<Path>, stage_id: &str) -> Result<
     Ok(assets)
 }
 
+/// Lists only release-global assets under `common` without selecting or
+/// mounting any retail scene archive.
+///
+/// Genuinely new authored stages use this path so a stage ID that happens to
+/// be a substring of one retail archive cannot pull that level into the new
+/// scene through fuzzy discovery.
+pub fn scan_common_stage_assets(base_root: impl AsRef<Path>) -> Result<Vec<StageAsset>> {
+    let base_root = base_root.as_ref();
+    if !base_root.exists() {
+        return Err(FormatError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("base root does not exist: {}", base_root.display()),
+        )));
+    }
+
+    let mut assets = Vec::new();
+    for entry in WalkDir::new(base_root).follow_links(false) {
+        let entry = entry.map_err(walk_error)?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if is_repo_workspace_file(base_root, path) {
+            continue;
+        }
+        let lower = path.to_string_lossy().to_ascii_lowercase();
+        if !lower.contains("/common/") && !lower.contains("\\common\\") {
+            continue;
+        }
+        assets.push(StageAsset {
+            path: path.to_path_buf(),
+            kind: classify_asset(path),
+        });
+    }
+    assets.sort_by(|left, right| left.path.cmp(&right.path));
+    assets.dedup_by(|left, right| left.path == right.path);
+    Ok(assets)
+}
+
 pub fn discover_scene_archives(base_root: impl AsRef<Path>) -> Result<Vec<SceneArchiveInfo>> {
     let base_root = base_root.as_ref();
     if !base_root.exists() {
@@ -481,6 +520,27 @@ mod tests {
     fn fuzzy_scene_archive_match_rejects_ambiguous_stage_ids() {
         let archives = vec![scene("dolpic0"), scene("dolpic1"), scene("bianco0")];
         assert!(select_scene_archives(&archives, "dolpic").is_err());
+    }
+
+    #[test]
+    fn common_scan_never_selects_a_retail_scene_archive() {
+        let id = TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "sms-formats-common-assets-{}-{id}",
+            std::process::id()
+        ));
+        let common = root.join("files/common/shared.bmd");
+        let retail = root.join("files/data/scene/dolpic0.szs");
+        fs::create_dir_all(common.parent().unwrap()).unwrap();
+        fs::create_dir_all(retail.parent().unwrap()).unwrap();
+        fs::write(&common, b"common").unwrap();
+        fs::write(&retail, b"retail").unwrap();
+
+        let assets = scan_common_stage_assets(&root).unwrap();
+        assert_eq!(assets.len(), 1);
+        assert_eq!(assets[0].path, common);
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

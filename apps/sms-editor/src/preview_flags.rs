@@ -62,7 +62,7 @@ pub(super) fn build_procedural_flag_preview(
                     else {
                         continue;
                     };
-                    let Ok(bytes) = read_stage_asset_bytes(&asset.path) else {
+                    let Ok(bytes) = document.read_asset_bytes(&asset.path) else {
                         continue;
                     };
                     let Ok(mut texture) = decode_bti_texture(bytes) else {
@@ -366,7 +366,7 @@ fn runtime_stage_area_index(
     ];
     let bytes = candidates
         .iter()
-        .find_map(|path| std::fs::read(path).ok())?;
+        .find_map(|path| document.read_asset_bytes(path).ok())?;
     sms_formats::parse_jdrama_scenario_archive_entries(&bytes)
         .ok()?
         .into_iter()
@@ -619,7 +619,11 @@ mod tests {
             assets: Vec::new(),
             objects: vec![SceneObject::new("flag", "MapObjFlag")],
             changed_files: BTreeMap::new(),
+            stage_archive: None,
+            stage_archive_source_path: None,
+            archive_edits: sms_scene::StageArchiveEdits::default(),
             registry: Some(registry),
+            route_authoring: None,
             load_issues: Vec::new(),
             lighting: Default::default(),
             actor_previews: BTreeMap::new(),

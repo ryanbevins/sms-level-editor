@@ -2,6 +2,8 @@
 members = [
     "apps/sms-cli",
     "apps/sms-editor",
+    "apps/xtask",
+    "crates/sms-authoring",
     "crates/sms-formats",
     "crates/sms-render",
     "crates/sms-scene",
@@ -17,11 +19,14 @@ repository = "https://github.com/ryanbevins/Graffito-Editor"
 
 [workspace.dependencies]
 anyhow = "1.0"
+base64 = "0.22"
 bytemuck = { version = "1.25", features = ["derive"] }
 clap = { version = "4.5", features = ["derive"] }
 eframe = { version = "0.35.0", default-features = false, features = ["accesskit", "default_fonts", "wayland", "wgpu", "x11"] }
 egui = "0.35.0"
 encoding_rs = "0.8"
+gltf = { version = "1.4", default-features = false, features = ["names", "utils"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 regex = "1.11"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -29,8 +34,10 @@ thiserror = "2.0"
 toml = "1.1"
 walkdir = "2.5"
 wgpu = "29.0.3"
+uuid = { version = "1.11", features = ["serde", "v4"] }
 
 sms-formats = { path = "crates/sms-formats" }
+sms-authoring = { path = "crates/sms-authoring" }
 sms-render = { path = "crates/sms-render" }
 sms-scene = { path = "crates/sms-scene" }
 sms-schema = { path = "crates/sms-schema" }

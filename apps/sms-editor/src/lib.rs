@@ -1,17 +1,20 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{
+    atomic::{AtomicBool, Ordering},
     mpsc::{self, Receiver, TryRecvError},
     Arc,
 };
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
+#[cfg(test)]
+use sms_formats::read_stage_asset_bytes;
 use sms_formats::{
     decode_bti_texture, discover_scene_archives, mount_scene_archive, parse_jdrama_object_records,
-    read_stage_asset_bytes, J3dAlphaCompare, J3dBillboard, J3dBillboardMode, J3dBlendMode, J3dFile,
+    ColFile, J3dAlphaCompare, J3dBillboard, J3dBillboardMode, J3dBlendMode, J3dFile,
     J3dGeometryPreview, J3dJointAnimation, J3dJointTransformOverride, J3dMaterial, J3dMatrix34,
     J3dPreparedAnimatedTriangles, J3dPreviewCombineMode, J3dTexturePatternAnimation,
     J3dTextureSrtAnimation, J3dTriangle, J3dZMode, JpaEffect, SceneArchiveInfo, StageAsset,
@@ -22,15 +25,39 @@ use sms_render::{
     gx_blend_compatibility, GxBlendCompatibility, RenderScene, RendererConfig, ViewportRenderer,
 };
 use sms_scene::{
-    AssetRef, AssetRole, SceneObject, StageDocument, Transform, ValidationIssue, ValidationSeverity,
+    AssetRef, AssetRole, ObjectAuthoringCatalog, ObjectAuthoringCatalogWarning,
+    RouteAuthoringDocument, SceneError, SceneObject, StageArchiveEdits, StageDocument,
+    StageLighting, StageResourceDocument, StageResourceEdit, Transform, ValidationIssue,
+    ValidationSeverity,
 };
 use sms_schema::{ObjectDefinition, ObjectRegistry, ParticleBindingTarget, SchemaGenerator};
 
 mod camera;
+mod direct_boot;
 mod document_commands;
+mod game_text;
 mod gpu_viewport;
+mod managed_build;
+mod model_assets;
+mod outliner;
+mod play_in_editor;
+mod project;
+mod project_ui;
+mod routes;
+mod scene_labels;
+mod skybox_library;
+mod stage_creation;
 mod ui_panels;
 mod viewport_ui;
+
+use game_text::*;
+use model_assets::*;
+use outliner::*;
+use project::*;
+use project_ui::{path_display_row, NewProjectDraft};
+use scene_labels::*;
+use skybox_library::*;
+use stage_creation::{insert_authored_scene_archive, NewStageDraft};
 
 const VIEWPORT_NEAR_CLIP: f32 = 8.0;
 
@@ -63,6 +90,55 @@ enum EditorTool {
     Place,
 }
 
+#[derive(Debug, Clone)]
+struct ObjectPaletteDragPayload {
+    factory_name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GizmoAxis {
+    X,
+    Y,
+    Z,
+}
+
+impl GizmoAxis {
+    fn index(self) -> usize {
+        match self {
+            Self::X => 0,
+            Self::Y => 1,
+            Self::Z => 2,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::X => "X",
+            Self::Y => "Y",
+            Self::Z => "Z",
+        }
+    }
+
+    fn world_direction(self) -> [f32; 3] {
+        match self {
+            Self::X => [1.0, 0.0, 0.0],
+            Self::Y => [0.0, 1.0, 0.0],
+            Self::Z => [0.0, 0.0, 1.0],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GizmoDrag {
+    axis: GizmoAxis,
+    tool: EditorTool,
+    start_pointer: egui::Pos2,
+    screen_origin: egui::Pos2,
+    screen_direction: egui::Vec2,
+    world_units_per_pixel: f32,
+    start_transform: Transform,
+}
+
 impl EditorTool {
     fn label(self) -> &'static str {
         match self {
@@ -93,18 +169,10 @@ impl ViewMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LeftTab {
-    Project,
+enum BottomTab {
     Content,
     Palette,
-    Outliner,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RightTab {
-    Inspector,
-    Assets,
-    Issues,
+    Console,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -116,26 +184,240 @@ struct PreviewVisibility {
 
 struct LoadedStage {
     base_root: String,
+    requested_project_root: String,
     project_root: String,
     archives: Vec<SceneArchiveInfo>,
     registry: Option<ObjectRegistry>,
     schema_warning: Option<String>,
+    object_authoring_catalog_key: Option<ObjectAuthoringCatalogCacheKey>,
+    object_authoring_catalog: Arc<ObjectAuthoringCatalog>,
+    object_authoring_catalog_warnings: Arc<Vec<ObjectAuthoringCatalogWarning>>,
+    project_warning: Option<String>,
     document: StageDocument,
     scene: RenderScene,
     preview: Option<ModelPreview>,
+    scene_labels: BTreeMap<String, SceneArchiveLabel>,
+    scene_label_warning: Option<String>,
+    retail_skyboxes: Vec<RetailSkyboxEntry>,
+    skybox_warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObjectAuthoringCatalogCacheKey {
+    base_root: String,
+    registry_fingerprint: u64,
+    retail_archive_fingerprint: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ObjectAuthoringCatalogCache {
+    key: ObjectAuthoringCatalogCacheKey,
+    catalog: Arc<ObjectAuthoringCatalog>,
+    warnings: Arc<Vec<ObjectAuthoringCatalogWarning>>,
+}
+
+struct LoadedSchema {
+    registry: ObjectRegistry,
+    object_authoring_catalog_cache: Option<ObjectAuthoringCatalogCache>,
+}
+
+struct ProjectLoadSelection {
+    project_root: String,
+    warning: Option<String>,
+}
+
+struct SceneScanResult {
+    archives: Vec<SceneArchiveInfo>,
+    labels: BTreeMap<String, SceneArchiveLabel>,
+    label_warning: Option<String>,
+    retail_skyboxes: Vec<RetailSkyboxEntry>,
+    skybox_warnings: Vec<String>,
+}
+
+fn build_object_authoring_catalog(
+    base_root: &Path,
+    archives: &[SceneArchiveInfo],
+    registry: &ObjectRegistry,
+) -> ObjectAuthoringCatalogCache {
+    let retail_archives: Vec<_> = archives
+        .iter()
+        .filter(|archive| archive.size_bytes > 0)
+        .cloned()
+        .collect();
+    let build = ObjectAuthoringCatalog::build_with_base_root(&retail_archives, registry, base_root);
+    ObjectAuthoringCatalogCache {
+        key: object_authoring_catalog_cache_key(base_root, archives, registry),
+        catalog: Arc::new(build.catalog),
+        warnings: Arc::new(build.warnings),
+    }
+}
+
+fn object_authoring_catalog_cache_key(
+    base_root: &Path,
+    archives: &[SceneArchiveInfo],
+    registry: &ObjectRegistry,
+) -> ObjectAuthoringCatalogCacheKey {
+    ObjectAuthoringCatalogCacheKey {
+        base_root: normalized_base_root_identity(base_root),
+        registry_fingerprint: object_registry_fingerprint(registry),
+        retail_archive_fingerprint: retail_archive_fingerprint(archives),
+    }
+}
+
+fn object_registry_fingerprint(registry: &ObjectRegistry) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+
+    let registry_bytes = serde_json::to_vec(registry)
+        .expect("ObjectRegistry serialization cannot fail for its data-only schema");
+    fnv1a_bytes(FNV_OFFSET, &registry_bytes)
+}
+
+fn retail_archive_fingerprint(archives: &[SceneArchiveInfo]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+
+    let mut retail_archives: Vec<_> = archives
+        .iter()
+        .filter(|archive| archive.size_bytes > 0)
+        .collect();
+    retail_archives.sort_by(|left, right| {
+        left.stage_id
+            .cmp(&right.stage_id)
+            .then_with(|| left.relative_path.cmp(&right.relative_path))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    retail_archives
+        .into_iter()
+        .fold(FNV_OFFSET, |hash, archive| {
+            let relative_path = archive
+                .relative_path
+                .to_string_lossy()
+                .replace('/', "\\")
+                .to_ascii_lowercase();
+            let hash = fnv1a_bytes(hash, archive.stage_id.as_bytes());
+            let hash = fnv1a_bytes(hash, &[0]);
+            let hash = fnv1a_bytes(hash, relative_path.as_bytes());
+            let hash = fnv1a_bytes(hash, &archive.size_bytes.to_le_bytes());
+            match std::fs::metadata(&archive.path)
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+            {
+                Some(modified) => {
+                    let hash = fnv1a_bytes(hash, &modified.as_secs().to_le_bytes());
+                    fnv1a_bytes(hash, &modified.subsec_nanos().to_le_bytes())
+                }
+                None => fnv1a_bytes(hash, &[0xff]),
+            }
+        })
+}
+
+fn fnv1a_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    for byte in bytes {
+        hash = (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+fn normalized_base_root_identity(base_root: &Path) -> String {
+    let absolute = std::fs::canonicalize(base_root).unwrap_or_else(|_| {
+        if base_root.is_absolute() {
+            base_root.to_path_buf()
+        } else {
+            std::env::current_dir().unwrap_or_default().join(base_root)
+        }
+    });
+    let normalized = absolute
+        .to_string_lossy()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_string();
+    if cfg!(windows) {
+        normalized.to_ascii_lowercase()
+    } else {
+        normalized
+    }
+}
+
+fn resolve_object_authoring_catalog(
+    base_root: &Path,
+    archives: &[SceneArchiveInfo],
+    registry: Option<&ObjectRegistry>,
+    cached: Option<ObjectAuthoringCatalogCache>,
+) -> Option<ObjectAuthoringCatalogCache> {
+    let registry = registry?;
+    let key = object_authoring_catalog_cache_key(base_root, archives, registry);
+    if let Some(cached) = cached.filter(|cached| cached.key == key) {
+        return Some(cached);
+    }
+    Some(build_object_authoring_catalog(
+        base_root, archives, registry,
+    ))
+}
+
+fn split_object_authoring_catalog_cache(
+    cache: Option<ObjectAuthoringCatalogCache>,
+) -> (
+    Option<ObjectAuthoringCatalogCacheKey>,
+    Arc<ObjectAuthoringCatalog>,
+    Arc<Vec<ObjectAuthoringCatalogWarning>>,
+) {
+    cache.map_or_else(
+        || {
+            (
+                None,
+                Arc::new(ObjectAuthoringCatalog::default()),
+                Arc::new(Vec::new()),
+            )
+        },
+        |cache| (Some(cache.key), cache.catalog, cache.warnings),
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DolphinLaunchMode {
+    Editor,
+    External,
+}
+
+impl DolphinLaunchMode {
+    fn progress_label(self) -> &'static str {
+        match self {
+            Self::Editor => "Launch in Editor",
+            Self::External => "Launch in Dolphin",
+        }
+    }
 }
 
 enum BackgroundResult {
-    Schema(Box<Result<ObjectRegistry, String>>),
+    Schema(Box<Result<LoadedSchema, String>>),
     Scan {
         base_root: String,
-        result: Result<Vec<SceneArchiveInfo>, String>,
+        result: Result<SceneScanResult, String>,
     },
     Open(Result<Box<LoadedStage>, String>),
+    CreateStage(Result<Box<LoadedStage>, String>),
+    RetailSkybox(Result<RetailSkyboxSelection, String>),
+    Build(Result<managed_build::ManagedGameBuildOutcome, String>),
+    BuildAndRun {
+        mode: DolphinLaunchMode,
+        result: Result<managed_build::ManagedGameLaunchOutcome, String>,
+    },
 }
 
 mod preview_types;
 use preview_types::*;
+
+fn stage_document_differs_from_saved(
+    document: &StageDocument,
+    saved_objects: &[SceneObject],
+    saved_lighting: &StageLighting,
+    saved_archive_edits: &StageArchiveEdits,
+) -> bool {
+    document.objects != saved_objects
+        || document.lighting != *saved_lighting
+        || document.archive_edits != *saved_archive_edits
+}
 
 fn validation_issues_for_preview(
     document: &StageDocument,
@@ -161,6 +443,25 @@ fn validation_issues_for_preview(
                 "{} additional model asset failure(s) were omitted after the first {} details",
                 preview.failed_models - preview.model_failures.len(),
                 preview.model_failures.len()
+            ),
+        ));
+    }
+    for (index, failure) in preview.collision_failures.iter().enumerate() {
+        issues.push(ValidationIssue::warning(
+            format!("renderer-collision-preview-failed-{index}"),
+            format!(
+                "Collision preview failed for '{}': {}",
+                failure.asset_path, failure.error
+            ),
+        ));
+    }
+    if preview.failed_collision_files > preview.collision_failures.len() {
+        issues.push(ValidationIssue::warning(
+            "renderer-collision-preview-failures-truncated",
+            format!(
+                "{} additional collision asset failure(s) were omitted after the first {} details",
+                preview.failed_collision_files - preview.collision_failures.len(),
+                preview.collision_failures.len()
             ),
         ));
     }
@@ -252,6 +553,114 @@ fn record_model_preview_failure(
     }
 }
 
+#[derive(Default)]
+struct CollisionPreviewBuild {
+    triangles: Vec<CollisionPreviewTriangle>,
+    file_count: usize,
+    surface_types: BTreeSet<u16>,
+    failed_assets: BTreeSet<String>,
+    failures: Vec<PreviewModelFailure>,
+}
+
+impl CollisionPreviewBuild {
+    fn append_file(&mut self, collision: &ColFile) {
+        self.file_count += 1;
+        for group in collision.groups() {
+            self.surface_types.insert(group.surface_type);
+            for triangle in &group.triangles {
+                let [a, b, c] = triangle.vertex_indices;
+                let (Some(a), Some(b), Some(c)) = (
+                    collision.vertices().get(usize::from(a)),
+                    collision.vertices().get(usize::from(b)),
+                    collision.vertices().get(usize::from(c)),
+                ) else {
+                    continue;
+                };
+                self.triangles.push(CollisionPreviewTriangle {
+                    vertices: [a.position, b.position, c.position],
+                    surface_type: group.surface_type,
+                });
+            }
+        }
+    }
+
+    fn record_failure(&mut self, asset_path: &str, error: String) {
+        record_model_preview_failure(
+            &mut self.failed_assets,
+            &mut self.failures,
+            asset_path,
+            error,
+        );
+    }
+}
+
+fn normalized_collision_asset_id(path: &str) -> String {
+    path.replace('\\', "/").to_ascii_lowercase()
+}
+
+fn semantic_collision_asset_id(document: &StageDocument, raw_path: &[u8]) -> String {
+    let raw_path = String::from_utf8_lossy(raw_path).replace('\\', "/");
+    document.stage_archive_source_path.as_ref().map_or_else(
+        || normalized_collision_asset_id(&raw_path),
+        |source| {
+            normalized_collision_asset_id(&format!("{}!/{raw_path}", source.to_string_lossy()))
+        },
+    )
+}
+
+fn build_collision_preview(document: &StageDocument) -> CollisionPreviewBuild {
+    let mut preview = CollisionPreviewBuild::default();
+    let mut loaded_assets = BTreeSet::new();
+
+    if let Some(archive) = &document.stage_archive {
+        for resource in archive.resources() {
+            let StageResourceDocument::Collision(base_collision) = &resource.document else {
+                continue;
+            };
+            let asset_id = semantic_collision_asset_id(document, &resource.raw_path);
+            let collision = document
+                .archive_edits
+                .collisions
+                .iter()
+                .find(|edit| edit.raw_resource_path == resource.raw_path)
+                .map_or(base_collision, |edit| &edit.document);
+            preview.append_file(collision);
+            loaded_assets.insert(asset_id);
+        }
+    }
+
+    for edit in &document.archive_edits.collisions {
+        let asset_id = semantic_collision_asset_id(document, &edit.raw_resource_path);
+        if loaded_assets.insert(asset_id) {
+            preview.append_file(&edit.document);
+        }
+    }
+
+    for asset in document
+        .assets
+        .iter()
+        .filter(|asset| asset.kind == StageAssetKind::Collision)
+    {
+        let asset_path = asset.path.to_string_lossy().replace('\\', "/");
+        if !loaded_assets.insert(normalized_collision_asset_id(&asset_path)) {
+            continue;
+        }
+        let bytes = match document.read_asset_bytes(&asset.path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                preview.record_failure(&asset_path, format!("read asset: {error}"));
+                continue;
+            }
+        };
+        match ColFile::parse(&bytes) {
+            Ok(collision) => preview.append_file(&collision),
+            Err(error) => preview.record_failure(&asset_path, format!("parse COL: {error}")),
+        }
+    }
+
+    preview
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum ObjectDelta {
     Insert {
@@ -269,17 +678,67 @@ enum ObjectDelta {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+struct ResourceEditState {
+    edit: Option<StageResourceEdit>,
+    edit_index: Option<usize>,
+    removal_index: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ResourceEditDelta {
+    raw_resource_path: Vec<u8>,
+    before: ResourceEditState,
+    after: ResourceEditState,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct RouteAuthoringDelta {
+    before: Option<RouteAuthoringDocument>,
+    after: Option<RouteAuthoringDocument>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 struct ObjectUndoRecord {
     deltas: Vec<ObjectDelta>,
+    resource_deltas: Vec<ResourceEditDelta>,
+    route_delta: Option<RouteAuthoringDelta>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObjectUndoTransactionKind {
+    Transform,
+    Parameter,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 struct ObjectUndoTransaction {
     index: usize,
     before: SceneObject,
+    kind: ObjectUndoTransactionKind,
+}
+#[derive(Debug, Clone, PartialEq)]
+struct RouteUndoTransaction {
+    before_objects: Vec<SceneObject>,
+    before_archive_edits: StageArchiveEdits,
+    before_route: Option<RouteAuthoringDocument>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct RouteHandleDrag {
+    graph_id: String,
+    link_id: String,
+    from_handle: bool,
+    plane_y: f32,
 }
 
 struct SmsEditorApp {
+    current_project: Option<OpenProject>,
+    recent_projects: RecentProjects,
+    show_project_hub: bool,
+    project_hub_error: Option<String>,
+    new_project_draft: Option<NewProjectDraft>,
+    new_stage_draft: Option<NewStageDraft>,
+    project_name_draft: String,
     repo_root: String,
     base_root: String,
     project_root: String,
@@ -288,9 +747,14 @@ struct SmsEditorApp {
     game_path: String,
     dolphin_user_dir: String,
     registry: Option<ObjectRegistry>,
+    object_authoring_catalog_cache_key: Option<ObjectAuthoringCatalogCacheKey>,
+    object_authoring_catalog: Arc<ObjectAuthoringCatalog>,
+    object_authoring_catalog_warnings: Arc<Vec<ObjectAuthoringCatalogWarning>>,
     document: Option<StageDocument>,
     render_scene: Option<RenderScene>,
     scene_archives: Vec<SceneArchiveInfo>,
+    scene_labels: BTreeMap<String, SceneArchiveLabel>,
+    retail_skyboxes: Vec<RetailSkyboxEntry>,
     model_preview: Option<ModelPreview>,
     gpu_viewport: Option<gpu_viewport::GpuViewportScene>,
     gpu_target_format: Option<eframe::wgpu::TextureFormat>,
@@ -303,21 +767,68 @@ struct SmsEditorApp {
     palette_factory: Option<String>,
     object_filter: String,
     scene_filter: String,
+    skybox_filter: String,
+    content_browser_kind: ContentBrowserKind,
+    model_asset_filter: String,
+    model_folder_filter: Option<String>,
+    model_asset_rename_draft: String,
+    model_asset_move_draft: String,
+    new_model_folder_draft: String,
+    model_catalog_root: Option<PathBuf>,
+    model_catalog_entries: Vec<sms_authoring::CatalogAssetEntry>,
+    model_catalog_issues: Vec<String>,
+    model_asset_preview_cache: BTreeMap<AuthoredModelPreviewKey, Arc<AuthoredModelPreviewGeometry>>,
+    authored_model_preview_base: Option<AuthoredModelPreviewBase>,
+    selected_model_asset: Option<sms_authoring::AssetId>,
+    selected_model_document: Option<sms_authoring::ModelAssetDocument>,
+    saved_model_document: Option<sms_authoring::ModelAssetDocument>,
+    selected_model_material: usize,
+    selected_model_texture: usize,
+    model_editor_section: ModelEditorSection,
+    model_target_profile: ModelTargetProfile,
+    model_editor_error: Option<String>,
+    gx_json_draft: String,
+    texture_json_draft: String,
+    asset_dirty: bool,
+    asset_undo_stack: VecDeque<ModelAssetUndoRecord>,
+    asset_redo_stack: VecDeque<ModelAssetUndoRecord>,
+    model_import_options: sms_authoring::ModelImportOptions,
+    model_import_job: Option<ModelImportJob>,
+    model_instances: Vec<EditorModelInstance>,
+    model_instances_dirty: bool,
+    model_instance_undo_stack: VecDeque<ModelInstanceUndoRecord>,
+    model_instance_redo_stack: VecDeque<ModelInstanceUndoRecord>,
+    model_collision_override_template: Option<sms_authoring::CollisionSurface>,
+    selected_model_instance_id: Option<uuid::Uuid>,
+    placing_model_asset: Option<sms_authoring::AssetId>,
     last_scanned_base_root: String,
     pending_auto_refresh_root: Option<String>,
     last_auto_refresh_attempt_root: String,
     tool: EditorTool,
     view_mode: ViewMode,
-    left_tab: LeftTab,
-    right_tab: RightTab,
+    bottom_tab: BottomTab,
+    show_project_settings: bool,
+    show_issues: bool,
+    show_console: bool,
+    show_stats: bool,
+    applied_window_title: String,
     snap_enabled: bool,
     snap_translation: f32,
     snap_rotation: f32,
     snap_scale: f32,
     show_environment_meshes: bool,
     show_goop_meshes: bool,
-    show_effect_meshes: bool,
+    show_effects: bool,
+    outliner_filter: String,
     startup_camera_focus: Option<[f32; 3]>,
+    route_mode: bool,
+    show_all_routes: bool,
+    active_route_graph: Option<String>,
+    selected_route_controls: BTreeSet<String>,
+    selected_route_link: Option<String>,
+    route_curve_confirmation: Option<(String, String)>,
+    pending_route_assignment: Option<(String, String)>,
+    route_handle_drag: Option<RouteHandleDrag>,
     startup_focus_object: Option<String>,
     startup_camera_distance: Option<f32>,
     startup_camera_yaw: Option<f32>,
@@ -326,17 +837,27 @@ struct SmsEditorApp {
     viewport_zoom: f32,
     camera_speed: f32,
     camera_fly_velocity: [f32; 3],
+    camera_state_save_pending: bool,
+    camera_state_changed_at: Instant,
+    hovered_gizmo_axis: Option<GizmoAxis>,
+    gizmo_drag: Option<GizmoDrag>,
     next_object_serial: u32,
     saved_objects: Vec<SceneObject>,
+    saved_lighting: StageLighting,
+    saved_archive_edits: StageArchiveEdits,
     document_dirty: bool,
     undo_stack: VecDeque<ObjectUndoRecord>,
     redo_stack: VecDeque<ObjectUndoRecord>,
     undo_transaction: Option<ObjectUndoTransaction>,
+    route_undo_transaction: Option<RouteUndoTransaction>,
     pending_stage_open: Option<String>,
+    pending_project_hub: bool,
     close_confirmation_requested: bool,
     close_authorized: bool,
     background_receiver: Option<Receiver<BackgroundResult>>,
     background_label: Option<String>,
+    active_build_cancel: Option<Arc<AtomicBool>>,
+    embedded_dolphin: Option<play_in_editor::EmbeddedDolphinSession>,
     animation_started_at: Instant,
     last_skeletal_animation_tick: u64,
     level_transform_progress: f32,
@@ -349,19 +870,93 @@ struct SmsEditorApp {
 impl Default for SmsEditorApp {
     fn default() -> Self {
         let args = editor_startup_args();
-        let base_root = args.base_root.unwrap_or_else(default_base_root);
+        let has_project_startup = args.project_file.is_some();
+        let startup_project = args
+            .project_file
+            .as_deref()
+            .map(OpenProject::load)
+            .transpose();
+        let (current_project, project_hub_error) = match startup_project {
+            Ok(project) => (project, None),
+            Err(error) => (None, Some(error)),
+        };
+        #[cfg(test)]
+        let mut recent_projects = RecentProjects::empty();
+        #[cfg(not(test))]
+        let mut recent_projects = RecentProjects::load_default();
+        if let Some(project) = &current_project {
+            let _ = recent_projects.touch(project);
+        }
+        let has_legacy_startup = args.base_root.is_some() && !has_project_startup;
+        let base_root = current_project.as_ref().map_or_else(
+            || args.base_root.unwrap_or_default(),
+            |project| {
+                project
+                    .descriptor
+                    .base_game_root
+                    .to_string_lossy()
+                    .into_owned()
+            },
+        );
+        let repo_root = current_project
+            .as_ref()
+            .and_then(|project| project.descriptor.schema_source_root.as_ref())
+            .map(|path| path.to_string_lossy().into_owned())
+            .or(args.repo_root)
+            .unwrap_or_else(default_repo_root);
+        let project_root = current_project.as_ref().map_or_else(
+            || "sms-editor-project".to_string(),
+            |project| project.data_root().to_string_lossy().into_owned(),
+        );
+        let stage_id = args
+            .stage_id
+            .or_else(|| {
+                current_project
+                    .as_ref()
+                    .and_then(|project| project.descriptor.last_stage.clone())
+            })
+            .unwrap_or_default();
+        let launch = current_project
+            .as_ref()
+            .map(|project| project.descriptor.launch.clone())
+            .unwrap_or_default();
+        let show_project_hub = !has_legacy_startup && current_project.is_none();
         Self {
-            repo_root: args.repo_root.unwrap_or_else(default_repo_root),
+            project_name_draft: current_project
+                .as_ref()
+                .map(|project| project.descriptor.name.clone())
+                .unwrap_or_default(),
+            current_project,
+            recent_projects,
+            show_project_hub,
+            project_hub_error,
+            new_project_draft: None,
+            new_stage_draft: None,
+            repo_root,
             base_root,
-            project_root: "sms-editor-project".to_string(),
-            stage_id: args.stage_id.unwrap_or_else(|| "dolpic0".to_string()),
-            dolphin_path: String::new(),
-            game_path: String::new(),
-            dolphin_user_dir: String::new(),
+            project_root,
+            stage_id,
+            dolphin_path: launch
+                .dolphin_executable
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            game_path: launch
+                .game_image
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            dolphin_user_dir: launch
+                .dolphin_user_directory
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default(),
             registry: None,
+            object_authoring_catalog_cache_key: None,
+            object_authoring_catalog: Arc::new(ObjectAuthoringCatalog::default()),
+            object_authoring_catalog_warnings: Arc::new(Vec::new()),
             document: None,
             render_scene: None,
             scene_archives: Vec::new(),
+            scene_labels: BTreeMap::new(),
+            retail_skyboxes: Vec::new(),
             model_preview: None,
             gpu_viewport: None,
             gpu_target_format: None,
@@ -374,20 +969,67 @@ impl Default for SmsEditorApp {
             palette_factory: None,
             object_filter: String::new(),
             scene_filter: String::new(),
+            skybox_filter: String::new(),
+            content_browser_kind: ContentBrowserKind::default(),
+            model_asset_filter: String::new(),
+            model_folder_filter: None,
+            model_asset_rename_draft: String::new(),
+            model_asset_move_draft: String::new(),
+            new_model_folder_draft: String::new(),
+            model_catalog_root: None,
+            model_catalog_entries: Vec::new(),
+            model_catalog_issues: Vec::new(),
+            model_asset_preview_cache: BTreeMap::new(),
+            authored_model_preview_base: None,
+            selected_model_asset: None,
+            selected_model_document: None,
+            saved_model_document: None,
+            selected_model_material: 0,
+            selected_model_texture: 0,
+            model_editor_section: ModelEditorSection::default(),
+            model_target_profile: ModelTargetProfile::default(),
+            model_editor_error: None,
+            gx_json_draft: String::new(),
+            texture_json_draft: String::new(),
+            asset_dirty: false,
+            asset_undo_stack: VecDeque::new(),
+            asset_redo_stack: VecDeque::new(),
+            model_import_options: sms_authoring::ModelImportOptions::default(),
+            model_import_job: None,
+            model_instances: Vec::new(),
+            model_instances_dirty: false,
+            model_instance_undo_stack: VecDeque::new(),
+            model_instance_redo_stack: VecDeque::new(),
+            model_collision_override_template: None,
+            selected_model_instance_id: None,
+            placing_model_asset: None,
             last_scanned_base_root: String::new(),
             pending_auto_refresh_root: None,
             last_auto_refresh_attempt_root: String::new(),
             tool: EditorTool::Select,
             view_mode: ViewMode::Lit,
-            left_tab: LeftTab::Content,
-            right_tab: RightTab::Inspector,
+            bottom_tab: BottomTab::Content,
+            show_project_settings: false,
+            show_issues: false,
+            show_console: false,
+            show_stats: false,
+            applied_window_title: String::new(),
             snap_enabled: true,
             snap_translation: 50.0,
             snap_rotation: 15.0,
             snap_scale: 0.1,
             show_environment_meshes: true,
             show_goop_meshes: true,
-            show_effect_meshes: false,
+            show_effects: true,
+            outliner_filter: String::new(),
+            route_mode: false,
+            show_all_routes: true,
+            active_route_graph: None,
+            selected_route_controls: BTreeSet::new(),
+            selected_route_link: None,
+            route_curve_confirmation: None,
+            pending_route_assignment: None,
+            route_handle_drag: None,
             startup_camera_focus: args.camera_focus,
             startup_focus_object: args.focus_object,
             startup_camera_distance: args.camera_distance,
@@ -397,17 +1039,27 @@ impl Default for SmsEditorApp {
             viewport_zoom: 1.0,
             camera_speed: 1.0,
             camera_fly_velocity: [0.0; 3],
+            camera_state_save_pending: false,
+            camera_state_changed_at: Instant::now(),
+            hovered_gizmo_axis: None,
+            gizmo_drag: None,
             next_object_serial: 1,
             saved_objects: Vec::new(),
+            saved_lighting: StageLighting::default(),
+            saved_archive_edits: StageArchiveEdits::default(),
             document_dirty: false,
             undo_stack: VecDeque::new(),
             redo_stack: VecDeque::new(),
             undo_transaction: None,
+            route_undo_transaction: None,
             pending_stage_open: None,
+            pending_project_hub: false,
             close_confirmation_requested: false,
             close_authorized: false,
             background_receiver: None,
             background_label: None,
+            active_build_cancel: None,
+            embedded_dolphin: None,
             animation_started_at: Instant::now(),
             last_skeletal_animation_tick: u64::MAX,
             level_transform_progress: 0.0,
@@ -432,24 +1084,37 @@ impl SmsEditorApp {
 }
 
 impl eframe::App for SmsEditorApp {
-    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.poll_background_task(ctx);
-        if ctx.input(|input| input.viewport().close_requested())
-            && self.is_dirty()
-            && !self.close_authorized
-        {
+    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.poll_background_task(ctx, Some(frame));
+        self.poll_embedded_dolphin(ctx);
+        self.poll_model_import(ctx);
+        self.persist_camera_state_if_due();
+        self.sync_window_title(ctx);
+        let close_requested = ctx.input(|input| input.viewport().close_requested());
+        if close_requested {
+            self.flush_camera_state();
+        }
+        if close_requested && self.is_dirty() && !self.close_authorized {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.close_confirmation_requested = true;
+        }
+
+        if self.show_project_hub {
+            return;
+        }
+
+        if self.embedded_dolphin.is_some() {
+            return;
         }
 
         if ctx.egui_wants_keyboard_input() {
             return;
         }
 
-        if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Z)) {
+        if ctx.input(|i| i.modifiers.ctrl && !i.modifiers.shift && i.key_pressed(egui::Key::Z)) {
             self.undo();
         }
-        if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Y)) {
+        if ctx.input(|i| i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::Z)) {
             self.redo();
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Delete)) {
@@ -472,33 +1137,51 @@ impl eframe::App for SmsEditorApp {
         }
     }
 
-    fn ui(&mut self, root_ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, root_ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        if self.show_project_hub {
+            egui::CentralPanel::default().show(root_ui, |ui| self.project_hub(ui));
+            self.new_project_dialog(root_ui.ctx());
+            self.unsaved_changes_dialog(root_ui.ctx());
+            return;
+        }
         self.refresh_scene_browser_if_needed();
+        self.refresh_model_catalog();
 
         egui::Panel::top("toolbar")
-            .default_size(48.0)
+            .default_size(34.0)
             .show(root_ui, |ui| self.toolbar(ui));
-
-        egui::Panel::left("left_dock")
-            .resizable(true)
-            .default_size(350.0)
-            .show(root_ui, |ui| self.left_dock(ui));
 
         egui::Panel::right("right_dock")
             .resizable(true)
-            .default_size(390.0)
+            .default_size(360.0)
             .show(root_ui, |ui| self.right_dock(ui));
 
-        egui::Panel::bottom("console")
+        egui::Panel::bottom("content_dock")
             .resizable(true)
-            .default_size(150.0)
-            .show(root_ui, |ui| self.console(ui));
+            .default_size(300.0)
+            .show(root_ui, |ui| self.bottom_dock(ui));
 
-        egui::CentralPanel::default().show(root_ui, |ui| self.viewport(ui));
-        if self.undo_transaction.is_some() && !root_ui.input(|input| input.pointer.primary_down()) {
-            self.commit_undo_transaction("Updated transform");
-        }
+        egui::CentralPanel::default().show(root_ui, |ui| {
+            self.viewport_toolbar(ui);
+            ui.separator();
+            if self.embedded_dolphin.is_some() {
+                self.embedded_dolphin_viewport(ui, frame);
+            } else {
+                self.viewport(ui);
+            }
+        });
+        let primary_pointer_down = root_ui.input(|input| input.pointer.primary_down());
+        self.finish_pointer_undo_transaction_if_released(primary_pointer_down);
+        self.project_settings_window(root_ui.ctx());
+        self.new_stage_dialog(root_ui.ctx());
+        self.issues_window(root_ui.ctx());
         self.unsaved_changes_dialog(root_ui.ctx());
+    }
+
+    fn on_exit(&mut self) {
+        if let Some(mut session) = self.embedded_dolphin.take() {
+            session.detach_window();
+        }
     }
 }
 
@@ -507,6 +1190,56 @@ impl SmsEditorApp {
 
     // Viewport interaction and painting live in viewport_ui.rs.
 
+    fn sync_window_title(&mut self, ctx: &egui::Context) {
+        let active_stage = (!self.show_project_hub).then_some(self.stage_id.as_str());
+        let desired = editor_window_title(
+            self.current_project
+                .as_ref()
+                .map(|project| project.descriptor.name.as_str()),
+            active_stage,
+        );
+        if self.applied_window_title != desired {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(desired.clone()));
+            self.applied_window_title = desired;
+        }
+    }
+
+    fn reusable_object_authoring_catalog_cache(
+        &self,
+        base_root: &Path,
+        registry: Option<&ObjectRegistry>,
+    ) -> Option<ObjectAuthoringCatalogCache> {
+        let registry = registry?;
+        let key = self.object_authoring_catalog_cache_key.as_ref()?;
+        (key.base_root == normalized_base_root_identity(base_root)
+            && key.registry_fingerprint == object_registry_fingerprint(registry))
+        .then(|| ObjectAuthoringCatalogCache {
+            key: key.clone(),
+            catalog: Arc::clone(&self.object_authoring_catalog),
+            warnings: Arc::clone(&self.object_authoring_catalog_warnings),
+        })
+    }
+
+    fn install_object_authoring_catalog_cache(
+        &mut self,
+        cache: Option<ObjectAuthoringCatalogCache>,
+    ) {
+        let (key, catalog, warnings) = split_object_authoring_catalog_cache(cache);
+        self.object_authoring_catalog_cache_key = key;
+        self.object_authoring_catalog = catalog;
+        self.object_authoring_catalog_warnings = warnings;
+    }
+
+    fn invalidate_object_authoring_catalog_for_changed_base_root(&mut self) {
+        let Some(key) = self.object_authoring_catalog_cache_key.as_ref() else {
+            return;
+        };
+        let selected_base_root = normalized_base_root_identity(Path::new(self.base_root.trim()));
+        if key.base_root != selected_base_root {
+            self.install_object_authoring_catalog_cache(None);
+        }
+    }
+
     fn generate_schema(&mut self) {
         if self.background_receiver.is_some() {
             self.log
@@ -514,10 +1247,30 @@ impl SmsEditorApp {
             return;
         }
         let repo_root = self.repo_root.clone();
+        let base_root = self.base_root.trim().to_string();
+        let archives = if !base_root.is_empty()
+            && normalized_base_root_identity(Path::new(self.last_scanned_base_root.trim()))
+                == normalized_base_root_identity(Path::new(&base_root))
+        {
+            self.scene_archives.clone()
+        } else {
+            Vec::new()
+        };
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
             let result = SchemaGenerator::new(repo_root)
                 .generate()
+                .map(|registry| {
+                    let object_authoring_catalog_cache = (!base_root.is_empty()
+                        && archives.iter().any(|archive| archive.size_bytes > 0))
+                    .then(|| {
+                        build_object_authoring_catalog(Path::new(&base_root), &archives, &registry)
+                    });
+                    LoadedSchema {
+                        registry,
+                        object_authoring_catalog_cache,
+                    }
+                })
                 .map_err(|err| err.to_string());
             let _ = sender.send(BackgroundResult::Schema(Box::new(result)));
         });
@@ -527,6 +1280,7 @@ impl SmsEditorApp {
     }
 
     fn refresh_scene_browser_if_needed(&mut self) {
+        self.invalidate_object_authoring_catalog_for_changed_base_root();
         let base_root = self.base_root.trim().to_string();
         if base_root.is_empty() {
             self.pending_auto_refresh_root = None;
@@ -578,9 +1332,40 @@ impl SmsEditorApp {
 
         let (sender, receiver) = mpsc::channel();
         let task_base_root = base_root.clone();
+        let repo_root = self.repo_root.trim().to_string();
+        let project_root = self.project_root.trim().to_string();
         thread::spawn(move || {
-            let result = discover_scene_archives(PathBuf::from(&task_base_root))
-                .map_err(|err| err.to_string());
+            let result = (|| -> Result<SceneScanResult, String> {
+                let mut archives = discover_scene_archives(PathBuf::from(&task_base_root))
+                    .map_err(|error| error.to_string())?;
+                if !project_root.is_empty() {
+                    let authored = sms_scene::discover_authored_project_stage_ids(&project_root)
+                        .map_err(|error| error.to_string())?;
+                    for stage_id in authored {
+                        insert_authored_scene_archive(
+                            &mut archives,
+                            Path::new(&task_base_root),
+                            &stage_id,
+                        );
+                    }
+                }
+                let (labels, label_warning) = match load_scene_archive_labels(
+                    PathBuf::from(&task_base_root).as_path(),
+                    PathBuf::from(&repo_root).as_path(),
+                    &archives,
+                ) {
+                    Ok(labels) => (labels, None),
+                    Err(error) => (BTreeMap::new(), Some(error)),
+                };
+                let (retail_skyboxes, skybox_warnings) = index_retail_skyboxes(&archives);
+                Ok(SceneScanResult {
+                    archives,
+                    labels,
+                    label_warning,
+                    retail_skyboxes,
+                    skybox_warnings,
+                })
+            })();
             let _ = sender.send(BackgroundResult::Scan {
                 base_root: task_base_root,
                 result,
@@ -599,6 +1384,7 @@ impl SmsEditorApp {
     }
 
     fn request_open_stage(&mut self, stage_id: String) {
+        self.flush_camera_state();
         if self.is_dirty() {
             self.pending_stage_open = Some(stage_id);
         } else {
@@ -624,12 +1410,35 @@ impl SmsEditorApp {
         }
 
         let visibility = self.preview_visibility();
+        let existing_object_authoring_catalog_cache = self
+            .reusable_object_authoring_catalog_cache(Path::new(&base_root), self.registry.as_ref());
         let existing_registry = self.registry.clone();
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
             let result = (|| -> Result<Box<LoadedStage>, String> {
-                let archives = discover_scene_archives(PathBuf::from(&base_root))
+                let mut archives = discover_scene_archives(PathBuf::from(&base_root))
                     .map_err(|err| err.to_string())?;
+                let authored_stage_ids = if project_root.is_empty() {
+                    Vec::new()
+                } else {
+                    sms_scene::discover_authored_project_stage_ids(&project_root)
+                        .map_err(|error| error.to_string())?
+                };
+                for authored_stage_id in &authored_stage_ids {
+                    insert_authored_scene_archive(
+                        &mut archives,
+                        Path::new(&base_root),
+                        authored_stage_id,
+                    );
+                }
+                let (scene_labels, scene_label_warning) = match load_scene_archive_labels(
+                    PathBuf::from(&base_root).as_path(),
+                    PathBuf::from(&repo_root).as_path(),
+                    &archives,
+                ) {
+                    Ok(labels) => (labels, None),
+                    Err(error) => (BTreeMap::new(), Some(error)),
+                };
                 let (registry, schema_warning) = if let Some(registry) = existing_registry {
                     (Some(registry), None)
                 } else {
@@ -638,27 +1447,66 @@ impl SmsEditorApp {
                         Err(err) => (None, Some(err.to_string())),
                     }
                 };
-                let mut document = StageDocument::open(PathBuf::from(&base_root), stage_id)
-                    .map_err(|err| err.to_string())?;
-                if !project_root.is_empty() {
-                    document
-                        .load_project_folder(PathBuf::from(&project_root))
-                        .map_err(|err| err.to_string())?;
-                }
+                let requested_project_root = project_root;
+                let (mut document, project_selection) = if authored_stage_ids
+                    .iter()
+                    .any(|authored| authored.eq_ignore_ascii_case(&stage_id))
+                {
+                    let document = StageDocument::open_authored_project_stage(
+                        PathBuf::from(&base_root),
+                        stage_id,
+                        PathBuf::from(&requested_project_root),
+                    )
+                    .map_err(|error| error.to_string())?;
+                    (
+                        document,
+                        ProjectLoadSelection {
+                            project_root: requested_project_root.clone(),
+                            warning: None,
+                        },
+                    )
+                } else {
+                    let mut document = StageDocument::open(PathBuf::from(&base_root), stage_id)
+                        .map_err(|error| error.to_string())?;
+                    let selection = load_project_for_stage(&mut document, &requested_project_root)
+                        .map_err(|error| error.to_string())?;
+                    (document, selection)
+                };
                 if let Some(registry) = registry.clone() {
                     document = document.with_registry(registry);
                 }
+                let object_authoring_catalog_cache = resolve_object_authoring_catalog(
+                    Path::new(&base_root),
+                    &archives,
+                    registry.as_ref(),
+                    existing_object_authoring_catalog_cache,
+                );
+                let (
+                    object_authoring_catalog_key,
+                    object_authoring_catalog,
+                    object_authoring_catalog_warnings,
+                ) = split_object_authoring_catalog_cache(object_authoring_catalog_cache);
+                let (retail_skyboxes, skybox_warnings) = index_retail_skyboxes(&archives);
                 let scene = RenderScene::from_document(&document);
                 let preview = SmsEditorApp::build_model_preview(&document, visibility);
                 Ok(Box::new(LoadedStage {
                     base_root,
-                    project_root,
+                    requested_project_root,
+                    project_root: project_selection.project_root,
                     archives,
                     registry,
                     schema_warning,
+                    object_authoring_catalog_key,
+                    object_authoring_catalog,
+                    object_authoring_catalog_warnings,
+                    project_warning: project_selection.warning,
                     document,
                     scene,
                     preview,
+                    scene_labels,
+                    scene_label_warning,
+                    retail_skyboxes,
+                    skybox_warnings,
                 }))
             })();
             let _ = sender.send(BackgroundResult::Open(result));
@@ -669,15 +1517,20 @@ impl SmsEditorApp {
             .push(format!("Opening stage '{}'...", self.stage_id));
     }
 
-    fn poll_background_task(&mut self, ctx: &egui::Context) {
+    fn poll_background_task(&mut self, ctx: &egui::Context, frame: Option<&eframe::Frame>) {
         let result = self.background_receiver.as_ref().map(Receiver::try_recv);
         match result {
             Some(Ok(result)) => {
                 self.background_receiver = None;
                 self.background_label = None;
+                self.active_build_cancel = None;
                 match result {
                     BackgroundResult::Schema(result) => match *result {
-                        Ok(registry) => {
+                        Ok(loaded_schema) => {
+                            let LoadedSchema {
+                                registry,
+                                object_authoring_catalog_cache,
+                            } = loaded_schema;
                             self.log.push(format!(
                                 "Generated {} object entries.",
                                 registry.objects.len()
@@ -688,10 +1541,27 @@ impl SmsEditorApp {
                                     &registry,
                                 );
                                 document.set_registry(registry.clone());
-                                self.document_dirty = document.objects != self.saved_objects;
+                                self.document_dirty = stage_document_differs_from_saved(
+                                    document,
+                                    &self.saved_objects,
+                                    &self.saved_lighting,
+                                    &self.saved_archive_edits,
+                                );
                                 self.issues = document.validate();
                             }
+                            self.install_object_authoring_catalog_cache(None);
                             self.registry = Some(registry);
+                            let expected_cache_key = self.registry.as_ref().map(|registry| {
+                                object_authoring_catalog_cache_key(
+                                    Path::new(self.base_root.trim()),
+                                    &self.scene_archives,
+                                    registry,
+                                )
+                            });
+                            let refreshed_cache = object_authoring_catalog_cache
+                                .filter(|cache| expected_cache_key.as_ref() == Some(&cache.key));
+                            self.install_object_authoring_catalog_cache(refreshed_cache);
+                            self.rebuild_model_preview_cache();
                             if self.document.is_some() {
                                 self.rebuild_model_preview_from_document();
                             }
@@ -699,15 +1569,19 @@ impl SmsEditorApp {
                         Err(err) => self.log.push(format!("Schema generation failed: {err}")),
                     },
                     BackgroundResult::Scan { base_root, result } => match result {
-                        Ok(archives) => {
+                        Ok(scan) => {
                             if self.base_root.trim() != base_root {
                                 self.log.push(format!(
                                     "Discarded scene scan for superseded base root {base_root}."
                                 ));
                                 return;
                             }
-                            let count = archives.len();
-                            self.scene_archives = archives;
+                            let count = scan.archives.len();
+                            let label_count = scan.labels.len();
+                            let skybox_count = scan.retail_skyboxes.len();
+                            self.scene_archives = scan.archives;
+                            self.scene_labels = scan.labels;
+                            self.retail_skyboxes = scan.retail_skyboxes;
                             self.last_scanned_base_root = base_root;
                             if self.stage_id.trim().is_empty() {
                                 if let Some(first) = self.scene_archives.first() {
@@ -716,12 +1590,137 @@ impl SmsEditorApp {
                             }
                             self.log
                                 .push(format!("Discovered {count} scene archive(s)."));
+                            if label_count > 0 {
+                                self.log.push(format!(
+                                    "Loaded {label_count} localized scene label(s) from the extracted game."
+                                ));
+                            }
+                            self.log.push(format!(
+                                "Indexed {skybox_count} complete retail skybox bundle(s)."
+                            ));
+                            for warning in scan.skybox_warnings {
+                                self.log.push(warning);
+                            }
+                            if let Some(warning) = scan.label_warning {
+                                self.log.push(format!(
+                                    "Scene names are unavailable; archive IDs remain active: {warning}"
+                                ));
+                            }
                         }
                         Err(err) => self.log.push(format!("Scene scan failed: {err}")),
                     },
                     BackgroundResult::Open(result) => match result {
                         Ok(loaded) => self.apply_loaded_stage(*loaded),
                         Err(err) => self.log.push(format!("Open stage failed: {err}")),
+                    },
+                    BackgroundResult::CreateStage(result) => match result {
+                        Ok(loaded) => {
+                            let target = loaded.document.stage_id.clone();
+                            let runtime_slot = loaded
+                                .document
+                                .changed_files
+                                .get(Path::new("data/stageArc.bin"))
+                                .and_then(|bytes| {
+                                    sms_formats::parse_jdrama_scenario_archive_entries(bytes).ok()
+                                })
+                                .and_then(|entries| {
+                                    entries.into_iter().find(|entry| {
+                                        entry
+                                            .archive_name
+                                            .eq_ignore_ascii_case(&format!("{target}.arc"))
+                                    })
+                                });
+                            self.stage_id = target.clone();
+                            self.apply_loaded_stage(*loaded);
+                            self.persist_project_settings(false);
+                            if let Some(runtime_slot) = runtime_slot {
+                                self.log.push(format!(
+                                    "Created source-free stage '{target}' in new runtime slot area {}, scenario {}.",
+                                    runtime_slot.area_index, runtime_slot.scenario_index
+                                ));
+                            } else {
+                                self.log.push(format!(
+                                    "Created and saved source-free stage '{target}' with a new project runtime slot."
+                                ));
+                            }
+                            self.log.push(
+                                "Author the scene by dropping terrain and Mario into the viewport, then set the skybox role and Stage Lighting before runtime testing."
+                                    .to_string(),
+                            );
+                        }
+                        Err(err) => self.log.push(format!("Create stage failed: {err}")),
+                    },
+                    BackgroundResult::RetailSkybox(result) => match result {
+                        Ok(selection) => self.apply_retail_skybox(selection),
+                        Err(err) => self
+                            .log
+                            .push(format!("Retail skybox selection failed: {err}")),
+                    },
+                    BackgroundResult::Build(result) => match result {
+                        Ok(outcome) => {
+                            self.log.push(format!(
+                                "Built runnable {}-byte stage at '{}' ({} independent copies, {} reused).",
+                                outcome.run.stage_size_bytes,
+                                outcome.run.stage_output_path.display(),
+                                outcome.run.copied_files,
+                                outcome.run.reused_files,
+                            ));
+                            self.log.push(format!(
+                                "Managed game directory: '{}'. The extracted base game was not modified.",
+                                outcome.run.run_root.display(),
+                            ));
+                        }
+                        Err(err) if managed_build::is_cancelled_error(&err) => {
+                            self.log.push(format!("Game build cancelled: {err}"))
+                        }
+                        Err(err) => self.log.push(format!("Game build failed: {err}")),
+                    },
+                    BackgroundResult::BuildAndRun { mode, result } => match result {
+                        Ok(outcome) => {
+                            self.log.push(format!(
+                                "Built runnable {}-byte stage at '{}' ({} independent copies, {} reused).",
+                                outcome.run.stage_size_bytes,
+                                outcome.run.stage_output_path.display(),
+                                outcome.run.copied_files,
+                                outcome.run.reused_files,
+                            ));
+                            self.log.push(format!(
+                                "Managed game directory: '{}'. The extracted base game was not modified.",
+                                outcome.run.run_root.display(),
+                            ));
+                            self.log.push(format!(
+                                "Prepared {} {}-byte direct-boot executable '{}' for '{}' at runtime area {}, scenario {} (logo bypass 0x{:08X}, hook 0x{:08X}, movie hook 0x{:08X}, stub 0x{:08X}).",
+                                if outcome.direct_boot.reused {
+                                    "unchanged"
+                                } else {
+                                    "updated"
+                                },
+                                outcome.direct_boot.size_bytes,
+                                outcome.direct_boot.launch_dol.display(),
+                                outcome.direct_boot.target.archive_name,
+                                outcome.direct_boot.target.area_index,
+                                outcome.direct_boot.target.scenario_index,
+                                outcome.direct_boot.logo_bypass_address,
+                                outcome.direct_boot.hook_address,
+                                outcome.direct_boot.movie_hook_address,
+                                outcome.direct_boot.stub_address,
+                            ));
+                            if outcome.direct_boot.matching_contexts > 1 {
+                                self.log.push(format!(
+                                    "The archive has {} runtime contexts in stageArc.bin; direct boot uses the first table entry (area {}, scenario {}).",
+                                    outcome.direct_boot.matching_contexts,
+                                    outcome.direct_boot.target.area_index,
+                                    outcome.direct_boot.target.scenario_index,
+                                ));
+                            }
+                            self.launch_managed_dolphin(&outcome, mode, frame);
+                        }
+                        Err(err) if managed_build::is_cancelled_error(&err) => self
+                            .log
+                            .push(format!("{} cancelled: {err}", mode.progress_label())),
+                        Err(err) => self
+                            .log
+                            .push(format!("{} failed: {err}", mode.progress_label())),
                     },
                 }
             }
@@ -731,6 +1730,7 @@ impl SmsEditorApp {
             Some(Err(TryRecvError::Disconnected)) => {
                 self.background_receiver = None;
                 self.background_label = None;
+                self.active_build_cancel = None;
                 self.log
                     .push("Background operation ended unexpectedly.".to_string());
             }
@@ -741,13 +1741,22 @@ impl SmsEditorApp {
     fn apply_loaded_stage(&mut self, loaded: LoadedStage) {
         let LoadedStage {
             base_root,
+            requested_project_root,
             project_root,
             archives,
             registry,
             schema_warning,
-            document,
+            object_authoring_catalog_key,
+            object_authoring_catalog,
+            object_authoring_catalog_warnings,
+            project_warning,
+            mut document,
             scene,
             preview,
+            scene_labels,
+            scene_label_warning,
+            retail_skyboxes,
+            skybox_warnings,
         } = loaded;
         if self.base_root.trim() != base_root {
             self.log.push(format!(
@@ -755,9 +1764,9 @@ impl SmsEditorApp {
             ));
             return;
         }
-        if self.project_root.trim() != project_root {
+        if self.project_root.trim() != requested_project_root {
             self.log.push(format!(
-                "Discarded stage load for superseded project root {project_root}."
+                "Discarded stage load for superseded project root {requested_project_root}."
             ));
             return;
         }
@@ -773,16 +1782,61 @@ impl SmsEditorApp {
                 "Schema generation failed; stage opened without it: {warning}"
             ));
         }
+        if let Some(warning) = project_warning {
+            self.log.push(warning);
+        }
+        if let Some(warning) = scene_label_warning {
+            self.log.push(format!(
+                "Scene names are unavailable; archive IDs remain active: {warning}"
+            ));
+        }
+        self.project_root = project_root;
+        self.adopt_resolved_project_data_root();
         self.registry = registry;
+        if self.registry.is_some() {
+            self.log.push(format!(
+                "Object authoring catalog indexed {} typed class(es); content-browser placement can add them with automatic manager and resource dependencies.",
+                object_authoring_catalog.len()
+            ));
+        } else {
+            self.log.push(
+                "Object authoring catalog is unavailable until object schema generation succeeds."
+                    .to_string(),
+            );
+        }
+        for warning in object_authoring_catalog_warnings.iter().take(12) {
+            self.log.push(format!(
+                "Object authoring catalog warning [{}]: {}",
+                warning.source_stage, warning.message
+            ));
+        }
+        if object_authoring_catalog_warnings.len() > 12 {
+            self.log.push(format!(
+                "Object authoring catalog omitted {} additional warning(s).",
+                object_authoring_catalog_warnings.len() - 12
+            ));
+        }
+        let object_authoring_catalog_cache =
+            object_authoring_catalog_key.map(|key| ObjectAuthoringCatalogCache {
+                key,
+                catalog: object_authoring_catalog,
+                warnings: object_authoring_catalog_warnings,
+            });
+        self.install_object_authoring_catalog_cache(object_authoring_catalog_cache);
         self.scene_archives = archives;
+        self.scene_labels = scene_labels;
+        self.retail_skyboxes = retail_skyboxes;
         self.last_scanned_base_root = self.base_root.trim().to_string();
         self.log.push(format!(
-            "Opened stage '{}' with {} asset(s), {} model(s), {} collision file(s).",
+            "Opened stage '{}' with {} asset(s), {} model(s), {} collision file(s). You can add typed object classes with automatic dependencies from the content browser.",
             document.stage_id,
             document.assets.len(),
             scene.model_paths.len(),
             scene.collision_paths.len()
         ));
+        for warning in skybox_warnings {
+            self.log.push(warning);
+        }
         if let Some(preview) = &preview {
             self.log.push(format!(
                 "Viewport preview loaded {} model(s), {} sampled point(s), {} triangle(s), {} texture(s), {} BTK material animation(s), {} BCK skeletal animation(s), {} procedural map-joint transformation(s), {} level-change JPA effect(s), {} actor-bound JPA effect(s), {} source vertex/vertices.",
@@ -801,6 +1855,12 @@ impl SmsEditorApp {
                 preview.actor_particles.len(),
                 preview.source_vertices
             ));
+            self.log.push(format!(
+                "Collision preview loaded {} file(s), {} triangle(s), and {} surface type(s).",
+                preview.collision_file_count,
+                preview.collision_triangles.len(),
+                preview.collision_surface_count
+            ));
         } else if !scene.model_paths.is_empty() {
             self.log
                 .push("Viewport preview could not decode BMD vertex data.".to_string());
@@ -816,12 +1876,29 @@ impl SmsEditorApp {
                 issue.code, issue.message
             ));
         }
+        if let Err(error) = document.ensure_route_authoring() {
+            self.log.push(format!("Routes unavailable: {error}"));
+        }
+        self.active_route_graph = document
+            .route_authoring
+            .as_ref()
+            .and_then(|routes| routes.graphs.first())
+            .map(|graph| graph.id.clone());
+        self.selected_route_controls.clear();
+        self.selected_route_link = None;
+        self.route_curve_confirmation = None;
+        self.pending_route_assignment = None;
+        self.route_handle_drag = None;
         self.saved_objects = document.objects.clone();
+        self.saved_lighting = document.lighting.clone();
+        self.saved_archive_edits = document.archive_edits.clone();
         self.document_dirty = false;
         self.stage_id = document.stage_id.clone();
         self.document = Some(document);
         self.render_scene = Some(scene);
+        self.reset_authored_model_preview_base();
         self.model_preview = preview;
+        self.reconcile_loaded_authored_catalog_resources();
         self.animation_started_at = Instant::now();
         self.last_skeletal_animation_tick = u64::MAX;
         self.level_transform_progress = 0.0;
@@ -831,10 +1908,14 @@ impl SmsEditorApp {
         self.rebuild_gpu_viewport_scene();
         self.clear_viewport_preview_cache();
         self.selected_object_id = None;
+        self.selected_model_instance_id = None;
+        self.placing_model_asset = None;
         self.undo_stack.clear();
         self.redo_stack.clear();
         self.undo_transaction = None;
+        self.route_undo_transaction = None;
         self.reset_camera();
+        self.restore_project_camera_state();
         self.apply_startup_camera_focus();
     }
 
@@ -871,6 +1952,14 @@ impl SmsEditorApp {
                 )
             })
             .collect();
+        let has_default_preview_models = models.iter().any(|asset| {
+            is_default_preview_model_path(
+                &asset.path.to_string_lossy().replace('\\', "/"),
+                true,
+                true,
+                true,
+            )
+        });
         let preferred: Vec<_> = models
             .iter()
             .copied()
@@ -884,7 +1973,7 @@ impl SmsEditorApp {
                 )
             })
             .collect();
-        let models = if preferred.is_empty() {
+        let models = if preferred.is_empty() && !has_default_preview_models {
             models
         } else {
             preferred
@@ -905,7 +1994,11 @@ impl SmsEditorApp {
         let mut level_transform_models = Vec::new();
         let mut level_transform_particles = Vec::new();
         let mut actor_particles = Vec::new();
-        let actor_particle_effects = load_actor_particle_effects(document);
+        let actor_particle_effects = if visibility.effects {
+            load_actor_particle_effects(document)
+        } else {
+            BTreeMap::new()
+        };
         let mut next_packet_index = 0usize;
         let mut bounds_min = [f32::INFINITY; 3];
         let mut bounds_max = [f32::NEG_INFINITY; 3];
@@ -921,13 +2014,17 @@ impl SmsEditorApp {
         let mut object_model_indices = BTreeMap::new();
         let mut mirror_actor_positions = BTreeMap::new();
         let mut mirror_model_slots = BTreeMap::new();
+        let collision_preview = build_collision_preview(document);
 
         for asset in models {
             let asset_path = asset.path.to_string_lossy().replace('\\', "/");
             let include_in_camera_bounds = is_camera_bounds_model_path(&asset_path);
             let model_render_layer = preview_render_layer_for_model_path(&asset_path);
+            if !visibility.effects && preview_render_layer_is_effect(model_render_layer) {
+                continue;
+            }
             let is_sky = model_render_layer == PreviewRenderLayer::Sky;
-            let bytes = match read_stage_asset_bytes(&asset.path) {
+            let bytes = match document.read_asset_bytes(&asset.path) {
                 Ok(bytes) => bytes,
                 Err(error) => {
                     record_model_preview_failure(
@@ -1272,6 +2369,9 @@ impl SmsEditorApp {
                 .or_else(|| actor_model_loader_flags(object))
                 .unwrap_or_else(|| model_loader_flags_for_path(&model_path));
             let object_render_layer = preview_render_layer_for_model_path(&model_path);
+            if !visibility.effects && preview_render_layer_is_effect(object_render_layer) {
+                continue;
+            }
             let object_preview_transform = if object_render_layer == PreviewRenderLayer::Heatwave {
                 shimmer_preview_transform(object.transform)
             } else {
@@ -1296,7 +2396,7 @@ impl SmsEditorApp {
                 if failed_model_assets.contains(&normalized_preview_asset_path(&model_path)) {
                     continue;
                 }
-                let bytes = match read_stage_asset_bytes(&model_path) {
+                let bytes = match document.read_asset_bytes(&model_path) {
                     Ok(bytes) => bytes,
                     Err(error) => {
                         record_model_preview_failure(
@@ -1557,7 +2657,7 @@ impl SmsEditorApp {
                     if failed_model_assets.contains(&accessory_cache_key) {
                         continue;
                     }
-                    let bytes = match read_stage_asset_bytes(&asset.path) {
+                    let bytes = match document.read_asset_bytes(&asset.path) {
                         Ok(bytes) => bytes,
                         Err(error) => {
                             record_model_preview_failure(
@@ -1742,14 +2842,16 @@ impl SmsEditorApp {
             })
             .collect();
 
-        push_level_transform_particle_previews(
-            document,
-            &level_transform_models,
-            &mut textures,
-            &mut triangles,
-            &mut next_packet_index,
-            &mut level_transform_particles,
-        );
+        if visibility.effects {
+            push_level_transform_particle_previews(
+                document,
+                &level_transform_models,
+                &mut textures,
+                &mut triangles,
+                &mut next_packet_index,
+                &mut level_transform_particles,
+            );
+        }
         let level_transform_duration_frames =
             level_transform_duration_frames(&level_transform_particles);
         let level_transform_particle_end_frames =
@@ -1771,7 +2873,9 @@ impl SmsEditorApp {
 
         material_animation_bindings.resize_with(materials.len(), Vec::new);
 
-        if loaded_models == 0 || (points.is_empty() && triangles.is_empty()) {
+        if (loaded_models == 0 || (points.is_empty() && triangles.is_empty()))
+            && collision_preview.triangles.is_empty()
+        {
             if failed_model_assets.is_empty() {
                 return None;
             }
@@ -1788,6 +2892,15 @@ impl SmsEditorApp {
             if let Some((robust_min, robust_max)) = robust_preview_bounds(&triangles, &points) {
                 bounds_min = robust_min;
                 bounds_max = robust_max;
+            } else if let Some((collision_min, collision_max)) = robust_position_bounds(
+                &collision_preview
+                    .triangles
+                    .iter()
+                    .flat_map(|triangle| triangle.vertices)
+                    .collect::<Vec<_>>(),
+            ) {
+                bounds_min = collision_min;
+                bounds_max = collision_max;
             }
         }
 
@@ -1803,6 +2916,11 @@ impl SmsEditorApp {
         Some(ModelPreview {
             points,
             triangles,
+            collision_triangles: collision_preview.triangles,
+            collision_file_count: collision_preview.file_count,
+            collision_surface_count: collision_preview.surface_types.len(),
+            failed_collision_files: collision_preview.failed_assets.len(),
+            collision_failures: collision_preview.failures,
             textures,
             materials,
             texture_srt_animations,
@@ -1837,7 +2955,7 @@ impl SmsEditorApp {
         PreviewVisibility {
             environment: self.show_environment_meshes,
             goop: self.show_goop_meshes,
-            effects: self.show_effect_meshes,
+            effects: self.show_effects,
         }
     }
 
@@ -1924,12 +3042,181 @@ fn japanese_font_candidates() -> Vec<PathBuf> {
     }
 }
 
-fn command_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Response {
-    ui.add_enabled(
-        enabled,
-        egui::Button::new(egui::RichText::new(label).strong())
-            .fill(egui::Color32::from_rgb(48, 56, 54)),
-    )
+fn load_project_for_stage(
+    document: &mut StageDocument,
+    project_root: &str,
+) -> Result<ProjectLoadSelection, SceneError> {
+    if project_root.is_empty() {
+        return Ok(ProjectLoadSelection {
+            project_root: String::new(),
+            warning: None,
+        });
+    }
+    let requested = PathBuf::from(project_root);
+    if document.project_root_overlaps_base(&requested)? {
+        let selected = load_first_compatible_project(
+            document,
+            external_project_roots_for_base(&document.base_root),
+        )?;
+        return Ok(ProjectLoadSelection {
+            warning: Some(format!(
+                "Project Folder automatically changed from '{}' to '{}' because editor projects must be outside the extracted base game directory.",
+                requested.display(),
+                selected.display()
+            )),
+            project_root: selected.to_string_lossy().into_owned(),
+        });
+    }
+    match document.load_project_folder(&requested) {
+        Ok(_) => Ok(ProjectLoadSelection {
+            project_root: project_root.to_string(),
+            warning: None,
+        }),
+        Err(SceneError::ProjectBaseMismatch {
+            path,
+            manifest_base,
+            open_base,
+        }) => {
+            let selected = load_first_compatible_project(
+                document,
+                regional_project_roots(&requested, &document.base_root, &manifest_base),
+            )?;
+            Ok(ProjectLoadSelection {
+                warning: Some(format!(
+                    "Project Folder automatically switched from '{}' to '{}' because '{}' belongs to base root '{}', not '{}'.",
+                    requested.display(),
+                    selected.display(),
+                    path.display(),
+                    manifest_base.display(),
+                    open_base.display()
+                )),
+                project_root: selected.to_string_lossy().into_owned(),
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn document_uses_selected_base(document: &StageDocument, selected_base_root: &str) -> bool {
+    let selected = PathBuf::from(selected_base_root);
+    let document_base = std::fs::canonicalize(&document.base_root);
+    let selected_base = std::fs::canonicalize(selected);
+    match (document_base, selected_base) {
+        (Ok(document_base), Ok(selected_base)) => {
+            #[cfg(windows)]
+            {
+                document_base
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(&selected_base.to_string_lossy())
+            }
+            #[cfg(not(windows))]
+            {
+                document_base == selected_base
+            }
+        }
+        _ => false,
+    }
+}
+
+fn load_first_compatible_project(
+    document: &mut StageDocument,
+    candidates: Vec<PathBuf>,
+) -> Result<PathBuf, SceneError> {
+    let mut last_mismatch = None;
+    for candidate in candidates {
+        match document.load_project_folder(&candidate) {
+            Ok(_) => return Ok(candidate),
+            Err(error @ SceneError::ProjectBaseMismatch { .. }) => last_mismatch = Some(error),
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_mismatch.unwrap_or_else(|| SceneError::InvalidProjectRoot(PathBuf::new())))
+}
+
+fn regional_project_roots(
+    requested: &std::path::Path,
+    base_root: &std::path::Path,
+    manifest_base: &std::path::Path,
+) -> Vec<PathBuf> {
+    const DEFAULT_PROJECT_NAME: &str = "graffito-editor-project";
+    let parent = requested
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let requested_name = requested
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(DEFAULT_PROJECT_NAME);
+    let manifest_suffix = format!("-{}", project_base_slug(manifest_base));
+    let family_name = requested_name
+        .strip_suffix(&manifest_suffix)
+        .unwrap_or(requested_name);
+
+    let mut candidates = Vec::new();
+    let legacy_root = parent.join(family_name);
+    if requested != legacy_root && legacy_root.join("sms-project.toml").is_file() {
+        candidates.push(legacy_root);
+    }
+    let slug = project_base_slug(base_root);
+    let regional_root = parent.join(format!("{family_name}-{slug}"));
+    if regional_root != requested && !candidates.contains(&regional_root) {
+        candidates.push(regional_root.clone());
+    }
+    candidates.push(parent.join(format!(
+        "{family_name}-{slug}-{:08x}",
+        project_base_hash(base_root) as u32
+    )));
+    candidates
+}
+
+fn external_project_roots_for_base(base_root: &std::path::Path) -> Vec<PathBuf> {
+    let parent = base_root
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let slug = project_base_slug(base_root);
+    vec![
+        parent.join(format!("{slug}-graffito-editor-project")),
+        parent.join(format!(
+            "{slug}-graffito-editor-project-{:08x}",
+            project_base_hash(base_root) as u32
+        )),
+    ]
+}
+
+fn project_base_slug(base_root: &std::path::Path) -> String {
+    let source = base_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("base");
+    let mut slug = String::new();
+    for character in source.chars() {
+        if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+            slug.push(character);
+        } else if !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        "base".to_string()
+    } else {
+        slug.to_string()
+    }
+}
+
+fn project_base_hash(base_root: &std::path::Path) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    base_root
+        .to_string_lossy()
+        .replace('/', "\\")
+        .to_ascii_lowercase()
+        .bytes()
+        .fold(FNV_OFFSET, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(FNV_PRIME)
+        })
 }
 
 mod preview_assets;
@@ -2342,10 +3629,7 @@ fn object_matches_focus(object: &SceneObject, needle: &str) -> bool {
 }
 
 fn object_display_name(object: &SceneObject) -> String {
-    object
-        .raw_param("name")
-        .map(str::to_owned)
-        .unwrap_or_else(|| object.factory_name.clone())
+    bilingual_object_name(object)
 }
 
 fn labeled_text(ui: &mut egui::Ui, label: &str, value: &mut String) {
@@ -2365,6 +3649,147 @@ fn format_bytes_short(bytes: u64) -> String {
     } else {
         format!("{bytes} B")
     }
+}
+
+fn content_browser_card_text(
+    archive: &SceneArchiveInfo,
+    localized: Option<&SceneArchiveLabel>,
+) -> String {
+    let mut lines = vec![archive.stage_id.clone()];
+    if let Some(stage_name) = localized.and_then(|label| label.stage_name.as_deref()) {
+        lines.push(stage_name.to_string());
+    }
+    if let Some(label) = localized {
+        if let Some(first) = label.scenario_names.first() {
+            let remaining = label.scenario_names.len().saturating_sub(1);
+            let suffix = if remaining == 0 {
+                String::new()
+            } else {
+                format!(" (+{remaining})")
+            };
+            lines.push(format!("{first}{suffix}"));
+        }
+    }
+    lines.push(format_bytes_short(archive.size_bytes));
+    lines.join("\n")
+}
+
+fn content_browser_card_button(
+    ui: &mut egui::Ui,
+    size: egui::Vec2,
+    selected: bool,
+    label: &str,
+) -> egui::Response {
+    let response = ui.add_sized(size, egui::Button::selectable(selected, ""));
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Button, ui.is_enabled(), selected, label)
+    });
+    if !ui.is_rect_visible(response.rect) {
+        return response;
+    }
+
+    let lines = label.lines().collect::<Vec<_>>();
+    let Some(title) = lines.first().copied() else {
+        return response;
+    };
+    let size_text = lines.last().copied().unwrap_or_default();
+    let details = if lines.len() > 2 {
+        &lines[1..lines.len() - 1]
+    } else {
+        &[]
+    };
+
+    let inner = response.rect.shrink2(egui::vec2(8.0, 6.0));
+    let text_color = ui.style().interact(&response).text_color();
+    let size_galley = egui::WidgetText::from(egui::RichText::new(size_text).small().weak())
+        .into_galley(
+            ui,
+            Some(egui::TextWrapMode::Truncate),
+            inner.width() * 0.35,
+            egui::TextStyle::Small,
+        );
+    let title_width = (inner.width() - size_galley.size().x - 8.0).max(24.0);
+    let title_galley = egui::WidgetText::from(egui::RichText::new(title).strong()).into_galley(
+        ui,
+        Some(egui::TextWrapMode::Truncate),
+        title_width,
+        egui::TextStyle::Button,
+    );
+    let detail_galleys = details
+        .iter()
+        .enumerate()
+        .map(|(index, line)| {
+            let text = if index == 0 {
+                egui::RichText::new(*line).strong()
+            } else {
+                egui::RichText::new(*line).small()
+            };
+            egui::WidgetText::from(text).into_galley(
+                ui,
+                Some(egui::TextWrapMode::Truncate),
+                inner.width(),
+                egui::TextStyle::Body,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let top_height = title_galley.size().y.max(size_galley.size().y);
+    let details_height = detail_galleys
+        .iter()
+        .map(|galley| galley.size().y)
+        .sum::<f32>();
+    let row_gap = 3.0;
+    let total_height = top_height
+        + if detail_galleys.is_empty() {
+            0.0
+        } else {
+            5.0 + details_height + row_gap * detail_galleys.len().saturating_sub(1) as f32
+        };
+    let painter = ui.painter().with_clip_rect(inner);
+    let mut y = inner.center().y - total_height * 0.5;
+    painter.galley(
+        egui::pos2(inner.left(), y + (top_height - title_galley.size().y) * 0.5),
+        title_galley,
+        text_color,
+    );
+    painter.galley(
+        egui::pos2(
+            inner.right() - size_galley.size().x,
+            y + (top_height - size_galley.size().y) * 0.5,
+        ),
+        size_galley,
+        text_color,
+    );
+
+    if !detail_galleys.is_empty() {
+        y += top_height + 5.0;
+        for galley in detail_galleys {
+            let height = galley.size().y;
+            painter.galley(egui::pos2(inner.left(), y), galley, text_color);
+            y += height + row_gap;
+        }
+    }
+
+    response
+}
+
+fn content_browser_hover_text(
+    archive: &SceneArchiveInfo,
+    localized: Option<&SceneArchiveLabel>,
+) -> String {
+    let mut lines = Vec::new();
+    if let Some(stage_name) = localized.and_then(|label| label.stage_name.as_deref()) {
+        lines.push(format!("Stage: {stage_name}"));
+    }
+    if let Some(label) = localized {
+        lines.extend(label.scenario_names.iter().map(|name| format!("• {name}")));
+    }
+    if !lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines.push(archive.relative_path.display().to_string());
+    lines.push(archive.path.display().to_string());
+    lines.join("\n")
 }
 
 fn merge_bounds(
@@ -2715,6 +4140,15 @@ fn preview_render_layer_for_model_path(path: &str) -> PreviewRenderLayer {
     }
 }
 
+fn preview_render_layer_is_effect(layer: PreviewRenderLayer) -> bool {
+    matches!(
+        layer,
+        PreviewRenderLayer::Heatwave
+            | PreviewRenderLayer::Particle
+            | PreviewRenderLayer::ParticleDistortion
+    )
+}
+
 fn path_is_shimmer_model_path(path: &str) -> bool {
     let path = path.replace('\\', "/").to_ascii_lowercase();
     path.rsplit('/').next().is_some_and(|name| {
@@ -2859,7 +4293,7 @@ fn mirror_cubes(document: &StageDocument) -> Vec<PreviewMirrorCube> {
                 .to_ascii_lowercase()
                 .ends_with("/map/tables.bin")
     }) {
-        let Ok(bytes) = read_stage_asset_bytes(&asset.path) else {
+        let Ok(bytes) = document.read_asset_bytes(&asset.path) else {
             continue;
         };
         let Ok(records) = parse_jdrama_object_records(&bytes) else {
@@ -3047,7 +4481,7 @@ fn active_pollution_layer_count(document: &StageDocument) -> usize {
                 .to_ascii_lowercase()
                 .ends_with("/map/ymap.ymp")
         })
-        .and_then(|asset| read_stage_asset_bytes(&asset.path).ok())
+        .and_then(|asset| document.read_asset_bytes(&asset.path).ok())
         .and_then(|bytes| pollution_layer_count_from_bytes(&bytes))
         .unwrap_or(0) as usize
 }
@@ -3335,6 +4769,41 @@ fn vector_drag(ui: &mut egui::Ui, values: &mut [f32; 3], speed: f32) -> VectorDr
     edit
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ContentBrowserLayout {
+    columns: usize,
+    card_width: f32,
+}
+
+fn content_browser_layout(available_width: f32, item_count: usize) -> ContentBrowserLayout {
+    const MIN_CARD_WIDTH: f32 = 180.0;
+    const MAX_CARD_WIDTH: f32 = 260.0;
+    const GAP: f32 = 8.0;
+
+    let available_width = available_width.max(MIN_CARD_WIDTH);
+    let maximum_columns =
+        (((available_width + GAP) / (MIN_CARD_WIDTH + GAP)).floor() as usize).max(1);
+    let columns = item_count.max(1).min(maximum_columns);
+    let used_gaps = GAP * columns.saturating_sub(1) as f32;
+    let card_width =
+        ((available_width - used_gaps) / columns as f32).clamp(MIN_CARD_WIDTH, MAX_CARD_WIDTH);
+    ContentBrowserLayout {
+        columns,
+        card_width,
+    }
+}
+
+fn editor_window_title(project_name: Option<&str>, stage_id: Option<&str>) -> String {
+    let project_name = project_name.map(str::trim).filter(|name| !name.is_empty());
+    let stage_id = stage_id.map(str::trim).filter(|stage| !stage.is_empty());
+    match (project_name, stage_id) {
+        (Some(project), Some(stage)) => format!("{project} - {stage} - Graffito-Editor"),
+        (Some(project), None) => format!("{project} - Graffito-Editor"),
+        (None, Some(stage)) => format!("{stage} - Graffito-Editor"),
+        (None, None) => "Graffito-Editor".to_string(),
+    }
+}
+
 fn runtime_yaw_degrees_per_frame(object: &SceneObject) -> f32 {
     let factory = object.factory_name.as_str();
     let class = object.class_name.as_deref().unwrap_or_default();
@@ -3386,24 +4855,6 @@ fn runtime_rotated_transform(
         + elapsed_seconds.max(0.0) * SMS_ANIMATION_FRAMES_PER_SECOND * yaw_degrees_per_frame)
         .rem_euclid(360.0);
     transform
-}
-
-fn snap_transform(transform: &mut Transform, translation: f32, rotation: f32, scale: f32) {
-    if translation > f32::EPSILON {
-        for value in &mut transform.translation {
-            *value = snap_value(*value, translation);
-        }
-    }
-    if rotation > f32::EPSILON {
-        for value in &mut transform.rotation_degrees {
-            *value = snap_value(*value, rotation);
-        }
-    }
-    if scale > f32::EPSILON {
-        for value in &mut transform.scale {
-            *value = snap_value(*value, scale).max(0.001);
-        }
-    }
 }
 
 fn snap_value(value: f32, step: f32) -> f32 {

@@ -11,7 +11,7 @@ use super::{
 };
 
 pub(super) const PROJECT_KIND: &str = "sms-editor-project";
-pub(super) const PROJECT_FORMAT_VERSION: u32 = 2;
+pub(super) const PROJECT_FORMAT_VERSION: u32 = 4;
 const MAX_PROJECT_MANIFEST_BYTES: u64 = 1024 * 1024;
 static PROJECT_TRANSACTION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -26,12 +26,9 @@ pub(super) fn save_project_folder(
     {
         return Err(SceneError::InvalidProjectRoot(project_root.to_path_buf()));
     }
-    let project_comparison = normalized_absolute_for_comparison(project_root)?;
     let base_comparison = normalized_absolute_for_comparison(&document.base_root)?;
     let manifest_base_path = fs::canonicalize(&document.base_root)?;
-    if path_is_same_or_child(&project_comparison, &base_comparison)
-        || path_is_same_or_child(&base_comparison, &project_comparison)
-    {
+    if project_root_overlaps_base(document, project_root)? {
         return Err(SceneError::ProjectOverlapsBase(project_root.to_path_buf()));
     }
     let parent = project_root
@@ -48,13 +45,10 @@ pub(super) fn save_project_folder(
     if let Some(existing_manifest) = &existing_manifest {
         let existing_base = normalized_absolute_for_comparison(&existing_manifest.base_path)?;
         if existing_base != base_comparison {
-            return Err(SceneError::UnsupportedProjectManifest {
+            return Err(SceneError::ProjectBaseMismatch {
                 path: project_root.join("sms-project.toml"),
-                reason: format!(
-                    "manifest base path '{}' does not match the open base root '{}'",
-                    existing_manifest.base_path.display(),
-                    document.base_root.display()
-                ),
+                manifest_base: existing_manifest.base_path.clone(),
+                open_base: document.base_root.clone(),
             });
         }
     }
@@ -285,6 +279,16 @@ pub(super) fn save_project_folder(
     ))
 }
 
+pub(super) fn project_root_overlaps_base(
+    document: &StageDocument,
+    project_root: &Path,
+) -> Result<bool> {
+    let project_comparison = normalized_absolute_for_comparison(project_root)?;
+    let base_comparison = normalized_absolute_for_comparison(&document.base_root)?;
+    Ok(path_is_same_or_child(&project_comparison, &base_comparison)
+        || path_is_same_or_child(&base_comparison, &project_comparison))
+}
+
 pub(super) fn load_project_overlay(
     document: &mut StageDocument,
     project_root: &Path,
@@ -296,14 +300,28 @@ pub(super) fn load_project_overlay(
     let manifest_base = normalized_absolute_for_comparison(&manifest.base_path)?;
     let document_base = normalized_absolute_for_comparison(&document.base_root)?;
     if manifest_base != document_base {
-        return Err(SceneError::UnsupportedProjectManifest {
+        return Err(SceneError::ProjectBaseMismatch {
             path: project_root.join("sms-project.toml"),
-            reason: format!(
-                "manifest base path '{}' does not match the open base root '{}'",
-                manifest.base_path.display(),
-                document.base_root.display()
-            ),
+            manifest_base: manifest.base_path,
+            open_base: document.base_root.clone(),
         });
+    }
+
+    let relative_baseline = document.authored_stage_baseline_path()?;
+    let baseline_is_managed = manifest
+        .changed_files
+        .iter()
+        .any(|path| project_relative_key(path) == project_relative_key(&relative_baseline));
+    if baseline_is_managed {
+        let baseline_path = project_root.join("files").join(&relative_baseline);
+        let archive = super::SourceFreeStageArchive::from_semantic_json(&read_file_bounded(
+            &baseline_path,
+            MAX_PROJECT_STAGE_BASELINE_BYTES,
+        )?)?;
+        // The authored baseline is authoritative for object addresses and
+        // resource bytes. It must be validated and installed before the scene
+        // overlay is reattached.
+        document.replace_with_authored_archive(archive)?;
     }
 
     let relative_overlay = document.editor_overlay_path()?;
@@ -322,7 +340,7 @@ pub(super) fn load_project_overlay(
             revision: manifest.revision,
             project_fingerprint,
         });
-        return Ok(false);
+        return Ok(baseline_is_managed);
     }
 
     let overlay_path = project_root.join("files").join(&relative_overlay);
@@ -359,8 +377,143 @@ pub(super) fn load_project_overlay(
         project_fingerprint,
     };
     document.objects = overlay.objects;
+    document.archive_edits = overlay.archive_edits;
+    document.route_authoring = overlay.route_authoring;
+    document.sync_archive_edit_assets();
+    if let Some(authoring) = document.route_authoring.as_ref() {
+        match (
+            authoring.compile(),
+            document.effective_resource_clone(&authoring.raw_resource_path),
+        ) {
+            (Ok(compiled), Ok(Some(super::StageResourceDocument::Rail(stored))))
+                if compiled != stored =>
+            {
+                document.load_issues.push(super::ValidationIssue::error(
+                    "route-authoring-overlay-mismatch",
+                    "Saved route authoring data does not compile to the stored RAL overlay; both representations were retained for review.",
+                ));
+            }
+            (Err(error), _) => document.load_issues.push(super::ValidationIssue::error(
+                "route-authoring-compile-failed",
+                format!("Saved route authoring data could not be compiled: {error}"),
+            )),
+            (_, Ok(Some(super::StageResourceDocument::Rail(_)))) => {}
+            (_, Ok(Some(_)) | Ok(None)) => {
+                document.load_issues.push(super::ValidationIssue::error(
+                    "route-authoring-resource-missing",
+                    "Saved route authoring data has no matching RAL overlay.",
+                ))
+            }
+            (_, Err(error)) => document.load_issues.push(super::ValidationIssue::error(
+                "route-authoring-resource-check-failed",
+                format!("Could not verify saved route authoring data: {error}"),
+            )),
+        }
+    }
+    if let Some(lighting) = overlay.lighting {
+        document.lighting = lighting;
+    }
     document.loaded_project = Some(loaded_project);
     Ok(true)
+}
+
+pub(super) fn load_authored_stage_baseline(
+    base_root: &Path,
+    stage_id: &str,
+    project_root: &Path,
+) -> Result<Option<super::SourceFreeStageArchive>> {
+    super::validate_stage_id(stage_id)?;
+    let Some(manifest) = inspect_existing_project(project_root)? else {
+        return Ok(None);
+    };
+    let manifest_base = normalized_absolute_for_comparison(&manifest.base_path)?;
+    let document_base = normalized_absolute_for_comparison(base_root)?;
+    if manifest_base != document_base {
+        return Err(SceneError::ProjectBaseMismatch {
+            path: project_root.join("sms-project.toml"),
+            manifest_base: manifest.base_path,
+            open_base: base_root.to_path_buf(),
+        });
+    }
+
+    let relative_path = authored_stage_baseline_relative_path(stage_id);
+    if !manifest
+        .changed_files
+        .iter()
+        .any(|path| project_relative_key(path) == project_relative_key(&relative_path))
+    {
+        return Ok(None);
+    }
+    let archive = super::SourceFreeStageArchive::from_semantic_json(&read_file_bounded(
+        &project_root.join("files").join(relative_path),
+        MAX_PROJECT_STAGE_BASELINE_BYTES,
+    )?)?;
+    super::validate_authored_archive_target(&archive, stage_id)?;
+    Ok(Some(archive))
+}
+
+pub(super) fn discover_authored_stage_ids(project_root: &Path) -> Result<Vec<String>> {
+    let Some(manifest) = inspect_existing_project(project_root)? else {
+        return Ok(Vec::new());
+    };
+    let mut stage_ids = Vec::new();
+    for relative_path in &manifest.changed_files {
+        let Some(stage_id) = authored_stage_id_from_baseline_path(relative_path)? else {
+            continue;
+        };
+        let archive = super::SourceFreeStageArchive::from_semantic_json(&read_file_bounded(
+            &project_root.join("files").join(relative_path),
+            MAX_PROJECT_STAGE_BASELINE_BYTES,
+        )?)?;
+        super::validate_authored_archive_target(&archive, &stage_id)?;
+        stage_ids.push(stage_id);
+    }
+    stage_ids.sort_by_key(|stage_id| stage_id.to_ascii_lowercase());
+    stage_ids.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    Ok(stage_ids)
+}
+
+fn authored_stage_baseline_relative_path(stage_id: &str) -> PathBuf {
+    PathBuf::from("editor")
+        .join("stages")
+        .join(format!("{stage_id}.stage.json"))
+}
+
+fn authored_stage_id_from_baseline_path(path: &Path) -> Result<Option<String>> {
+    let components = path.components().collect::<Vec<_>>();
+    let [Component::Normal(editor), Component::Normal(stages), Component::Normal(file_name)] =
+        components.as_slice()
+    else {
+        return Ok(None);
+    };
+    let Some(editor) = editor.to_str() else {
+        return Err(SceneError::UnsupportedProjectManifest {
+            path: path.to_path_buf(),
+            reason: "authored stage path contains non-UTF-8 components".to_string(),
+        });
+    };
+    let Some(stages) = stages.to_str() else {
+        return Err(SceneError::UnsupportedProjectManifest {
+            path: path.to_path_buf(),
+            reason: "authored stage path contains non-UTF-8 components".to_string(),
+        });
+    };
+    if !editor.eq_ignore_ascii_case("editor") || !stages.eq_ignore_ascii_case("stages") {
+        return Ok(None);
+    }
+    let Some(file_name) = file_name.to_str() else {
+        return Err(SceneError::UnsupportedProjectManifest {
+            path: path.to_path_buf(),
+            reason: "authored stage filename is not valid UTF-8".to_string(),
+        });
+    };
+    let lowercase = file_name.to_ascii_lowercase();
+    let Some(prefix_len) = lowercase.strip_suffix(".stage.json").map(str::len) else {
+        return Ok(None);
+    };
+    let stage_id = file_name[..prefix_len].to_string();
+    super::validate_stage_id(&stage_id)?;
+    Ok(Some(stage_id))
 }
 
 fn reattach_overlay_source_records(
@@ -368,11 +521,29 @@ fn reattach_overlay_source_records(
     overlay_objects: &mut [super::SceneObject],
 ) -> Result<()> {
     let mut base_records = BTreeMap::new();
+    let mut base_placements = BTreeMap::new();
     for object in base_objects {
         let Some(source) = object.source.as_ref() else {
             continue;
         };
         base_records.insert(source_record_key(source)?, object);
+        if let Some(address) = object
+            .placement
+            .as_ref()
+            .and_then(super::PlacementBinding::source_address)
+        {
+            let key = (address.clone(), source_record_path_key(source)?);
+            match base_placements.entry(key) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(Some(object));
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    // Never use a semantic placement fallback when the base
+                    // document itself contains an ambiguous address.
+                    entry.insert(None);
+                }
+            }
+        }
     }
 
     for object in overlay_objects {
@@ -380,7 +551,18 @@ fn reattach_overlay_source_records(
             continue;
         };
         let key = source_record_key(source)?;
-        let Some(base_object) = base_records.get(&key) else {
+        let base_object = base_records.get(&key).copied().or_else(|| {
+            let address = object
+                .placement
+                .as_ref()
+                .and_then(super::PlacementBinding::source_address)?;
+            let path = source_record_path_key(source).ok()?;
+            base_placements
+                .get(&(address.clone(), path))
+                .copied()
+                .flatten()
+        });
+        let Some(base_object) = base_object else {
             return Err(SceneError::ProjectOverlaySourceMismatch {
                 object_id: object.id.clone(),
                 source_path: source.path.clone(),
@@ -390,15 +572,44 @@ fn reattach_overlay_source_records(
         let Some(base_source) = base_object.source.as_ref() else {
             unreachable!("base source records are indexed only when they have a source");
         };
-        let Some(source_record_bytes) = base_object.source_record_bytes.as_deref() else {
+        if let Some(base_address) = base_object
+            .placement
+            .as_ref()
+            .and_then(super::PlacementBinding::source_address)
+        {
+            match object.placement.as_ref() {
+                Some(placement) if placement.source_address() != Some(base_address) => {
+                    return Err(SceneError::ProjectOverlaySourceMismatch {
+                        object_id: object.id.clone(),
+                        source_path: source.path.clone(),
+                        offset: source.offset,
+                    });
+                }
+                Some(_) => {}
+                None if object.id == base_object.id => {
+                    object.placement =
+                        Some(super::PlacementBinding::Existing(base_address.clone()));
+                }
+                None => {
+                    // Version 1/2 projects represented duplicates by retaining
+                    // the source record location on an object with a new id.
+                    object.placement = Some(super::PlacementBinding::CloneOf(base_address.clone()));
+                }
+            }
+        } else if object.placement.is_some() {
             return Err(SceneError::ProjectOverlaySourceMismatch {
                 object_id: object.id.clone(),
                 source_path: source.path.clone(),
                 offset: source.offset,
             });
-        };
+        }
         object.source = Some(base_source.clone());
-        object.source_record_bytes = Some(source_record_bytes.to_vec());
+
+        for (name, value) in &mut object.raw_params {
+            if base_object.raw_param(name) != Some(value.raw()) {
+                *value = super::SceneParameter::edited(value.raw().to_string(), None);
+            }
+        }
 
         // Overlay values win, but newly understood source fields must become
         // available when an older project is reopened against a newer parser.
@@ -431,6 +642,14 @@ fn reattach_overlay_source_records(
 fn source_record_key(
     source: &sms_formats::SourceLocation,
 ) -> Result<(String, Option<u64>, Option<u64>)> {
+    Ok((
+        source_record_path_key(source)?,
+        source.offset,
+        source.length,
+    ))
+}
+
+fn source_record_path_key(source: &sms_formats::SourceLocation) -> Result<String> {
     let path = source.path.to_string_lossy().replace('\\', "/");
     let normalized_path = if let Some((archive_path, internal_path)) = path.split_once("!/") {
         format!(
@@ -440,7 +659,7 @@ fn source_record_key(
     } else {
         normalized_absolute_for_comparison(&source.path)?
     };
-    Ok((normalized_path, source.offset, source.length))
+    Ok(normalized_path)
 }
 
 fn validate_loaded_project(
@@ -476,7 +695,8 @@ enum ProjectEntryFingerprint {
     File { length: u64, hash: u128 },
 }
 
-const MAX_PROJECT_OVERLAY_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_PROJECT_OVERLAY_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_PROJECT_STAGE_BASELINE_BYTES: u64 = 512 * 1024 * 1024;
 
 fn snapshot_project_root(project_root: &Path) -> Result<ProjectSnapshot> {
     let root_metadata = match fs::symlink_metadata(project_root) {

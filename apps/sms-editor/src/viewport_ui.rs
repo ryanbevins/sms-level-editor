@@ -7,6 +7,60 @@ const CAMERA_FLY_ACCELERATION_INTERP_SPEED: f32 = 8.0;
 const CAMERA_FLY_DECELERATION_INTERP_SPEED: f32 = 12.0;
 const CAMERA_FLY_STOP_SPEED: f32 = 0.5;
 const PICK_DEPTH_EPSILON: f32 = 0.01;
+const GIZMO_AXIS_LENGTH_PIXELS: f32 = 78.0;
+const GIZMO_RING_RADIUS_PIXELS: f32 = 64.0;
+const GIZMO_HIT_RADIUS_PIXELS: f32 = 10.0;
+
+pub(super) fn collision_surface_color(surface_type: u16) -> egui::Color32 {
+    const PALETTE: [[u8; 3]; 12] = [
+        [76, 184, 168],
+        [104, 164, 230],
+        [232, 176, 72],
+        [206, 112, 154],
+        [128, 194, 92],
+        [164, 125, 220],
+        [230, 112, 84],
+        [72, 172, 220],
+        [218, 204, 88],
+        [92, 196, 126],
+        [214, 132, 222],
+        [226, 142, 66],
+    ];
+    let mut hash = u32::from(surface_type);
+    hash ^= hash >> 7;
+    hash = hash.wrapping_mul(0x9e37_79b1);
+    let [r, g, b] = PALETTE[hash as usize % PALETTE.len()];
+    egui::Color32::from_rgb(r, g, b)
+}
+
+fn shaded_collision_color(triangle: &CollisionPreviewTriangle) -> egui::Color32 {
+    let base = collision_surface_color(triangle.surface_type);
+    let edge_a = vec3_sub(triangle.vertices[1], triangle.vertices[0]);
+    let edge_b = vec3_sub(triangle.vertices[2], triangle.vertices[0]);
+    let normal = vec3_normalize(vec3_cross(edge_a, edge_b));
+    let light = vec3_normalize([0.35, 0.85, 0.4]);
+    let shade = (0.68 + 0.32 * vec3_dot(normal, light).abs()).clamp(0.0, 1.0);
+    egui::Color32::from_rgb(
+        (f32::from(base.r()) * shade) as u8,
+        (f32::from(base.g()) * shade) as u8,
+        (f32::from(base.b()) * shade) as u8,
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GizmoScreenAxis {
+    start: egui::Pos2,
+    end: egui::Pos2,
+    direction: egui::Vec2,
+}
+
+#[derive(Debug, Clone)]
+struct GizmoGeometry {
+    origin: egui::Pos2,
+    axes: [GizmoScreenAxis; 3],
+    rotation_rings: [Vec<egui::Pos2>; 3],
+    world_units_per_pixel: f32,
+}
 
 fn preview_triangle_writes_opaque_depth(
     preview: &ModelPreview,
@@ -192,6 +246,20 @@ impl SmsEditorApp {
         rect: egui::Rect,
         response: &egui::Response,
     ) {
+        if let Some(payload) = response.dnd_release_payload::<ObjectPaletteDragPayload>() {
+            if let Some(pointer) = ui.input(|input| input.pointer.latest_pos()) {
+                let world = self.screen_to_world_floor(rect, pointer);
+                self.spawn_object_at(payload.factory_name.clone(), world);
+            }
+            return;
+        }
+        if let Some(payload) = response.dnd_release_payload::<ModelAssetDragPayload>() {
+            if let Some(pointer) = ui.input(|input| input.pointer.latest_pos()) {
+                let world = self.screen_to_world_floor(rect, pointer);
+                self.spawn_model_instance_at(payload.asset_id, world);
+            }
+            return;
+        }
         let secondary_down = ui.input(|input| input.pointer.secondary_down());
         let fly_navigation_active = secondary_down
             && (response.hovered() || response.dragged_by(egui::PointerButton::Secondary));
@@ -201,6 +269,7 @@ impl SmsEditorApp {
             if scroll.abs() > f32::EPSILON {
                 if fly_navigation_active {
                     self.camera_speed = camera_speed_after_scroll(self.camera_speed, scroll);
+                    self.queue_camera_state_save();
                 } else {
                     let amount = self.renderer.camera().distance * scroll * 0.0015;
                     self.dolly_camera(amount);
@@ -211,11 +280,9 @@ impl SmsEditorApp {
 
         let pointer_delta = ui.input(|input| input.pointer.delta());
         let modifiers = ui.input(|input| input.modifiers);
-        let moving_object =
-            !modifiers.alt && self.tool == EditorTool::Move && self.selected_object_id.is_some();
-        if moving_object && response.drag_started_by(egui::PointerButton::Primary) {
-            self.begin_undo_transaction();
-        }
+        let route_handle_using_pointer = self.handle_route_handle_drag(ui, rect, response);
+        let gizmo_using_pointer =
+            route_handle_using_pointer || self.handle_transform_gizmo_input(ui, rect, response);
 
         if response.hovered() && ui.input(|input| input.key_pressed(egui::Key::F)) {
             self.frame_selected();
@@ -226,7 +293,9 @@ impl SmsEditorApp {
             self.mark_viewport_interaction(ui);
         }
 
-        if modifiers.alt && response.dragged_by(egui::PointerButton::Primary) {
+        if gizmo_using_pointer {
+            self.mark_viewport_interaction(ui);
+        } else if modifiers.alt && response.dragged_by(egui::PointerButton::Primary) {
             self.orbit_camera(pointer_delta);
             if pointer_delta != egui::Vec2::ZERO {
                 self.mark_viewport_interaction(ui);
@@ -250,22 +319,19 @@ impl SmsEditorApp {
             if pointer_delta != egui::Vec2::ZERO {
                 self.mark_viewport_interaction(ui);
             }
-        } else if response.dragged_by(egui::PointerButton::Primary)
-            && self.tool == EditorTool::Move
-            && pointer_delta != egui::Vec2::ZERO
-        {
-            self.nudge_selected(self.viewport_drag_move_delta(rect, pointer_delta));
-            self.mark_viewport_interaction(ui);
         }
 
-        if self.undo_transaction.is_some() && response.drag_stopped_by(egui::PointerButton::Primary)
-        {
-            self.commit_undo_transaction("Moved object");
-        }
-
-        if response.clicked() {
+        if response.clicked() && self.hovered_gizmo_axis.is_none() && !gizmo_using_pointer {
             if let Some(pos) = response.interact_pointer_pos() {
+                if self.handle_route_viewport_click(rect, response, modifiers) {
+                    return;
+                }
                 if self.tool == EditorTool::Place {
+                    if let Some(asset_id) = self.placing_model_asset {
+                        let world = self.screen_to_world_floor(rect, pos);
+                        self.spawn_model_instance_at(asset_id, world);
+                        return;
+                    }
                     if let Some(factory) = self.palette_factory.clone() {
                         let world = self.screen_to_world_floor(rect, pos);
                         self.spawn_object_at(factory, world);
@@ -273,9 +339,136 @@ impl SmsEditorApp {
                     }
                 }
 
-                self.selected_object_id = self.object_at_screen_position(rect, pos);
+                if let Some(instance_id) = self.model_instance_at_screen_position(rect, pos) {
+                    if self.asset_dirty && !self.save_selected_model_asset() {
+                        return;
+                    }
+                    self.selected_model_instance_id = Some(instance_id);
+                    self.selected_object_id = None;
+                    self.selected_model_asset = None;
+                    self.selected_model_document = None;
+                    self.saved_model_document = None;
+                } else {
+                    if self.asset_dirty && !self.save_selected_model_asset() {
+                        return;
+                    }
+                    self.selected_model_instance_id = None;
+                    self.selected_object_id = self.object_at_screen_position(rect, pos);
+                    if self.selected_object_id.is_some() {
+                        self.selected_model_asset = None;
+                        self.selected_model_document = None;
+                        self.saved_model_document = None;
+                    }
+                }
             }
         }
+    }
+
+    fn handle_transform_gizmo_input(
+        &mut self,
+        ui: &egui::Ui,
+        rect: egui::Rect,
+        response: &egui::Response,
+    ) -> bool {
+        let route_origin = self.selected_route_control_position();
+        let supports_gizmo = if route_origin.is_some() {
+            self.tool == EditorTool::Move
+        } else {
+            matches!(
+                self.tool,
+                EditorTool::Move | EditorTool::Rotate | EditorTool::Scale
+            )
+        };
+        let pointer = ui.input(|input| input.pointer.interact_pos());
+        let world_origin = route_origin.or_else(|| {
+            self.selected_object()
+                .map(|object| object.transform.translation)
+        });
+        let geometry = supports_gizmo
+            .then(|| world_origin.and_then(|origin| self.gizmo_geometry(rect, origin)))
+            .flatten();
+        let hovered = if response.hovered() {
+            pointer
+                .zip(geometry.as_ref())
+                .and_then(|(pointer, geometry)| gizmo_axis_at_pointer(self.tool, geometry, pointer))
+        } else {
+            None
+        };
+        self.hovered_gizmo_axis = self.gizmo_drag.map(|drag| drag.axis).or(hovered);
+
+        if self.hovered_gizmo_axis.is_some() {
+            ui.ctx().set_cursor_icon(if self.gizmo_drag.is_some() {
+                egui::CursorIcon::Grabbing
+            } else {
+                egui::CursorIcon::Grab
+            });
+        }
+
+        let primary_pressed = ui.input(|input| input.pointer.primary_pressed());
+        if self.gizmo_drag.is_none() && primary_pressed {
+            if let (Some(axis), Some(pointer), Some(geometry), Some(origin)) =
+                (hovered, pointer, geometry.as_ref(), world_origin)
+            {
+                let start_transform = if route_origin.is_some() {
+                    self.begin_route_undo_transaction();
+                    Transform {
+                        translation: origin,
+                        ..Transform::default()
+                    }
+                } else {
+                    self.begin_undo_transaction();
+                    self.selected_object()
+                        .map_or_else(Transform::default, |object| object.transform)
+                };
+                self.gizmo_drag = Some(GizmoDrag {
+                    axis,
+                    tool: self.tool,
+                    start_pointer: pointer,
+                    screen_origin: geometry.origin,
+                    screen_direction: geometry.axes[axis.index()].direction,
+                    world_units_per_pixel: geometry.world_units_per_pixel,
+                    start_transform,
+                });
+            }
+        }
+
+        let was_dragging = self.gizmo_drag.is_some();
+        let primary_down = ui.input(|input| input.pointer.primary_down());
+        if primary_down {
+            if let (Some(drag), Some(pointer)) = (self.gizmo_drag, pointer) {
+                let transform = transform_from_gizmo_drag(
+                    drag,
+                    pointer,
+                    self.snap_enabled,
+                    self.snap_translation,
+                    self.snap_rotation,
+                    self.snap_scale,
+                );
+                if self.route_undo_transaction.is_some() {
+                    self.update_selected_route_control_position(transform.translation);
+                } else {
+                    self.update_selected_transform(transform);
+                }
+            }
+        }
+
+        let primary_released = ui.input(|input| input.pointer.primary_released());
+        if primary_released {
+            if let Some(drag) = self.gizmo_drag.take() {
+                if self.route_undo_transaction.is_some() {
+                    self.commit_route_undo_transaction("Moved route control point");
+                    return true;
+                }
+                self.commit_undo_transaction(match drag.tool {
+                    EditorTool::Move => "Moved object",
+                    EditorTool::Rotate => "Rotated object",
+                    EditorTool::Scale => "Scaled object",
+                    _ => "Transformed object",
+                });
+            }
+        }
+
+        was_dragging || self.gizmo_drag.is_some() || (primary_pressed && hovered.is_some())
     }
 
     pub(super) fn object_at_screen_position(
@@ -497,15 +690,19 @@ impl SmsEditorApp {
         let distance = self.renderer.camera().distance;
         self.renderer.camera_mut().focus =
             vec3_add(old_position, vec3_scale(frame.forward, distance));
+        self.queue_camera_state_save();
     }
 
     pub(super) fn orbit_camera(&mut self, delta: egui::Vec2) {
         if delta == egui::Vec2::ZERO {
             return;
         }
-        let camera = self.renderer.camera_mut();
-        camera.yaw_degrees -= delta.x * 0.18;
-        camera.pitch_degrees = (camera.pitch_degrees - delta.y * 0.14).clamp(-89.0, 89.0);
+        {
+            let camera = self.renderer.camera_mut();
+            camera.yaw_degrees -= delta.x * 0.18;
+            camera.pitch_degrees = (camera.pitch_degrees - delta.y * 0.14).clamp(-89.0, 89.0);
+        }
+        self.queue_camera_state_save();
     }
 
     pub(super) fn pan_camera_pixels(&mut self, rect: egui::Rect, delta: egui::Vec2) {
@@ -522,26 +719,6 @@ impl SmsEditorApp {
         self.translate_camera(world_delta);
     }
 
-    pub(super) fn viewport_drag_move_delta(&self, rect: egui::Rect, delta: egui::Vec2) -> [f32; 3] {
-        if delta == egui::Vec2::ZERO {
-            return [0.0, 0.0, 0.0];
-        }
-        let frame = self.camera_frame();
-        let focal = perspective_focal_length(rect, self.viewport_zoom).max(1.0);
-        let units_per_pixel = (self.renderer.camera().distance / focal).max(0.01);
-        let right = vec3_normalize([frame.right[0], 0.0, frame.right[2]]);
-        let forward = vec3_normalize([frame.forward[0], 0.0, frame.forward[2]]);
-        let forward = if vec3_dot(forward, forward) <= 0.0001 {
-            [0.0, 0.0, 1.0]
-        } else {
-            forward
-        };
-        vec3_add(
-            vec3_scale(right, delta.x * units_per_pixel),
-            vec3_scale(forward, -delta.y * units_per_pixel),
-        )
-    }
-
     pub(super) fn dolly_camera(&mut self, amount: f32) {
         if amount.abs() <= f32::EPSILON || !amount.is_finite() {
             return;
@@ -556,6 +733,7 @@ impl SmsEditorApp {
         }
         let camera = self.renderer.camera_mut();
         camera.focus = vec3_add(camera.focus, delta);
+        self.queue_camera_state_save();
     }
 
     pub(super) fn mark_viewport_interaction(&mut self, ui: &egui::Ui) {
@@ -570,7 +748,7 @@ impl SmsEditorApp {
     ) {
         painter.add(egui::Shape::mesh(viewport_background_mesh(rect)));
 
-        if self.model_preview.is_some() {
+        if self.model_preview.is_some() || self.view_mode == ViewMode::Collision {
             self.paint_model_preview(ui.ctx(), painter, rect);
         } else {
             self.paint_stage_silhouette(painter, rect);
@@ -580,6 +758,8 @@ impl SmsEditorApp {
         if self.renderer.config().show_grid {
             self.paint_grid(painter, rect);
         }
+        self.paint_model_instances(painter, rect);
+        self.paint_routes(painter, rect);
         self.paint_selected_object_outline(painter, rect);
 
         let projection = self.camera_projection(rect);
@@ -614,7 +794,7 @@ impl SmsEditorApp {
             );
 
             if selected {
-                self.paint_gizmo(painter, rect, pos);
+                self.paint_gizmo(painter, rect, object.transform.translation);
             }
         }
 
@@ -851,6 +1031,21 @@ impl SmsEditorApp {
         painter: &egui::Painter,
         rect: egui::Rect,
     ) {
+        if self.view_mode == ViewMode::Collision {
+            if self.renderer.config().show_collision {
+                self.paint_collision_preview(ctx, painter, rect);
+            } else {
+                painter.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "Collision display is disabled in Viewport settings.",
+                    egui::FontId::proportional(15.0),
+                    egui::Color32::from_rgb(224, 213, 178),
+                );
+            }
+            return;
+        }
+
         self.update_level_transformation(ctx);
         self.update_skeletal_animations();
         let has_triangles = self
@@ -911,6 +1106,82 @@ impl SmsEditorApp {
                 self.paint_preview_bounds(painter, rect, preview);
             }
         }
+    }
+
+    fn paint_collision_preview(
+        &mut self,
+        ctx: &egui::Context,
+        painter: &egui::Painter,
+        rect: egui::Rect,
+    ) {
+        let Some(preview) = self.model_preview.as_ref() else {
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "No collision geometry was found for this stage.",
+                egui::FontId::proportional(15.0),
+                egui::Color32::from_rgb(224, 213, 178),
+            );
+            return;
+        };
+        if preview.collision_triangles.is_empty() {
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "No collision geometry was found for this stage.",
+                egui::FontId::proportional(15.0),
+                egui::Color32::from_rgb(224, 213, 178),
+            );
+            return;
+        }
+
+        let key = self.model_framebuffer_key(rect);
+        let needs_render = self.model_framebuffer.is_none() || self.model_framebuffer_key != key;
+        if needs_render {
+            if let Some(image) = self.render_collision_framebuffer(rect) {
+                if let Some(handle) = &mut self.model_framebuffer {
+                    handle.set(image, egui::TextureOptions::LINEAR);
+                } else {
+                    self.model_framebuffer = Some(ctx.load_texture(
+                        "sms-collision-framebuffer",
+                        image,
+                        egui::TextureOptions::LINEAR,
+                    ));
+                }
+                self.model_framebuffer_key = key;
+            }
+        }
+
+        if let Some(handle) = &self.model_framebuffer {
+            painter.image(
+                handle.id(),
+                rect,
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        }
+
+        let label = format!(
+            "Collision | {} triangle(s) | {} surface type(s)",
+            preview.collision_triangles.len(),
+            preview.collision_surface_count
+        );
+        let label_pos = rect.left_top() + egui::vec2(10.0, 10.0);
+        let galley = painter.layout_no_wrap(
+            label,
+            egui::FontId::monospace(12.0),
+            egui::Color32::from_rgb(226, 236, 232),
+        );
+        let label_rect = egui::Rect::from_min_size(
+            label_pos - egui::vec2(6.0, 4.0),
+            galley.size() + egui::vec2(12.0, 8.0),
+        );
+        painter.rect_filled(
+            label_rect,
+            4.0,
+            egui::Color32::from_rgba_unmultiplied(12, 17, 19, 210),
+        );
+        painter.galley(label_pos, galley, egui::Color32::WHITE);
     }
 
     pub(super) fn update_level_transformation(&mut self, ctx: &egui::Context) {
@@ -1427,11 +1698,55 @@ impl SmsEditorApp {
         Some(image)
     }
 
+    pub(super) fn render_collision_framebuffer(
+        &self,
+        rect: egui::Rect,
+    ) -> Option<egui::ColorImage> {
+        let preview = self.model_preview.as_ref()?;
+        if preview.collision_triangles.is_empty() || rect.width() < 2.0 || rect.height() < 2.0 {
+            return None;
+        }
+
+        let size = framebuffer_size_for_rect(rect);
+        let mut image = viewport_framebuffer_background(size);
+        let mut depth = vec![f32::INFINITY; size[0] * size[1]];
+        let mut projected_triangles = Vec::new();
+
+        for triangle in &preview.collision_triangles {
+            let Some(screen) = project_triangle_to_framebuffer(self, rect, size, triangle.vertices)
+            else {
+                continue;
+            };
+            if !projected_triangle_overlaps_frame(screen, size) {
+                continue;
+            }
+            let color = shaded_collision_color(triangle);
+            rasterize_preview_triangle(
+                &mut image, &mut depth, screen, None, None, [color; 3], true, None, false,
+            );
+            projected_triangles.push(screen);
+        }
+
+        let edge_color = egui::Color32::from_rgb(24, 31, 33);
+        for screen in projected_triangles {
+            for [start, end] in [
+                [screen[0], screen[1]],
+                [screen[1], screen[2]],
+                [screen[2], screen[0]],
+            ] {
+                rasterize_depth_tested_segment(&mut image, &depth, start, end, edge_color);
+            }
+        }
+
+        Some(image)
+    }
+
     pub(super) fn model_framebuffer_key(&self, rect: egui::Rect) -> Option<ModelFramebufferKey> {
         let preview = self.model_preview.as_ref()?;
         let camera = self.renderer.camera();
         Some(ModelFramebufferKey {
             stage_id: self.stage_id.clone(),
+            view_mode: self.view_mode,
             size: framebuffer_size_for_rect(rect),
             camera_focus: camera.focus.map(f32::to_bits),
             camera_yaw: camera.yaw_degrees.to_bits(),
@@ -1442,6 +1757,7 @@ impl SmsEditorApp {
             triangle_count: preview.triangles.len(),
             texture_count: preview.textures.len(),
             source_triangles: preview.source_triangles,
+            collision_triangle_count: preview.collision_triangles.len(),
         })
     }
 
@@ -1535,26 +1851,158 @@ impl SmsEditorApp {
         }
     }
 
+    fn gizmo_geometry(&self, rect: egui::Rect, world_origin: [f32; 3]) -> Option<GizmoGeometry> {
+        let projection = self.camera_projection(rect);
+        let (origin, depth) = projection.project_world_to_screen(world_origin)?;
+        let focal = perspective_focal_length(rect, self.viewport_zoom).max(1.0);
+        let world_units_per_pixel = (depth / focal).max(0.001);
+        let world_axis_length = GIZMO_AXIS_LENGTH_PIXELS * world_units_per_pixel;
+        let axes = std::array::from_fn(|index| {
+            let axis = [GizmoAxis::X, GizmoAxis::Y, GizmoAxis::Z][index];
+            let end_world = vec3_add(
+                world_origin,
+                vec3_scale(axis.world_direction(), world_axis_length),
+            );
+            let end = projection
+                .project_world_to_screen(end_world)
+                .map_or(origin, |(screen, _)| screen);
+            let delta = end - origin;
+            let direction = if delta.length_sq() > 0.0001 {
+                delta.normalized()
+            } else {
+                egui::Vec2::ZERO
+            };
+            GizmoScreenAxis {
+                start: origin + direction * 8.0,
+                end,
+                direction,
+            }
+        });
+        let ring_radius = GIZMO_RING_RADIUS_PIXELS * world_units_per_pixel;
+        let rotation_rings = std::array::from_fn(|axis_index| {
+            let axis = [GizmoAxis::X, GizmoAxis::Y, GizmoAxis::Z][axis_index];
+            (0..=64)
+                .filter_map(|step| {
+                    let angle = step as f32 / 64.0 * std::f32::consts::TAU;
+                    let (sin, cos) = angle.sin_cos();
+                    let offset = match axis {
+                        GizmoAxis::X => [0.0, cos * ring_radius, sin * ring_radius],
+                        GizmoAxis::Y => [cos * ring_radius, 0.0, sin * ring_radius],
+                        GizmoAxis::Z => [cos * ring_radius, sin * ring_radius, 0.0],
+                    };
+                    projection
+                        .project_world_to_screen(vec3_add(world_origin, offset))
+                        .map(|(screen, _)| screen)
+                })
+                .collect()
+        });
+        Some(GizmoGeometry {
+            origin,
+            axes,
+            rotation_rings,
+            world_units_per_pixel,
+        })
+    }
+
     pub(super) fn paint_gizmo(
         &self,
         painter: &egui::Painter,
-        _rect: egui::Rect,
-        origin: egui::Pos2,
+        rect: egui::Rect,
+        world_origin: [f32; 3],
     ) {
-        painter.arrow(
-            origin,
-            egui::vec2(54.0, 0.0),
-            egui::Stroke::new(3.0, egui::Color32::from_rgb(230, 82, 82)),
+        if !matches!(
+            self.tool,
+            EditorTool::Move | EditorTool::Rotate | EditorTool::Scale
+        ) {
+            return;
+        }
+        let Some(geometry) = self.gizmo_geometry(rect, world_origin) else {
+            return;
+        };
+        let active_axis = self
+            .gizmo_drag
+            .map(|drag| drag.axis)
+            .or(self.hovered_gizmo_axis);
+        let axes = [GizmoAxis::X, GizmoAxis::Y, GizmoAxis::Z];
+
+        if self.tool == EditorTool::Rotate {
+            for axis in axes {
+                let points = &geometry.rotation_rings[axis.index()];
+                if points.len() < 2 {
+                    continue;
+                }
+                painter.add(egui::Shape::line(
+                    points.clone(),
+                    egui::Stroke::new(5.0, egui::Color32::from_black_alpha(150)),
+                ));
+                let color = gizmo_axis_color(axis, active_axis == Some(axis));
+                painter.add(egui::Shape::line(
+                    points.clone(),
+                    egui::Stroke::new(if active_axis == Some(axis) { 4.0 } else { 2.5 }, color),
+                ));
+                if let Some(label_position) = points.first() {
+                    painter.text(
+                        *label_position,
+                        egui::Align2::CENTER_CENTER,
+                        axis.label(),
+                        egui::FontId::proportional(12.0),
+                        color,
+                    );
+                }
+            }
+        } else {
+            for axis in axes {
+                let screen_axis = geometry.axes[axis.index()];
+                let highlighted = active_axis == Some(axis);
+                let color = gizmo_axis_color(axis, highlighted);
+                painter.line_segment(
+                    [screen_axis.start, screen_axis.end],
+                    egui::Stroke::new(6.0, egui::Color32::from_black_alpha(155)),
+                );
+                if self.tool == EditorTool::Move {
+                    painter.arrow(
+                        screen_axis.start,
+                        screen_axis.end - screen_axis.start,
+                        egui::Stroke::new(if highlighted { 4.5 } else { 3.0 }, color),
+                    );
+                } else {
+                    painter.line_segment(
+                        [screen_axis.start, screen_axis.end],
+                        egui::Stroke::new(if highlighted { 4.5 } else { 3.0 }, color),
+                    );
+                    let handle = egui::Rect::from_center_size(
+                        screen_axis.end,
+                        egui::vec2(
+                            if highlighted { 13.0 } else { 10.0 },
+                            if highlighted { 13.0 } else { 10.0 },
+                        ),
+                    );
+                    painter.rect_filled(handle, 1.0, color);
+                    painter.rect_stroke(
+                        handle,
+                        1.0,
+                        egui::Stroke::new(1.0, egui::Color32::from_black_alpha(180)),
+                        egui::StrokeKind::Inside,
+                    );
+                }
+                painter.text(
+                    screen_axis.end + screen_axis.direction * 10.0,
+                    egui::Align2::CENTER_CENTER,
+                    axis.label(),
+                    egui::FontId::proportional(12.0),
+                    color,
+                );
+            }
+        }
+        painter.circle_filled(
+            geometry.origin,
+            if active_axis.is_some() { 6.0 } else { 4.5 },
+            egui::Color32::from_rgb(235, 238, 240),
         );
-        painter.arrow(
-            origin,
-            egui::vec2(-32.0, -34.0),
-            egui::Stroke::new(3.0, egui::Color32::from_rgb(82, 176, 116)),
-        );
-        painter.arrow(
-            origin,
-            egui::vec2(24.0, -46.0),
-            egui::Stroke::new(3.0, egui::Color32::from_rgb(93, 158, 236)),
+        painter.circle_stroke(
+            geometry.origin,
+            7.0,
+            egui::Stroke::new(1.5, egui::Color32::from_black_alpha(180)),
         );
     }
 
@@ -1564,85 +2012,89 @@ impl SmsEditorApp {
         painter: &egui::Painter,
         rect: egui::Rect,
     ) {
-        let overlay =
-            egui::Rect::from_min_size(rect.min + egui::vec2(16.0, 16.0), egui::vec2(280.0, 118.0));
-        painter.rect_filled(
-            overlay,
-            6.0,
-            egui::Color32::from_rgba_unmultiplied(12, 15, 16, 210),
-        );
-        painter.rect_stroke(
-            overlay,
-            6.0,
-            egui::Stroke::new(
-                1.0,
-                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 30),
-            ),
-            egui::StrokeKind::Inside,
-        );
+        if self.show_stats {
+            let overlay = egui::Rect::from_min_size(
+                rect.min + egui::vec2(16.0, 16.0),
+                egui::vec2(280.0, 118.0),
+            );
+            painter.rect_filled(
+                overlay,
+                6.0,
+                egui::Color32::from_rgba_unmultiplied(12, 15, 16, 210),
+            );
+            painter.rect_stroke(
+                overlay,
+                6.0,
+                egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 30),
+                ),
+                egui::StrokeKind::Inside,
+            );
 
-        let document_summary = self
-            .render_scene
-            .as_ref()
-            .map(|scene| {
-                format!(
-                    "{}  models:{}  col:{}  obj:{}",
-                    scene.stage_id,
-                    scene.model_paths.len(),
-                    scene.collision_paths.len(),
-                    scene.object_count
-                )
-            })
-            .unwrap_or_else(|| "No stage loaded".to_string());
+            let document_summary = self
+                .render_scene
+                .as_ref()
+                .map(|scene| {
+                    format!(
+                        "{}  models:{}  col:{}  obj:{}",
+                        scene.stage_id,
+                        scene.model_paths.len(),
+                        scene.collision_paths.len(),
+                        scene.object_count
+                    )
+                })
+                .unwrap_or_else(|| "No stage loaded".to_string());
 
-        painter.text(
-            overlay.min + egui::vec2(14.0, 12.0),
-            egui::Align2::LEFT_TOP,
-            document_summary,
-            egui::FontId::proportional(14.0),
-            egui::Color32::from_rgb(238, 241, 242),
-        );
-        painter.text(
-            overlay.min + egui::vec2(14.0, 40.0),
-            egui::Align2::LEFT_TOP,
-            format!(
-                "{} / {} / snap {}",
-                self.tool.label(),
-                self.view_mode.label(),
-                if self.snap_enabled { "on" } else { "off" }
-            ),
-            egui::FontId::monospace(12.0),
-            egui::Color32::from_rgb(190, 202, 204),
-        );
-        let camera = self.renderer.camera();
-        painter.text(
-            overlay.min + egui::vec2(14.0, 66.0),
-            egui::Align2::LEFT_TOP,
-            if let Some(preview) = &self.model_preview {
+            painter.text(
+                overlay.min + egui::vec2(14.0, 12.0),
+                egui::Align2::LEFT_TOP,
+                document_summary,
+                egui::FontId::proportional(14.0),
+                egui::Color32::from_rgb(238, 241, 242),
+            );
+            painter.text(
+                overlay.min + egui::vec2(14.0, 40.0),
+                egui::Align2::LEFT_TOP,
                 format!(
-                    "verts {}  tris {}  tex {}  pts {}  dist {:.0}",
-                    preview.source_vertices,
-                    preview.source_triangles,
-                    preview.source_textures,
-                    preview.points.len(),
-                    camera.distance
-                )
-            } else {
-                format!(
-                    "yaw {:.0}  pitch {:.0}  dist {:.0}",
-                    camera.yaw_degrees, camera.pitch_degrees, camera.distance
-                )
-            },
-            egui::FontId::monospace(12.0),
-            egui::Color32::from_rgb(190, 202, 204),
-        );
-        painter.text(
-            overlay.min + egui::vec2(14.0, 90.0),
-            egui::Align2::LEFT_TOP,
-            format!("RMB + WASD/QE  wheel speed {:.2}x", self.camera_speed),
-            egui::FontId::monospace(11.0),
-            egui::Color32::from_rgb(160, 176, 179),
-        );
+                    "{} / {} / snap {}",
+                    self.tool.label(),
+                    self.view_mode.label(),
+                    if self.snap_enabled { "on" } else { "off" }
+                ),
+                egui::FontId::monospace(12.0),
+                egui::Color32::from_rgb(190, 202, 204),
+            );
+            let camera = self.renderer.camera();
+            painter.text(
+                overlay.min + egui::vec2(14.0, 66.0),
+                egui::Align2::LEFT_TOP,
+                if let Some(preview) = &self.model_preview {
+                    format!(
+                        "verts {}  tris {}  tex {}  pts {}  dist {:.0}",
+                        preview.source_vertices,
+                        preview.source_triangles,
+                        preview.source_textures,
+                        preview.points.len(),
+                        camera.distance
+                    )
+                } else {
+                    format!(
+                        "yaw {:.0}  pitch {:.0}  dist {:.0}",
+                        camera.yaw_degrees, camera.pitch_degrees, camera.distance
+                    )
+                },
+                egui::FontId::monospace(12.0),
+                egui::Color32::from_rgb(190, 202, 204),
+            );
+            painter.text(
+                overlay.min + egui::vec2(14.0, 90.0),
+                egui::Align2::LEFT_TOP,
+                format!("RMB + WASD/QE  wheel speed {:.2}x", self.camera_speed),
+                egui::FontId::monospace(11.0),
+                egui::Color32::from_rgb(160, 176, 179),
+            );
+        }
 
         let compass_center = egui::pos2(rect.right() - 70.0, rect.top() + 74.0);
         painter.circle_filled(
@@ -1676,8 +2128,19 @@ impl SmsEditorApp {
             egui::Stroke::new(2.0, egui::Color32::from_rgb(93, 158, 236)),
         );
 
-        if self.palette_factory.is_some() && self.tool == EditorTool::Place {
-            let text = self.palette_factory.as_deref().unwrap_or_default();
+        if (self.palette_factory.is_some() || self.placing_model_asset.is_some())
+            && self.tool == EditorTool::Place
+        {
+            let text = self.palette_factory.clone().unwrap_or_else(|| {
+                self.placing_model_asset
+                    .and_then(|id| {
+                        self.model_catalog_entries
+                            .iter()
+                            .find(|entry| entry.id == id)
+                            .map(|entry| entry.name.clone())
+                    })
+                    .unwrap_or_else(|| "model asset".to_string())
+            });
             let rect = egui::Rect::from_min_size(
                 rect.left_bottom() + egui::vec2(16.0, -48.0),
                 egui::vec2(260.0, 34.0),
@@ -1690,12 +2153,117 @@ impl SmsEditorApp {
             painter.text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
-                format!("Placing {text}"),
+                format!("Placing {text} — click to confirm"),
                 egui::FontId::proportional(13.0),
                 egui::Color32::from_rgb(215, 238, 231),
             );
         }
     }
+}
+
+fn gizmo_axis_color(axis: GizmoAxis, highlighted: bool) -> egui::Color32 {
+    if highlighted {
+        return egui::Color32::from_rgb(255, 224, 92);
+    }
+    match axis {
+        GizmoAxis::X => egui::Color32::from_rgb(238, 72, 72),
+        GizmoAxis::Y => egui::Color32::from_rgb(76, 202, 105),
+        GizmoAxis::Z => egui::Color32::from_rgb(72, 139, 242),
+    }
+}
+
+fn gizmo_axis_at_pointer(
+    tool: EditorTool,
+    geometry: &GizmoGeometry,
+    pointer: egui::Pos2,
+) -> Option<GizmoAxis> {
+    let mut best: Option<(f32, GizmoAxis)> = None;
+    for axis in [GizmoAxis::X, GizmoAxis::Y, GizmoAxis::Z] {
+        let distance = if tool == EditorTool::Rotate {
+            geometry.rotation_rings[axis.index()]
+                .windows(2)
+                .map(|segment| point_segment_distance(pointer, segment[0], segment[1]))
+                .min_by(f32::total_cmp)
+                .unwrap_or(f32::INFINITY)
+        } else if matches!(tool, EditorTool::Move | EditorTool::Scale) {
+            let screen_axis = geometry.axes[axis.index()];
+            point_segment_distance(pointer, screen_axis.start, screen_axis.end)
+        } else {
+            f32::INFINITY
+        };
+        if distance <= GIZMO_HIT_RADIUS_PIXELS
+            && best.is_none_or(|(best_distance, _)| distance < best_distance)
+        {
+            best = Some((distance, axis));
+        }
+    }
+    best.map(|(_, axis)| axis)
+}
+
+fn point_segment_distance(point: egui::Pos2, start: egui::Pos2, end: egui::Pos2) -> f32 {
+    let segment = end - start;
+    let length_squared = segment.length_sq();
+    if length_squared <= f32::EPSILON {
+        return point.distance(start);
+    }
+    let offset = point - start;
+    let projection =
+        ((offset.x * segment.x + offset.y * segment.y) / length_squared).clamp(0.0, 1.0);
+    point.distance(start + segment * projection)
+}
+
+pub(super) fn transform_from_gizmo_drag(
+    drag: GizmoDrag,
+    pointer: egui::Pos2,
+    snap_enabled: bool,
+    translation_snap: f32,
+    rotation_snap: f32,
+    scale_snap: f32,
+) -> Transform {
+    let mut transform = drag.start_transform;
+    let pointer_delta = pointer - drag.start_pointer;
+    let projected_pixels =
+        pointer_delta.x * drag.screen_direction.x + pointer_delta.y * drag.screen_direction.y;
+    let axis = drag.axis.index();
+    match drag.tool {
+        EditorTool::Move => {
+            let mut value = drag.start_transform.translation[axis]
+                + projected_pixels * drag.world_units_per_pixel;
+            if snap_enabled && translation_snap > f32::EPSILON {
+                value = snap_value(value, translation_snap);
+            }
+            transform.translation[axis] = value;
+        }
+        EditorTool::Rotate => {
+            let start = drag.start_pointer - drag.screen_origin;
+            let current = pointer - drag.screen_origin;
+            let mut delta_degrees = if start.length_sq() > 16.0 && current.length_sq() > 16.0 {
+                let cross = start.x * current.y - start.y * current.x;
+                let dot = start.x * current.x + start.y * current.y;
+                cross.atan2(dot).to_degrees()
+            } else {
+                (pointer_delta.x - pointer_delta.y) * 0.5
+            };
+            let mut value = drag.start_transform.rotation_degrees[axis] + delta_degrees;
+            if snap_enabled && rotation_snap > f32::EPSILON {
+                value = snap_value(value, rotation_snap);
+                delta_degrees = value - drag.start_transform.rotation_degrees[axis];
+            }
+            transform.rotation_degrees[axis] =
+                (drag.start_transform.rotation_degrees[axis] + delta_degrees).rem_euclid(360.0);
+        }
+        EditorTool::Scale => {
+            let response_scale = drag.start_transform.scale[axis].abs().max(0.25);
+            let mut value = drag.start_transform.scale[axis]
+                + projected_pixels / GIZMO_AXIS_LENGTH_PIXELS * response_scale;
+            if snap_enabled && scale_snap > f32::EPSILON {
+                value = snap_value(value, scale_snap);
+            }
+            transform.scale[axis] = value.max(0.001);
+        }
+        EditorTool::Select | EditorTool::Place => {}
+    }
+    transform
 }
 
 pub(super) fn camera_speed_after_scroll(current: f32, scroll_delta: f32) -> f32 {

@@ -30,7 +30,7 @@ pub(super) fn level_transform_targets(
                 .to_ascii_lowercase()
                 .ends_with("!/map/scene.bin")
     }) {
-        let Ok(bytes) = read_stage_asset_bytes(&asset.path) else {
+        let Ok(bytes) = document.read_asset_bytes(&asset.path) else {
             continue;
         };
         let Ok(records) = parse_jdrama_object_records(&bytes) else {
@@ -250,7 +250,7 @@ pub(super) fn apply_pollution_bitmap_mask(
     }) else {
         return;
     };
-    let Ok(bytes) = read_stage_asset_bytes(&asset.path) else {
+    let Ok(bytes) = document.read_asset_bytes(&asset.path) else {
         return;
     };
     let Some((width, height, rgba)) = decode_pollution_bitmap_mask(&bytes) else {
@@ -452,7 +452,7 @@ pub(super) fn attach_model_texture_srt_animation(
         }) else {
             continue;
         };
-        let Ok(bytes) = read_stage_asset_bytes(&asset.path) else {
+        let Ok(bytes) = document.read_asset_bytes(&asset.path) else {
             continue;
         };
         let Ok(animation) = J3dTextureSrtAnimation::parse(&bytes) else {
@@ -530,7 +530,7 @@ pub(super) fn starting_joint_animation(
                     .eq_ignore_ascii_case(candidate)
             })
     })?;
-    let bytes = read_stage_asset_bytes(&asset.path).ok()?;
+    let bytes = document.read_asset_bytes(&asset.path).ok()?;
     J3dJointAnimation::parse(bytes).ok()
 }
 fn root_accessory_body_pose(
@@ -538,7 +538,7 @@ fn root_accessory_body_pose(
     object: &SceneObject,
     body_model_path: &str,
 ) -> Option<J3dJointAnimation> {
-    let body_bytes = read_stage_asset_bytes(body_model_path).ok()?;
+    let body_bytes = document.read_asset_bytes(body_model_path).ok()?;
     let body_joint_count = J3dFile::parse(&body_bytes).ok()?.joint_names().ok()?.len();
     let root_parts = npc_accessory_specs(document, object)
         .into_iter()
@@ -575,7 +575,7 @@ fn root_accessory_body_pose(
             if material_table_match_key(animation_stem) != part_key {
                 continue;
             }
-            let Ok(bytes) = read_stage_asset_bytes(&asset.path) else {
+            let Ok(bytes) = document.read_asset_bytes(&asset.path) else {
                 continue;
             };
             let Ok(animation) = J3dJointAnimation::parse(bytes) else {
@@ -665,7 +665,7 @@ pub(super) fn attach_npc_texture_pattern_animation(
     }) else {
         return;
     };
-    let Ok(bytes) = read_stage_asset_bytes(&asset.path) else {
+    let Ok(bytes) = document.read_asset_bytes(&asset.path) else {
         return;
     };
     let Ok(animation) = J3dTexturePatternAnimation::parse(bytes) else {
@@ -766,7 +766,7 @@ pub(super) fn apply_model_material_table(
     else {
         return;
     };
-    let Ok(bytes) = read_stage_asset_bytes(&table_path) else {
+    let Ok(bytes) = document.read_asset_bytes(&table_path) else {
         return;
     };
     let Ok(table) = J3dFile::parse(&bytes) else {
@@ -871,7 +871,7 @@ pub(super) fn apply_actor_runtime_textures(
         }) else {
             continue;
         };
-        let Ok(bytes) = read_stage_asset_bytes(&asset.path) else {
+        let Ok(bytes) = document.read_asset_bytes(&asset.path) else {
             continue;
         };
         let Ok(mut texture) = decode_bti_texture(bytes) else {
@@ -1008,7 +1008,7 @@ pub(super) fn accessory_joint_animation(
     document: &StageDocument,
     model_path: &str,
 ) -> Option<J3dJointAnimation> {
-    let model_bytes = read_stage_asset_bytes(model_path).ok()?;
+    let model_bytes = document.read_asset_bytes(model_path).ok()?;
     let model_joint_count = J3dFile::parse(&model_bytes).ok()?.joint_names().ok()?.len();
     let animation_path = accessory_joint_animation_path(model_path)?;
     let asset = document.assets.iter().find(|asset| {
@@ -1019,7 +1019,7 @@ pub(super) fn accessory_joint_animation(
                 .replace('\\', "/")
                 .eq_ignore_ascii_case(&animation_path)
     })?;
-    let bytes = read_stage_asset_bytes(&asset.path).ok()?;
+    let bytes = document.read_asset_bytes(&asset.path).ok()?;
     let animation = J3dJointAnimation::parse(bytes).ok()?;
     (animation.joint_count() == model_joint_count).then_some(animation)
 }

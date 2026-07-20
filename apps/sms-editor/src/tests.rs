@@ -1,5 +1,118 @@
 use super::*;
 
+#[test]
+fn monte_palette_entries_use_friendly_pianta_names() {
+    let object = ObjectDefinition {
+        factory_name: "NPCMonteMH".to_string(),
+        class_name: "TMonteMH".to_string(),
+        category: "NPC".to_string(),
+        source: sms_schema::SchemaSource::MarNameRefGen,
+        display_name: None,
+        preview_model: None,
+        hidden: false,
+        unsafe_to_edit: false,
+    };
+    assert_eq!(
+        crate::ui_panels::object_palette_display_name(&object),
+        "Pianta - Male (Variant H)"
+    );
+
+    let mut female = object;
+    female.factory_name = "NPCMonteW".to_string();
+    assert_eq!(
+        crate::ui_panels::object_palette_display_name(&female),
+        "Pianta - Female"
+    );
+}
+
+#[test]
+fn nozzle_box_palette_entry_uses_a_readable_name() {
+    let object = ObjectDefinition {
+        factory_name: "NozzleBox".to_string(),
+        class_name: "TNozzleBox".to_string(),
+        category: "MapObj".to_string(),
+        source: sms_schema::SchemaSource::MarNameRefGen,
+        display_name: None,
+        preview_model: None,
+        hidden: false,
+        unsafe_to_edit: false,
+    };
+    assert_eq!(
+        crate::ui_panels::object_palette_display_name(&object),
+        "Nozzle Box"
+    );
+}
+
+#[test]
+fn editor_layout_defaults_to_the_unreal_style_workspace() {
+    let app = SmsEditorApp::default();
+
+    assert_eq!(app.bottom_tab, BottomTab::Content);
+    assert!(!app.show_project_settings);
+    assert!(!app.show_issues);
+    assert!(!app.show_console);
+    assert!(!app.show_stats);
+    assert!(app.show_effects);
+}
+
+#[test]
+fn content_browser_layout_wraps_to_the_available_width() {
+    let narrow = content_browser_layout(360.0, 20);
+    let medium = content_browser_layout(760.0, 20);
+    let wide = content_browser_layout(1_240.0, 20);
+    let sparse = content_browser_layout(1_240.0, 3);
+
+    assert_eq!(narrow.columns, 1);
+    assert!(medium.columns > narrow.columns);
+    assert!(wide.columns > narrow.columns);
+    assert_eq!(sparse.columns, 3);
+    assert!((180.0..=260.0).contains(&wide.card_width));
+    for (available_width, layout) in [(360.0, narrow), (760.0, medium), (1_240.0, wide)] {
+        let occupied_width =
+            layout.card_width * layout.columns as f32 + 8.0 * (layout.columns - 1) as f32;
+        assert!(occupied_width <= available_width);
+    }
+}
+
+#[test]
+fn content_browser_cards_include_game_localized_stage_and_scenario_names() {
+    let archive = SceneArchiveInfo {
+        stage_id: "bianco0".to_string(),
+        group: "bianco".to_string(),
+        relative_path: PathBuf::from("files/data/scene/bianco0.szs"),
+        path: PathBuf::from("C:/game/files/data/scene/bianco0.szs"),
+        size_bytes: 2_300_000,
+    };
+    let localized = SceneArchiveLabel {
+        stage_name: Some("BIANCO HILLS".to_string()),
+        scenario_names: vec![
+            "Road to the Big Windmill".to_string(),
+            "The Hillside Cave Secret".to_string(),
+        ],
+    };
+
+    let card = content_browser_card_text(&archive, Some(&localized));
+    let hover = content_browser_hover_text(&archive, Some(&localized));
+    assert!(card.contains("bianco0"));
+    assert!(card.contains("BIANCO HILLS"));
+    assert!(card.contains("Road to the Big Windmill (+1)"));
+    assert_eq!(card.lines().count(), 4);
+    assert!(hover.contains("The Hillside Cave Secret"));
+}
+
+#[test]
+fn window_title_includes_the_project_and_open_level() {
+    assert_eq!(
+        editor_window_title(Some("Sunshine US"), Some("bianco3")),
+        "Sunshine US - bianco3 - Graffito-Editor"
+    );
+    assert_eq!(
+        editor_window_title(Some("Sunshine US"), None),
+        "Sunshine US - Graffito-Editor"
+    );
+    assert_eq!(editor_window_title(None, None), "Graffito-Editor");
+}
+
 fn assert_vec3_close(actual: [f32; 3], expected: [f32; 3]) {
     for (actual, expected) in actual.into_iter().zip(expected) {
         assert!(
@@ -113,6 +226,45 @@ fn fly_camera_velocity_interpolates_in_and_out() {
 }
 
 #[test]
+fn project_camera_state_restores_the_last_stage_view() {
+    let mut project = SmsProjectFile::new(
+        "Camera Test",
+        PathBuf::from(r"C:\Games\SunshineJPExtract"),
+        PathBuf::from("Camera Test.smsdata"),
+        None,
+    );
+    project.stage_cameras.insert(
+        "bianco2".to_string(),
+        ProjectCameraState {
+            focus: [120.0, 340.0, 560.0],
+            distance: 7_500.0,
+            yaw_degrees: 135.0,
+            pitch_degrees: -22.0,
+            viewport_pan: [14.0, -9.0],
+            viewport_zoom: 1.4,
+            camera_speed: 0.5,
+        },
+    );
+    let mut app = SmsEditorApp {
+        current_project: Some(OpenProject {
+            descriptor_path: PathBuf::from("Camera Test.sms"),
+            descriptor: project,
+        }),
+        stage_id: "bianco2".to_string(),
+        ..SmsEditorApp::default()
+    };
+
+    assert!(app.restore_project_camera_state());
+    assert_vec3_close(app.renderer.camera().focus, [120.0, 340.0, 560.0]);
+    assert_eq!(app.renderer.camera().distance, 7_500.0);
+    assert_eq!(app.renderer.camera().yaw_degrees, 135.0);
+    assert_eq!(app.renderer.camera().pitch_degrees, -22.0);
+    assert_eq!(app.viewport_pan, egui::vec2(14.0, -9.0));
+    assert_eq!(app.viewport_zoom, 1.4);
+    assert_eq!(app.camera_speed, 0.5);
+}
+
+#[test]
 fn fly_camera_scroll_adjusts_and_clamps_speed() {
     assert!(viewport_ui::camera_speed_after_scroll(1.0, 120.0) > 1.0);
     assert!(viewport_ui::camera_speed_after_scroll(1.0, -120.0) < 1.0);
@@ -152,6 +304,90 @@ fn viewport_markers_show_only_selection_outside_objects_mode() {
     app.view_mode = ViewMode::Lit;
     app.selected_object_id = None;
     assert!(marker_ids(&app).is_empty());
+}
+
+#[test]
+fn collision_preview_expands_col_groups_into_surface_typed_triangles() {
+    let collision = ColFile::new(
+        vec![
+            sms_formats::ColVertex::new(0.0, 0.0, 0.0),
+            sms_formats::ColVertex::new(100.0, 0.0, 0.0),
+            sms_formats::ColVertex::new(0.0, 0.0, 100.0),
+            sms_formats::ColVertex::new(100.0, 0.0, 100.0),
+        ],
+        vec![sms_formats::ColGroup {
+            surface_type: 0x0102,
+            has_per_triangle_data: false,
+            triangles: vec![
+                sms_formats::ColTriangle {
+                    vertex_indices: [0, 1, 2],
+                    attribute_0: 0,
+                    attribute_1: 0,
+                    data: None,
+                },
+                sms_formats::ColTriangle {
+                    vertex_indices: [1, 3, 2],
+                    attribute_0: 0,
+                    attribute_1: 0,
+                    data: None,
+                },
+            ],
+        }],
+    );
+    let mut preview = CollisionPreviewBuild::default();
+
+    preview.append_file(&collision);
+
+    assert_eq!(preview.file_count, 1);
+    assert_eq!(preview.triangles.len(), 2);
+    assert_eq!(preview.triangles[0].surface_type, 0x0102);
+    assert_eq!(
+        preview.triangles[1].vertices,
+        [[100.0, 0.0, 0.0], [100.0, 0.0, 100.0], [0.0, 0.0, 100.0]]
+    );
+    assert_eq!(preview.surface_types, BTreeSet::from([0x0102]));
+}
+
+#[test]
+fn collision_surface_colors_are_stable_and_distinguish_types() {
+    assert_eq!(
+        viewport_ui::collision_surface_color(0x0102),
+        viewport_ui::collision_surface_color(0x0102)
+    );
+    assert_ne!(
+        viewport_ui::collision_surface_color(0x0102),
+        viewport_ui::collision_surface_color(0x0103)
+    );
+}
+
+#[test]
+fn collision_framebuffer_draws_loaded_geometry() {
+    let mut preview = preview_for_texture_alpha(false, false);
+    preview.collision_triangles = vec![CollisionPreviewTriangle {
+        vertices: [
+            [-1_000.0, 0.0, -1_000.0],
+            [1_000.0, 0.0, -1_000.0],
+            [0.0, 0.0, 1_000.0],
+        ],
+        surface_type: 1,
+    }];
+    preview.collision_file_count = 1;
+    preview.collision_surface_count = 1;
+    let app = SmsEditorApp {
+        model_preview: Some(preview),
+        view_mode: ViewMode::Collision,
+        ..SmsEditorApp::default()
+    };
+    let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0));
+
+    let image = app.render_collision_framebuffer(rect).unwrap();
+    let background = viewport_framebuffer_background(image.size);
+
+    assert!(image
+        .pixels
+        .iter()
+        .zip(background.pixels)
+        .any(|(rendered, clear)| *rendered != clear));
 }
 
 #[test]
@@ -587,14 +823,9 @@ fn placement_stream_rgb_reaches_the_decomp_selected_tev_register() {
         ..ObjectRegistry::default()
     };
     let mut object = SceneObject::new("paint", "FixturePaint");
-    object.source_record_bytes = Some(
-        [0xAA, 0xBB]
-            .into_iter()
-            .chain(0x0000_01FFu32.to_be_bytes())
-            .chain(0x0000_0078u32.to_be_bytes())
-            .chain(0x1234_5609u32.to_be_bytes())
-            .collect(),
-    );
+    object.insert_source_raw_param("tev_red", "511");
+    object.insert_source_raw_param("tev_green", "120");
+    object.insert_source_raw_param("tev_blue", "305419785");
 
     assert_eq!(
         map_obj_stream_tev_color(&object, Some(&registry)),
@@ -1312,6 +1543,11 @@ fn preview_for_texture_alpha(has_alpha: bool, has_translucent_alpha: bool) -> Mo
     ModelPreview {
         points: Vec::new(),
         triangles: Vec::new(),
+        collision_triangles: Vec::new(),
+        collision_file_count: 0,
+        collision_surface_count: 0,
+        failed_collision_files: 0,
+        collision_failures: Vec::new(),
         textures: vec![PreviewTexture {
             image: image.clone(),
             mips: vec![image],
@@ -1428,32 +1664,82 @@ fn alt_orbit_uses_same_horizontal_yaw_sign() {
 }
 
 #[test]
-fn move_drag_uses_camera_relative_ground_plane() {
-    let app = camera_app();
-    let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+fn gizmo_move_snaps_only_the_dragged_axis() {
+    let drag = GizmoDrag {
+        axis: GizmoAxis::X,
+        tool: EditorTool::Move,
+        start_pointer: egui::pos2(100.0, 100.0),
+        screen_origin: egui::pos2(100.0, 100.0),
+        screen_direction: egui::vec2(1.0, 0.0),
+        world_units_per_pixel: 1.0,
+        start_transform: Transform {
+            translation: [13.0, 17.0, 23.0],
+            rotation_degrees: [7.0, 11.0, 19.0],
+            scale: [1.1, 1.2, 1.3],
+        },
+    };
 
-    let right_drag = app.viewport_drag_move_delta(rect, egui::vec2(10.0, 0.0));
-    let up_drag = app.viewport_drag_move_delta(rect, egui::vec2(0.0, -10.0));
+    let transformed = viewport_ui::transform_from_gizmo_drag(
+        drag,
+        egui::pos2(160.0, 100.0),
+        true,
+        50.0,
+        15.0,
+        0.1,
+    );
 
-    assert!(right_drag[0] < 0.0);
-    assert!(right_drag[2].abs() < 0.001);
-    assert!(up_drag[2] > 0.0);
-    assert!(up_drag[0].abs() < 0.001);
+    assert_eq!(transformed.translation, [50.0, 17.0, 23.0]);
+    assert_eq!(transformed.rotation_degrees, [7.0, 11.0, 19.0]);
+    assert_eq!(transformed.scale, [1.1, 1.2, 1.3]);
 }
 
 #[test]
-fn move_drag_rotates_with_camera_yaw() {
-    let mut app = camera_app();
-    app.renderer.camera_mut().yaw_degrees = 90.0;
-    let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+fn gizmo_rotate_and_scale_edit_only_the_active_axis() {
+    let start_transform = Transform {
+        translation: [13.0, 17.0, 23.0],
+        rotation_degrees: [7.0, 11.0, 19.0],
+        scale: [1.1, 1.2, 1.3],
+    };
+    let rotated = viewport_ui::transform_from_gizmo_drag(
+        GizmoDrag {
+            axis: GizmoAxis::Y,
+            tool: EditorTool::Rotate,
+            start_pointer: egui::pos2(164.0, 100.0),
+            screen_origin: egui::pos2(100.0, 100.0),
+            screen_direction: egui::vec2(1.0, 0.0),
+            world_units_per_pixel: 1.0,
+            start_transform,
+        },
+        egui::pos2(100.0, 164.0),
+        true,
+        50.0,
+        15.0,
+        0.1,
+    );
+    let scaled = viewport_ui::transform_from_gizmo_drag(
+        GizmoDrag {
+            axis: GizmoAxis::Z,
+            tool: EditorTool::Scale,
+            start_pointer: egui::pos2(100.0, 100.0),
+            screen_origin: egui::pos2(100.0, 100.0),
+            screen_direction: egui::vec2(0.0, 1.0),
+            world_units_per_pixel: 1.0,
+            start_transform,
+        },
+        egui::pos2(100.0, 160.0),
+        true,
+        50.0,
+        15.0,
+        0.1,
+    );
 
-    let right_drag = app.viewport_drag_move_delta(rect, egui::vec2(10.0, 0.0));
-    let up_drag = app.viewport_drag_move_delta(rect, egui::vec2(0.0, -10.0));
-
-    assert!(right_drag[2] > 0.0);
-    assert!(right_drag[0].abs() < 0.001);
-    assert!(up_drag[0] > 0.0);
-    assert!(up_drag[2].abs() < 0.001);
+    assert_eq!(rotated.rotation_degrees, [7.0, 105.0, 19.0]);
+    assert_eq!(rotated.translation, start_transform.translation);
+    assert_eq!(rotated.scale, start_transform.scale);
+    assert_eq!(scaled.scale[0..2], start_transform.scale[0..2]);
+    assert!(scaled.scale[2] > start_transform.scale[2]);
+    assert_eq!(scaled.translation, start_transform.translation);
+    assert_eq!(scaled.rotation_degrees, start_transform.rotation_degrees);
 }
 
 #[test]
@@ -1491,6 +1777,22 @@ fn authored_water_reflections_follow_environment_visibility() {
         preview_render_layer_for_model_path(reflect_sky),
         PreviewRenderLayer::MirrorScene
     );
+}
+
+#[test]
+fn shimmer_models_are_controlled_by_effect_visibility() {
+    let path = "stage.szs!/mapobj/shimmerhi.bmd";
+
+    assert_eq!(
+        preview_render_layer_for_model_path(path),
+        PreviewRenderLayer::Heatwave
+    );
+    assert!(preview_render_layer_is_effect(PreviewRenderLayer::Heatwave));
+    assert!(preview_render_layer_is_effect(PreviewRenderLayer::Particle));
+    assert!(preview_render_layer_is_effect(
+        PreviewRenderLayer::ParticleDistortion
+    ));
+    assert!(!preview_render_layer_is_effect(PreviewRenderLayer::Main));
 }
 
 #[test]
@@ -1722,8 +2024,17 @@ fn reset_fruit_registry() -> ObjectRegistry {
                 |(resource_name, actor_type, _, _, _)| sms_schema::MapObjResourceDefinition {
                     resource_name: (*resource_name).to_string(),
                     actor_type: *actor_type,
+                    object_flags: 0,
+                    required_manager_name: "fixture map object manager".to_string(),
+                    has_hold_dependency: false,
+                    has_move_dependency: false,
+                    uses_resource_name_model_fallback: true,
                     primary_model: Some(format!("{resource_name}.bmd")),
+                    animation_resources: Vec::new(),
+                    hold_model_path: None,
+                    move_bck_path: None,
                     load_flags: 0x1022_0000,
+                    collision_resources: Vec::new(),
                     source_file: "src/MoveBG/MapObjInit.cpp".to_string(),
                 },
             )
@@ -2399,6 +2710,11 @@ fn updating_object_transform_moves_cached_preview_mesh() {
                 particle_color_mode: None,
                 particle_environment_color: None,
             }],
+            collision_triangles: Vec::new(),
+            collision_file_count: 0,
+            collision_surface_count: 0,
+            failed_collision_files: 0,
+            collision_failures: Vec::new(),
             textures: Vec::new(),
             materials: Vec::new(),
             texture_srt_animations: Vec::new(),
@@ -2471,6 +2787,36 @@ fn dirty_state_tracks_saved_object_content() {
 }
 
 #[test]
+fn object_edits_do_not_clear_unsaved_lighting_changes() {
+    let object = SceneObject::new("obj-1", "coin");
+    let mut app = SmsEditorApp {
+        document: Some(test_document(vec![object.clone()])),
+        saved_objects: vec![object],
+        ..SmsEditorApp::default()
+    };
+
+    app.document
+        .as_mut()
+        .unwrap()
+        .lighting
+        .ambients
+        .push(sms_formats::JDramaAmbient {
+            name: Some("Object ambient".to_string()),
+            color: [32, 48, 64, 255],
+        });
+    app.document_dirty = true;
+
+    app.mutate_document("Moved object", |document| {
+        document.objects[0].transform.translation[0] = 25.0;
+    });
+    app.undo();
+
+    assert!(app.is_dirty());
+    assert_eq!(app.document.as_ref().unwrap().objects, app.saved_objects);
+    assert_ne!(app.document.as_ref().unwrap().lighting, app.saved_lighting);
+}
+
+#[test]
 fn project_save_uses_the_same_trimmed_project_path_as_project_load() {
     let root = std::env::temp_dir().join(format!(
         "sms-editor-app-save-path-{}-{}",
@@ -2481,6 +2827,7 @@ fn project_save_uses_the_same_trimmed_project_path_as_project_load() {
             .as_nanos()
     ));
     let mut app = SmsEditorApp {
+        base_root: ".".to_string(),
         project_root: format!("  {}  ", root.display()),
         document: Some(test_document(vec![SceneObject::new("obj-1", "Coin")])),
         ..SmsEditorApp::default()
@@ -2489,6 +2836,351 @@ fn project_save_uses_the_same_trimmed_project_path_as_project_load() {
     assert!(app.save_project());
     assert!(root.join("sms-project.toml").is_file());
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn project_save_is_blocked_when_the_selected_base_differs_from_the_open_document() {
+    let root = std::env::temp_dir().join(format!(
+        "sms-editor-app-stale-base-save-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let jp_base = root.join("SunshineJPExtract");
+    let us_base = root.join("SunshineUSExtract");
+    let project_root = root.join("us-project");
+    std::fs::create_dir_all(&jp_base).unwrap();
+    std::fs::create_dir_all(&us_base).unwrap();
+    let mut document = test_document(Vec::new());
+    document.base_root = jp_base;
+    let mut app = SmsEditorApp {
+        base_root: us_base.to_string_lossy().into_owned(),
+        project_root: project_root.to_string_lossy().into_owned(),
+        document: Some(document),
+        ..SmsEditorApp::default()
+    };
+
+    assert!(!app.save_project());
+    assert!(!project_root.exists());
+    assert!(app
+        .log
+        .iter()
+        .any(|message| message.contains("open stage belongs") && message.contains("blocked")));
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn project_from_another_base_selects_separate_project_without_blocking_stage_open() {
+    let root = std::env::temp_dir().join(format!(
+        "sms-editor-app-project-base-mismatch-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let jp_base = root.join("jp-base");
+    let us_base = root.join("us-base");
+    let project_root = root.join("sms-editor-project");
+    std::fs::create_dir_all(&jp_base).unwrap();
+    std::fs::create_dir_all(&us_base).unwrap();
+
+    let mut jp_document = test_document(vec![SceneObject::new("jp-object", "Coin")]);
+    jp_document.base_root = jp_base.clone();
+    jp_document.save_project_folder(&project_root).unwrap();
+
+    let mut us_document = test_document(vec![SceneObject::new("us-object", "Coin")]);
+    us_document.base_root = us_base.clone();
+    let selection =
+        load_project_for_stage(&mut us_document, &project_root.to_string_lossy()).unwrap();
+    let warning = selection
+        .warning
+        .expect("a mismatched project should select a separate project folder");
+
+    assert!(warning.contains("Project Folder automatically switched"));
+    assert_ne!(selection.project_root, project_root.to_string_lossy());
+    assert!(selection.project_root.contains("us-base"));
+    assert_eq!(us_document.objects[0].id, "us-object");
+
+    us_document
+        .save_project_folder(&selection.project_root)
+        .unwrap();
+    let mut reopened_us = test_document(vec![SceneObject::new("base-us-object", "Coin")]);
+    reopened_us.base_root = us_base;
+    assert!(reopened_us
+        .load_project_folder(&selection.project_root)
+        .unwrap());
+    assert_eq!(reopened_us.objects[0].id, "us-object");
+
+    let mut reopened_jp = test_document(vec![SceneObject::new("base-jp-object", "Coin")]);
+    reopened_jp.base_root = jp_base;
+    let jp_selection = load_project_for_stage(&mut reopened_jp, &selection.project_root).unwrap();
+    assert_eq!(PathBuf::from(jp_selection.project_root), project_root);
+    assert_eq!(reopened_jp.objects[0].id, "jp-object");
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn project_folder_inside_the_base_is_moved_to_a_safe_sibling() {
+    let root = std::env::temp_dir().join(format!(
+        "sms-editor-app-project-overlap-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let base_root = root.join("SunshineUSExtract");
+    std::fs::create_dir_all(&base_root).unwrap();
+    let mut document = test_document(Vec::new());
+    document.base_root = base_root.clone();
+
+    let selection = load_project_for_stage(&mut document, &base_root.to_string_lossy()).unwrap();
+
+    assert_eq!(
+        PathBuf::from(&selection.project_root),
+        root.join("SunshineUSExtract-graffito-editor-project")
+    );
+    assert!(selection
+        .warning
+        .is_some_and(|warning| warning.contains("must be outside")));
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn stage_build_requires_a_saved_sms_project() {
+    let mut app = SmsEditorApp {
+        document: Some(test_document(Vec::new())),
+        ..SmsEditorApp::default()
+    };
+
+    app.build_game();
+
+    assert!(app.background_receiver.is_none());
+    assert!(app
+        .log
+        .iter()
+        .any(|message| message.contains("requires a saved .sms project")));
+}
+
+#[test]
+fn completed_stage_build_reports_the_managed_game_relative_output() {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    sender
+        .send(BackgroundResult::Build(Ok(
+            managed_build::ManagedGameBuildOutcome {
+                run: managed_build::ManagedRunMirrorOutcome {
+                    build_root: PathBuf::from("project.smsbuild"),
+                    run_root: PathBuf::from("project.smsbuild/run-root"),
+                    run_main_dol: PathBuf::from("project.smsbuild/run-root/sys/main.dol"),
+                    source_relative_path: PathBuf::from("files/data/scene/dolpic0.szs"),
+                    stage_output_path: PathBuf::from(
+                        "project.smsbuild/run-root/files/data/scene/dolpic0.szs",
+                    ),
+                    stage_size_bytes: 1234,
+                    stage_replaced: false,
+                    copied_files: 3,
+                    reused_files: 0,
+                    removed_entries: 0,
+                },
+            },
+        )))
+        .unwrap();
+    let mut app = SmsEditorApp {
+        background_receiver: Some(receiver),
+        background_label: Some("Building managed game".to_string()),
+        ..SmsEditorApp::default()
+    };
+
+    app.poll_background_task(&egui::Context::default(), None);
+
+    assert!(app.background_receiver.is_none());
+    assert!(app.background_label.is_none());
+    assert!(app.log.iter().any(|message| {
+        message.contains("1234-byte")
+            && message.contains("project.smsbuild/run-root/files/data/scene/dolpic0.szs")
+    }));
+    assert!(app.log.iter().any(|message| {
+        message.contains("Managed game directory") && message.contains("project.smsbuild/run-root")
+    }));
+    assert!(app
+        .log
+        .iter()
+        .any(|message| message.contains("extracted base game was not modified")));
+}
+
+#[test]
+fn completed_managed_launch_reports_the_resolved_direct_boot_target() {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    sender
+        .send(BackgroundResult::BuildAndRun {
+            mode: DolphinLaunchMode::External,
+            result: Ok(managed_build::ManagedGameLaunchOutcome {
+                run: managed_build::ManagedRunMirrorOutcome {
+                    build_root: PathBuf::from("project.smsbuild"),
+                    run_root: PathBuf::from("project.smsbuild/run-root"),
+                    run_main_dol: PathBuf::from("project.smsbuild/run-root/sys/main.dol"),
+                    source_relative_path: PathBuf::from("files/data/scene/pinnaBeach4.szs"),
+                    stage_output_path: PathBuf::from(
+                        "project.smsbuild/run-root/files/data/scene/pinnaBeach4.szs",
+                    ),
+                    stage_size_bytes: 4321,
+                    stage_replaced: true,
+                    copied_files: 1,
+                    reused_files: 2,
+                    removed_entries: 0,
+                },
+                direct_boot: managed_build::ManagedDirectBootOutcome {
+                    launch_dol: PathBuf::from("project.smsbuild/run-root/sys/main.dol"),
+                    target: direct_boot::RuntimeStageTarget {
+                        area_index: 5,
+                        scenario_index: 4,
+                        archive_name: "pinnaBeach4.arc".to_string(),
+                    },
+                    matching_contexts: 4,
+                    size_bytes: 9876,
+                    reused: false,
+                    logo_bypass_address: 0x800F_9DF4,
+                    hook_address: 0x800F_9B4C,
+                    movie_hook_address: 0x800F_A000,
+                    stub_address: 0x8042_0000,
+                },
+            }),
+        })
+        .unwrap();
+    let mut app = SmsEditorApp {
+        background_receiver: Some(receiver),
+        background_label: Some("Preparing and launching current scene".to_string()),
+        ..SmsEditorApp::default()
+    };
+
+    app.poll_background_task(&egui::Context::default(), None);
+
+    assert!(app.background_receiver.is_none());
+    assert!(app.background_label.is_none());
+    assert!(app.log.iter().any(|message| {
+        message.contains("9876-byte")
+            && message.contains("pinnaBeach4.arc")
+            && message.contains("runtime area 5, scenario 4")
+            && message.contains("logo bypass 0x800F9DF4")
+    }));
+    assert!(app
+        .log
+        .iter()
+        .any(|message| message.contains("4 runtime contexts")));
+    assert!(app
+        .log
+        .iter()
+        .any(|message| message.contains("Dolphin executable is not configured")));
+}
+
+#[test]
+fn managed_dolphin_exec_keeps_the_extracted_directory_mount_path() {
+    let run_root = std::path::Path::new("project.smsbuild/run-root");
+    assert!(document_commands::managed_dolphin_exec_is_directory_main(
+        run_root,
+        std::path::Path::new("project.smsbuild/run-root/sys/main.dol")
+    ));
+    assert!(!document_commands::managed_dolphin_exec_is_directory_main(
+        run_root,
+        std::path::Path::new("project.smsbuild/run-root/sys/direct-boot.dol")
+    ));
+}
+
+#[test]
+fn blank_dolphin_user_directory_uses_dolphins_normal_profile() {
+    let mut command = Command::new("Dolphin");
+
+    let configured = SmsEditorApp::configure_dolphin_user_directory(&mut command, "  ");
+
+    assert_eq!(configured, None);
+    assert!(command.get_args().next().is_none());
+}
+
+#[test]
+fn configured_dolphin_user_directory_is_forwarded_to_dolphin() {
+    let mut command = Command::new("Dolphin");
+
+    let configured = SmsEditorApp::configure_dolphin_user_directory(
+        &mut command,
+        r"C:\DolphinProfiles\SMS-Modding",
+    );
+
+    assert_eq!(
+        configured,
+        Some(PathBuf::from(r"C:\DolphinProfiles\SMS-Modding"))
+    );
+    assert_eq!(
+        command.get_args().collect::<Vec<_>>(),
+        [
+            std::ffi::OsStr::new("-u"),
+            std::ffi::OsStr::new(r"C:\DolphinProfiles\SMS-Modding")
+        ]
+    );
+}
+
+#[test]
+fn play_in_editor_keeps_input_active_when_dolphin_loses_top_level_focus() {
+    let mut command = Command::new("Dolphin");
+
+    SmsEditorApp::configure_play_in_editor_input(&mut command);
+
+    assert_eq!(
+        command.get_args().collect::<Vec<_>>(),
+        [
+            std::ffi::OsStr::new("-C"),
+            std::ffi::OsStr::new("Dolphin.Interface.PauseOnFocusLost=False"),
+            std::ffi::OsStr::new("-C"),
+            std::ffi::OsStr::new("Dolphin.Input.BackgroundInput=True"),
+        ]
+    );
+}
+
+#[test]
+fn managed_build_cancel_state_logs_once_and_clears_with_the_result() {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let mut app = SmsEditorApp {
+        background_receiver: Some(receiver),
+        background_label: Some("Building managed game".to_string()),
+        active_build_cancel: Some(Arc::clone(&cancel)),
+        ..SmsEditorApp::default()
+    };
+
+    assert!(app.background_label.is_some());
+    assert!(app.active_build_cancel.is_some());
+    app.cancel_active_build();
+    app.cancel_active_build();
+
+    assert!(cancel.load(Ordering::Acquire));
+    assert_eq!(
+        app.log
+            .iter()
+            .filter(|message| message.starts_with("Cancelling managed game build"))
+            .count(),
+        1
+    );
+
+    sender
+        .send(BackgroundResult::Build(Err(format!(
+            "{}; test cancellation",
+            managed_build::MANAGED_BUILD_CANCELLED
+        ))))
+        .unwrap();
+    app.poll_background_task(&egui::Context::default(), None);
+
+    assert!(app.background_receiver.is_none());
+    assert!(app.background_label.is_none());
+    assert!(app.active_build_cancel.is_none());
+    assert!(app
+        .log
+        .iter()
+        .any(|message| message.starts_with("Game build cancelled:")));
 }
 
 #[test]
@@ -2503,13 +3195,22 @@ fn completed_stage_load_is_discarded_when_the_project_path_changed() {
     };
     let loaded = LoadedStage {
         base_root: "base-root".to_string(),
+        requested_project_root: "project-a".to_string(),
         project_root: "project-a".to_string(),
         archives: Vec::new(),
         registry: None,
         schema_warning: None,
+        object_authoring_catalog_key: None,
+        object_authoring_catalog: Default::default(),
+        object_authoring_catalog_warnings: Default::default(),
+        project_warning: None,
         document,
         scene,
         preview: None,
+        scene_labels: BTreeMap::new(),
+        scene_label_warning: None,
+        retail_skyboxes: Vec::new(),
+        skybox_warnings: Vec::new(),
     };
 
     app.apply_loaded_stage(loaded);
@@ -2519,6 +3220,45 @@ fn completed_stage_load_is_discarded_when_the_project_path_changed() {
         .log
         .iter()
         .any(|message| message.contains("superseded project root")));
+}
+
+#[test]
+fn completed_stage_load_adopts_the_resolved_project_folder() {
+    let document = test_document(Vec::new());
+    let scene = RenderScene::from_document(&document);
+    let mut app = SmsEditorApp {
+        base_root: "base-root".to_string(),
+        project_root: "sms-editor-project".to_string(),
+        stage_id: "dolpic0".to_string(),
+        ..SmsEditorApp::default()
+    };
+    let loaded = LoadedStage {
+        base_root: "base-root".to_string(),
+        requested_project_root: "sms-editor-project".to_string(),
+        project_root: "sms-editor-project-SunshineUSExtract".to_string(),
+        archives: Vec::new(),
+        registry: None,
+        schema_warning: None,
+        object_authoring_catalog_key: None,
+        object_authoring_catalog: Default::default(),
+        object_authoring_catalog_warnings: Default::default(),
+        project_warning: Some("Project Folder automatically switched.".to_string()),
+        document,
+        scene,
+        preview: None,
+        scene_labels: BTreeMap::new(),
+        scene_label_warning: None,
+        retail_skyboxes: Vec::new(),
+        skybox_warnings: Vec::new(),
+    };
+
+    app.apply_loaded_stage(loaded);
+
+    assert_eq!(app.project_root, "sms-editor-project-SunshineUSExtract");
+    assert!(app
+        .log
+        .iter()
+        .any(|message| message.contains("automatically switched")));
 }
 
 #[test]
@@ -2533,13 +3273,22 @@ fn completed_stage_load_is_discarded_when_the_selected_stage_changed() {
     };
     let loaded = LoadedStage {
         base_root: "base-root".to_string(),
+        requested_project_root: "project".to_string(),
         project_root: "project".to_string(),
         archives: Vec::new(),
         registry: None,
         schema_warning: None,
+        object_authoring_catalog_key: None,
+        object_authoring_catalog: Default::default(),
+        object_authoring_catalog_warnings: Default::default(),
+        project_warning: None,
         document,
         scene,
         preview: None,
+        scene_labels: BTreeMap::new(),
+        scene_label_warning: None,
+        retail_skyboxes: Vec::new(),
+        skybox_warnings: Vec::new(),
     };
 
     app.apply_loaded_stage(loaded);
@@ -2549,6 +3298,84 @@ fn completed_stage_load_is_discarded_when_the_selected_stage_changed() {
         .log
         .iter()
         .any(|message| message.contains("superseded stage")));
+}
+
+#[test]
+fn object_authoring_catalog_cache_identity_tracks_retail_inventory_and_registry() {
+    let root = tempfile::tempdir().unwrap();
+    let archive_path = root.path().join("files/data/scene/dolpic0.szs");
+    std::fs::create_dir_all(archive_path.parent().unwrap()).unwrap();
+    std::fs::write(&archive_path, [0_u8]).unwrap();
+    let retail_archive = SceneArchiveInfo {
+        stage_id: "dolpic0".to_string(),
+        group: "dolpic".to_string(),
+        path: archive_path,
+        relative_path: PathBuf::from("files/data/scene/dolpic0.szs"),
+        size_bytes: 1,
+    };
+    let registry = ObjectRegistry::default();
+    let original_key = object_authoring_catalog_cache_key(
+        root.path(),
+        std::slice::from_ref(&retail_archive),
+        &registry,
+    );
+
+    let authored_archive = SceneArchiveInfo {
+        stage_id: "custom0".to_string(),
+        group: "custom".to_string(),
+        path: root.path().join("files/data/scene/custom0.szs"),
+        relative_path: PathBuf::from("files/data/scene/custom0.szs"),
+        size_bytes: 0,
+    };
+    let with_authored_key = object_authoring_catalog_cache_key(
+        root.path(),
+        &[retail_archive.clone(), authored_archive],
+        &registry,
+    );
+    assert_eq!(original_key, with_authored_key);
+
+    let mut changed_archive = retail_archive.clone();
+    changed_archive.size_bytes = 2;
+    let changed_archive_key =
+        object_authoring_catalog_cache_key(root.path(), &[changed_archive], &registry);
+    assert_ne!(original_key, changed_archive_key);
+
+    let changed_registry = ObjectRegistry {
+        moving_collision_vertex_limit: Some(1),
+        ..ObjectRegistry::default()
+    };
+    let changed_registry_key =
+        object_authoring_catalog_cache_key(root.path(), &[retail_archive], &changed_registry);
+    assert_ne!(original_key, changed_registry_key);
+}
+
+#[test]
+fn object_authoring_catalog_cache_reuses_the_immutable_payload() {
+    let root = tempfile::tempdir().unwrap();
+    let registry = ObjectRegistry::default();
+    let key = object_authoring_catalog_cache_key(root.path(), &[], &registry);
+    let catalog = Arc::new(ObjectAuthoringCatalog::default());
+    let warnings = Arc::new(Vec::new());
+    let app = SmsEditorApp {
+        object_authoring_catalog_cache_key: Some(key),
+        object_authoring_catalog: Arc::clone(&catalog),
+        object_authoring_catalog_warnings: Arc::clone(&warnings),
+        ..SmsEditorApp::default()
+    };
+
+    let reused = app
+        .reusable_object_authoring_catalog_cache(root.path(), Some(&registry))
+        .unwrap();
+    assert!(Arc::ptr_eq(&catalog, &reused.catalog));
+    assert!(Arc::ptr_eq(&warnings, &reused.warnings));
+
+    let changed_registry = ObjectRegistry {
+        moving_collision_vertex_limit: Some(1),
+        ..ObjectRegistry::default()
+    };
+    assert!(app
+        .reusable_object_authoring_catalog_cache(root.path(), Some(&changed_registry))
+        .is_none());
 }
 
 #[test]
@@ -2578,11 +3405,14 @@ fn schema_refresh_updates_derived_preview_metadata_without_marking_the_document_
     };
     let (sender, receiver) = std::sync::mpsc::channel();
     sender
-        .send(BackgroundResult::Schema(Box::new(Ok(registry))))
+        .send(BackgroundResult::Schema(Box::new(Ok(LoadedSchema {
+            registry,
+            object_authoring_catalog_cache: None,
+        }))))
         .unwrap();
     app.background_receiver = Some(receiver);
 
-    app.poll_background_task(&egui::Context::default());
+    app.poll_background_task(&egui::Context::default(), None);
 
     assert!(!app.is_dirty());
     assert_eq!(app.document.as_ref().unwrap().objects, app.saved_objects);
@@ -2635,7 +3465,11 @@ fn test_document(objects: Vec<SceneObject>) -> StageDocument {
         assets: Vec::new(),
         objects,
         changed_files: BTreeMap::new(),
+        stage_archive: None,
+        stage_archive_source_path: None,
+        archive_edits: sms_scene::StageArchiveEdits::default(),
         registry: None,
+        route_authoring: None,
         load_issues: Vec::new(),
         lighting: Default::default(),
         actor_previews: BTreeMap::new(),

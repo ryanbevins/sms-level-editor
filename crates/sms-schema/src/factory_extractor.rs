@@ -29,6 +29,15 @@ pub(crate) fn extract_factory_candidates(text: &str) -> Vec<FactoryCandidate> {
     .expect("valid factory regex");
     let compare_re = Regex::new(r#"strcmp\s*\(\s*name\s*,\s*"([^"]+)"\s*\)\s*==\s*0"#)
         .expect("valid factory-name comparison regex");
+    let branch_re =
+        Regex::new(r#"(?s)strcmp\s*\(\s*name\s*,\s*"([^"]+)"\s*\)\s*==\s*0\s*\)\s*\{([^{}]*)\}"#)
+            .expect("valid factory branch regex");
+    let constructed_assignment_re = Regex::new(
+        r#"(?:[A-Za-z_:][A-Za-z0-9_:<>]*\s*\*?\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*new\s+([A-Za-z_:][A-Za-z0-9_:]*)"#,
+    )
+    .expect("valid constructed assignment regex");
+    let returned_identifier_re = Regex::new(r#"return\s+([A-Za-z_][A-Za-z0-9_]*)\s*;"#)
+        .expect("valid returned identifier regex");
 
     let mut candidates = Vec::new();
     let mut handled_names = BTreeSet::new();
@@ -40,6 +49,38 @@ pub(crate) fn extract_factory_candidates(text: &str) -> Vec<FactoryCandidate> {
             class_name: Some(captures[2].to_string()),
             evidence: FactoryEvidence::ConstructedReturn,
         });
+    }
+
+    // A few factories perform required bookkeeping between construction and
+    // return, so the new expression is assigned to a local first. Resolve
+    // only a variable that is both constructed and returned inside the same
+    // simple name-guarded branch; this keeps unrelated allocations out of the
+    // object registry. MarNameRefGen's Mario branch is shaped this way.
+    for branch in branch_re.captures_iter(text) {
+        let factory_name = branch[1].to_string();
+        if handled_names.contains(&factory_name) {
+            continue;
+        }
+        let body = &branch[2];
+        let returned = returned_identifier_re
+            .captures_iter(body)
+            .map(|captures| captures[1].to_string())
+            .collect::<BTreeSet<_>>();
+        let constructed = constructed_assignment_re
+            .captures_iter(body)
+            .find_map(|captures| {
+                returned
+                    .contains(&captures[1])
+                    .then(|| captures[2].to_string())
+            });
+        if let Some(class_name) = constructed {
+            handled_names.insert(factory_name.clone());
+            candidates.push(FactoryCandidate {
+                factory_name,
+                class_name: Some(class_name),
+                evidence: FactoryEvidence::ConstructedReturn,
+            });
+        }
     }
 
     for captures in compare_re.captures_iter(text) {
@@ -170,5 +211,23 @@ mod tests {
             candidate.class_name.as_deref() == Some("TItem")
                 && candidate.evidence == FactoryEvidence::ConstructedReturn
         }));
+    }
+
+    #[test]
+    fn resolves_locally_constructed_and_returned_factory_objects() {
+        let text = r#"
+            if (strcmp(name, "Mario") == 0) {
+                TMario* mario = new TMario;
+                gpMarioOriginal = mario;
+                gpMarioAddress = (size_t)mario;
+                return mario;
+            }
+        "#;
+
+        let candidates = extract_factory_candidates(text);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].factory_name, "Mario");
+        assert_eq!(candidates[0].class_name.as_deref(), Some("TMario"));
+        assert_eq!(candidates[0].evidence, FactoryEvidence::ConstructedReturn);
     }
 }

@@ -9,17 +9,60 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sms_formats::{
-    mount_scene_archive, parse_jdrama_object_records, read_stage_asset_bytes, scan_stage_assets,
-    JDramaAmbient, JDramaLight, JDramaObjectRecord, PrmFile, SourceLocation, StageAsset,
-    StageAssetKind,
+    mount_scene_archive, parse_jdrama_object_records, read_stage_asset_bytes,
+    scan_common_stage_assets, scan_stage_assets, JDramaAmbient, JDramaDocument, JDramaField,
+    JDramaFieldValue, JDramaLight, JDramaObjectRecord, JDramaRecord, JDramaRecordPayload, PrmFile,
+    SourceLocation, StageAsset, StageAssetKind,
 };
 use sms_schema::{
     EnemyActorDefinition, EnemyManagerDefinition, EnemyModelDefinition, ObjectRegistry,
 };
 use thiserror::Error;
 
+mod blank_stage;
+mod object_authoring;
+mod object_parameters;
 mod project_store;
+mod route_authoring;
+mod stage_archive;
+mod stage_export;
 mod validation;
+
+pub use blank_stage::{
+    blank_stage_mario_record, blank_stage_sky_record, runtime_sky_material_table,
+    BlankStageBootstrapKind, BlankStageBootstrapManifest, BlankStageBootstrapRequirement,
+    BlankStageBootstrapResource, BlankStageLightingPreset, BlankStagePreset,
+    BlankStageSkyboxPreset, BlankStageTargetMetadata, BLANK_STAGE_BOOTSTRAP_REQUIREMENTS,
+    BLANK_STAGE_CAMERA_DIRECTORY_MARKER_PATH, BLANK_STAGE_COIN_PARTICLE_PATH,
+    BLANK_STAGE_PRESET_VERSION, DEFAULT_BLANK_STAGE_TARGET_SLOT,
+};
+pub use object_authoring::{
+    ObjectAuthoringCatalog, ObjectAuthoringCatalogBuild, ObjectAuthoringCatalogWarning,
+    ObjectAuthoringDependency, ObjectAuthoringResource, ObjectAuthoringRuntimeActorReference,
+    ObjectAuthoringTableDependency, ObjectAuthoringTemplate, SHINE_QUICK_CAMERA_NAME,
+};
+pub(crate) use object_parameters::validate_object_parameter_links;
+pub use object_parameters::{
+    apply_all_object_parameters, apply_dirty_object_parameter_edits, apply_object_parameter_edits,
+    editable_object_parameters, editable_parameters_for_object, seed_scene_object_parameters,
+    sync_scene_object_parameter_aliases, EditableSceneParameter, ObjectParameterBitFlag,
+    ObjectParameterChoice, ObjectParameterIndexedChoice, ObjectParameterInfo, ObjectParameterKind,
+    ParameterApplyMode, OBJECT_PARAMETER_CHARACTER_NAME, OBJECT_PARAMETER_NAME,
+};
+pub use route_authoring::{
+    BezierHandles, RouteAssignmentSuggestion, RouteAuthoringDocument, RouteAuthoringError,
+    RouteControlPoint, RouteDirection, RouteGraph, RouteLink, RoutePeriod,
+    DEFAULT_ROUTE_BAKE_TOLERANCE, MAX_ROUTE_SAMPLES_PER_LINK, ROUTE_RESOURCE_PATH,
+};
+pub use stage_archive::{
+    SourceFreeStageArchive, StageCompression, StageObjectPlacement, StageOrigin, StageResource,
+    StageResourceDocument,
+};
+pub use stage_export::{
+    StageArchiveEdits, StageArchiveExportOutcome, StageCollisionEdit, StageCollisionEditMode,
+    StageModelEdit, StageModelEditMode, StagePlacementInsert, StageResourceEdit,
+    StageResourceEditMode,
+};
 
 #[derive(Debug, Error)]
 pub enum SceneError {
@@ -29,6 +72,16 @@ pub enum SceneError {
     Io(#[from] std::io::Error),
     #[error("format error: {0}")]
     Format(#[from] sms_formats::FormatError),
+    #[error("stage resource {path}: {source}")]
+    StageResource {
+        path: String,
+        #[source]
+        source: sms_formats::FormatError,
+    },
+    #[error("stage archive export failed: {0}")]
+    StageExport(String),
+    #[error("rebuilt stage archive output overlaps the extracted base directory: {0}")]
+    StageArchiveOutputOverlapsBase(PathBuf),
     #[error("manifest serialization error: {0}")]
     TomlSer(#[from] toml::ser::Error),
     #[error("manifest parsing error: {0}")]
@@ -47,6 +100,14 @@ pub enum SceneError {
     UnownedProjectRoot(PathBuf),
     #[error("unsupported Graffito-Editor project manifest at {path}: {reason}")]
     UnsupportedProjectManifest { path: PathBuf, reason: String },
+    #[error(
+        "Graffito-Editor project manifest at {path} belongs to base root '{manifest_base}', not the open base root '{open_base}'"
+    )]
+    ProjectBaseMismatch {
+        path: PathBuf,
+        manifest_base: PathBuf,
+        open_base: PathBuf,
+    },
     #[error("project export is blocked by validation errors: {0}")]
     ValidationFailed(String),
     #[error(
@@ -140,7 +201,18 @@ pub struct StageDocument {
     pub assets: Vec<StageAsset>,
     pub objects: Vec<SceneObject>,
     pub changed_files: BTreeMap<PathBuf, Vec<u8>>,
+    /// Complete detached semantic import of the stage archive. The original
+    /// archive bytes and RARC child payload slots are never retained here.
+    pub stage_archive: Option<SourceFreeStageArchive>,
+    /// Informational source identity captured at import time. Export never
+    /// opens this path again.
+    pub stage_archive_source_path: Option<PathBuf>,
+    /// Source-free model and collision replacements authored for stage export.
+    pub archive_edits: StageArchiveEdits,
     pub registry: Option<ObjectRegistry>,
+    /// Project-only control points and Bezier handles for `map/scene.ral`.
+    /// The compiled retail representation remains an authored Rail resource.
+    pub route_authoring: Option<RouteAuthoringDocument>,
     pub load_issues: Vec<ValidationIssue>,
     pub lighting: StageLighting,
     pub actor_previews: BTreeMap<String, ActorPreview>,
@@ -233,19 +305,738 @@ impl StageDocument {
 
         let stage_id = stage_id.into();
         let assets = scan_stage_assets(&base_root, &stage_id)?;
-        let (objects, load_issues, lighting) = load_scene_objects_from_assets(&assets);
+        let (objects, mut load_issues, lighting) = load_scene_objects_from_assets(&assets);
+        let (stage_archive_source_path, stage_archive) =
+            match stage_export::import_exact_stage_archive(&base_root, &stage_id) {
+                Ok((source_path, archive)) => (Some(source_path), Some(archive)),
+                Err(error) => {
+                    load_issues.push(ValidationIssue::error(
+                        "stage-semantic-import-failed",
+                        format!(
+                            "Could not import a detached semantic archive for stage '{stage_id}': {error}"
+                        ),
+                    ));
+                    (None, None)
+                }
+            };
         Ok(Self {
             stage_id,
             base_root,
             assets,
             objects,
             changed_files: BTreeMap::new(),
+            stage_archive,
+            stage_archive_source_path,
+            archive_edits: StageArchiveEdits::default(),
             registry: None,
             load_issues,
+            route_authoring: None,
             lighting,
             actor_previews: BTreeMap::new(),
             loaded_project: None,
         })
+    }
+
+    /// Creates a document for a genuinely new authored stage id.
+    ///
+    /// No retail stage archive is opened or required. The semantic archive is
+    /// mounted at the virtual runtime identity
+    /// `<base>/files/data/scene/<stage_id>.szs`, which is also the path a
+    /// managed release build will author later.
+    pub fn from_authored_archive(
+        base_root: impl AsRef<Path>,
+        stage_id: impl Into<String>,
+        mut archive: SourceFreeStageArchive,
+    ) -> Result<Self> {
+        let base_root = base_root.as_ref().to_path_buf();
+        if !base_root.exists() {
+            return Err(SceneError::MissingBaseRoot(base_root));
+        }
+        let stage_id = stage_id.into();
+        validate_stage_id(&stage_id)?;
+        validate_authored_archive_target(&archive, &stage_id)?;
+        blank_stage::ensure_blank_stage_runtime_resources(&mut archive)?;
+        let source_path = authored_stage_virtual_source_path(&base_root, &stage_id)?;
+        let assets = authored_stage_assets(&base_root, &source_path, &archive)?;
+        let (objects, load_issues, lighting) =
+            load_scene_objects_from_assets_with_reader(&assets, |path| {
+                read_semantic_stage_asset_bytes(&archive, &source_path, path)
+            });
+        let semantic_json = archive.to_semantic_json()?;
+        let archive = SourceFreeStageArchive::from_semantic_json(&semantic_json)?;
+        Ok(Self {
+            stage_id,
+            base_root,
+            assets,
+            objects,
+            changed_files: BTreeMap::new(),
+            stage_archive: Some(archive),
+            stage_archive_source_path: Some(source_path),
+            archive_edits: StageArchiveEdits::default(),
+            registry: None,
+            load_issues,
+            route_authoring: None,
+            lighting,
+            actor_previews: BTreeMap::new(),
+            loaded_project: None,
+        })
+    }
+
+    /// Reopens an authored stage directly from a managed project baseline.
+    /// This is the safe restart path for stage ids that do not exist in the
+    /// extracted retail game.
+    pub fn open_authored_project_stage(
+        base_root: impl AsRef<Path>,
+        stage_id: impl Into<String>,
+        project_root: impl AsRef<Path>,
+    ) -> Result<Self> {
+        let base_root = base_root.as_ref();
+        let stage_id = stage_id.into();
+        let archive = project_store::load_authored_stage_baseline(
+            base_root,
+            &stage_id,
+            project_root.as_ref(),
+        )?
+        .ok_or_else(|| {
+            SceneError::StageExport(format!(
+                "project has no authored stage baseline for '{stage_id}'"
+            ))
+        })?;
+        let mut document = Self::from_authored_archive(base_root, stage_id, archive)?;
+        document.load_project_folder(project_root)?;
+        Ok(document)
+    }
+
+    /// Replaces the current stage baseline with a source-free authored archive
+    /// targeting this document's existing retail slot. Project identity and
+    /// already loaded project state are preserved; scene-derived state is
+    /// regenerated entirely from the authored semantic resources.
+    pub fn replace_with_authored_archive(
+        &mut self,
+        mut archive: SourceFreeStageArchive,
+    ) -> Result<()> {
+        validate_authored_archive_target(&archive, &self.stage_id)?;
+        blank_stage::ensure_blank_stage_runtime_resources(&mut archive)?;
+
+        // Normalize through the public detached document format. Besides
+        // proving a stable semantic rebuild, this prevents a caller-owned
+        // archive instance from carrying unvalidated container state into the
+        // editor document.
+        let semantic_json = archive.to_semantic_json()?;
+        let archive = SourceFreeStageArchive::from_semantic_json(&semantic_json)?;
+        let source_path = match &self.stage_archive_source_path {
+            Some(source_path) => source_path.clone(),
+            None => authored_stage_virtual_source_path(&self.base_root, &self.stage_id)?,
+        };
+        let assets = authored_stage_assets(&self.base_root, &source_path, &archive)?;
+        let (objects, load_issues, lighting) =
+            load_scene_objects_from_assets_with_reader(&assets, |path| {
+                read_semantic_stage_asset_bytes(&archive, &source_path, path)
+            });
+
+        let registry = self.registry.take();
+        self.assets = assets;
+        self.objects = objects;
+        self.stage_archive = Some(archive);
+        self.stage_archive_source_path = Some(source_path);
+        self.archive_edits = StageArchiveEdits::default();
+        self.load_issues = load_issues;
+        self.lighting = lighting;
+        self.route_authoring = None;
+        self.actor_previews.clear();
+        if let Some(registry) = registry {
+            self.set_registry(registry);
+        }
+        Ok(())
+    }
+
+    /// Reads a stage asset from the document's detached semantic archive when
+    /// the path addresses its mounted stage source. Common files and other
+    /// external assets retain the normal filesystem/archive reader behavior.
+    pub fn read_asset_bytes(&self, path: impl AsRef<Path>) -> Result<Vec<u8>> {
+        let path = path.as_ref();
+        if let (Some(archive), Some(source_path)) =
+            (&self.stage_archive, &self.stage_archive_source_path)
+        {
+            if let Some(raw_resource_path) = semantic_resource_path_for_asset(source_path, path) {
+                if let Some(edit) = self
+                    .archive_edits
+                    .resources
+                    .iter()
+                    .find(|edit| edit.raw_resource_path == raw_resource_path)
+                {
+                    return Ok(edit.document.to_bytes()?);
+                }
+                if let Some(edit) = self
+                    .archive_edits
+                    .models
+                    .iter()
+                    .find(|edit| edit.raw_resource_path == raw_resource_path)
+                {
+                    return Ok(edit.document.to_bytes()?);
+                }
+            }
+            if let Some(bytes) = read_matching_semantic_stage_asset(archive, source_path, path)? {
+                return Ok(bytes);
+            }
+        }
+        Ok(read_stage_asset_bytes(path)?)
+    }
+
+    /// Clones the semantic resource after applying the current authored
+    /// overlay in export order. This lets transactional editors merge into a
+    /// detached resource without consulting or mutating the imported source.
+    pub fn effective_resource_clone(
+        &self,
+        raw_resource_path: &[u8],
+    ) -> Result<Option<StageResourceDocument>> {
+        let mut current = if self
+            .archive_edits
+            .resource_removals
+            .iter()
+            .any(|removed| removed == raw_resource_path)
+        {
+            None
+        } else {
+            self.stage_archive
+                .as_ref()
+                .and_then(|archive| archive.resource(raw_resource_path))
+                .cloned()
+        };
+        if let Some(edit) = self
+            .archive_edits
+            .resources
+            .iter()
+            .find(|edit| edit.raw_resource_path == raw_resource_path)
+        {
+            if edit.mode == StageResourceEditMode::Insert && current.is_some() {
+                return Err(SceneError::StageExport(format!(
+                    "resource {} is already present but has an insert-only authored edit",
+                    String::from_utf8_lossy(raw_resource_path)
+                )));
+            }
+            current = Some(edit.document.clone());
+        }
+        for edit in self
+            .archive_edits
+            .models
+            .iter()
+            .filter(|edit| edit.raw_resource_path == raw_resource_path)
+        {
+            match (&current, edit.mode) {
+                (Some(StageResourceDocument::Model(_)), _) | (None, StageModelEditMode::Upsert) => {
+                    current = Some(StageResourceDocument::Model(edit.document.clone()));
+                }
+                (Some(_), _) => {
+                    return Err(SceneError::StageExport(format!(
+                        "resource {} has a model edit but is not a model",
+                        String::from_utf8_lossy(raw_resource_path)
+                    )));
+                }
+                (None, StageModelEditMode::Replace) => {
+                    return Err(SceneError::StageExport(format!(
+                        "model resource {} was not found",
+                        String::from_utf8_lossy(raw_resource_path)
+                    )));
+                }
+            }
+        }
+        for edit in self
+            .archive_edits
+            .collisions
+            .iter()
+            .filter(|edit| edit.raw_resource_path == raw_resource_path)
+        {
+            let replacement = match (&current, edit.mode) {
+                (
+                    Some(StageResourceDocument::Collision(existing)),
+                    StageCollisionEditMode::Append,
+                ) => stage_export::append_collision_document(
+                    existing,
+                    &edit.document,
+                    raw_resource_path,
+                )?,
+                (Some(StageResourceDocument::Collision(_)), _)
+                | (None, StageCollisionEditMode::Upsert) => edit.document.clone(),
+                (Some(_), _) => {
+                    return Err(SceneError::StageExport(format!(
+                        "resource {} has a collision edit but is not collision data",
+                        String::from_utf8_lossy(raw_resource_path)
+                    )));
+                }
+                (None, _) => {
+                    return Err(SceneError::StageExport(format!(
+                        "collision resource {} was not found",
+                        String::from_utf8_lossy(raw_resource_path)
+                    )));
+                }
+            };
+            current = Some(StageResourceDocument::Collision(replacement));
+        }
+        Ok(current)
+    }
+    /// Materializes the effective retail rail as project-side controls on first use.
+    pub fn ensure_route_authoring(&mut self) -> Result<&mut RouteAuthoringDocument> {
+        if self.route_authoring.is_none() {
+            let resource = self.effective_resource_clone(ROUTE_RESOURCE_PATH)?;
+            let rail = match resource {
+                Some(StageResourceDocument::Rail(rail)) => rail,
+                Some(_) => {
+                    return Err(SceneError::StageExport(
+                        "map/scene.ral is not a RAL resource".to_string(),
+                    ));
+                }
+                None => sms_formats::RalDocument {
+                    graphs: Vec::new(),
+                    file_size: 0,
+                    padding: Vec::new(),
+                },
+            };
+            self.route_authoring = Some(RouteAuthoringDocument::lift(ROUTE_RESOURCE_PATH, &rail));
+        }
+        Ok(self
+            .route_authoring
+            .as_mut()
+            .expect("route authoring initialized"))
+    }
+
+    /// Compiles project-side route state into the detached semantic archive overlay.
+    pub fn compile_route_authoring(&mut self) -> Result<()> {
+        let Some(authoring) = self.route_authoring.as_ref() else {
+            return Ok(());
+        };
+        let rail = authoring
+            .compile()
+            .map_err(|error| SceneError::StageExport(error.to_string()))?;
+        self.upsert_authored_resource(
+            authoring.raw_resource_path.clone(),
+            StageResourceDocument::Rail(rail),
+        );
+        Ok(())
+    }
+
+    pub fn route_consumers(&self, graph_name: &str) -> Vec<&SceneObject> {
+        self.objects
+            .iter()
+            .filter(|object| object.raw_param("graph_name") == Some(graph_name))
+            .collect()
+    }
+    pub fn route_reference_count(&self, graph_name: &str) -> usize {
+        self.objects
+            .iter()
+            .map(|object| {
+                usize::from(object.raw_param("graph_name") == Some(graph_name))
+                    + match &object.placement {
+                        Some(PlacementBinding::Authored(authored)) => authored
+                            .dependencies
+                            .iter()
+                            .map(|dependency| {
+                                graph_name_in_record_count(&dependency.record, graph_name)
+                            })
+                            .sum::<usize>(),
+                        _ => 0,
+                    }
+            })
+            .sum()
+    }
+
+    pub fn route_assignment_suggestions(&self, object_id: &str) -> Vec<RouteAssignmentSuggestion> {
+        let Some(object) = self.objects.iter().find(|object| object.id == object_id) else {
+            return Vec::new();
+        };
+        let Some(routes) = self.route_authoring.as_ref() else {
+            return Vec::new();
+        };
+        let current = object.raw_param("graph_name").unwrap_or("(null)");
+        let position = object.transform.translation;
+        let mut suggestions = routes
+            .graphs
+            .iter()
+            .map(|graph| {
+                let consumers = self.route_consumers(&graph.name);
+                RouteAssignmentSuggestion {
+                    graph_id: graph.id.clone(),
+                    graph_name: graph.name.clone(),
+                    current: graph.name == current,
+                    same_factory_uses: consumers
+                        .iter()
+                        .filter(|candidate| candidate.factory_name == object.factory_name)
+                        .count(),
+                    consumer_count: consumers.len(),
+                    nearest_distance: graph
+                        .nearest_control_distance(position)
+                        .unwrap_or(f32::INFINITY),
+                }
+            })
+            .collect::<Vec<_>>();
+        suggestions.sort_by(|left, right| {
+            right
+                .current
+                .cmp(&left.current)
+                .then_with(|| right.same_factory_uses.cmp(&left.same_factory_uses))
+                .then_with(|| left.nearest_distance.total_cmp(&right.nearest_distance))
+                .then_with(|| left.graph_name.cmp(&right.graph_name))
+        });
+        suggestions
+    }
+
+    /// Renames a graph and every exact typed consumer as one transactional mutation.
+    pub fn rename_route_graph(&mut self, graph_id: &str, new_name: &str) -> Result<usize> {
+        let before_routes = self.route_authoring.clone();
+        let before_objects = self.objects.clone();
+        let before_edits = self.archive_edits.clone();
+        let result = (|| {
+            let old_name = self
+                .ensure_route_authoring()?
+                .graph(graph_id)
+                .ok_or_else(|| {
+                    SceneError::StageExport(format!("route graph {graph_id:?} was not found"))
+                })?
+                .name
+                .clone();
+            self.route_authoring
+                .as_mut()
+                .expect("route authoring initialized")
+                .rename_graph(graph_id, new_name)
+                .map_err(|error| SceneError::StageExport(error.to_string()))?;
+            let mut changed = 0;
+            for object in &mut self.objects {
+                if object.raw_param("graph_name") == Some(old_name.as_str()) {
+                    object.set_raw_param("graph_name", new_name);
+                    changed += 1;
+                }
+                if let Some(PlacementBinding::Authored(authored)) = &mut object.placement {
+                    changed +=
+                        rewrite_graph_name_in_record(&mut authored.prototype, &old_name, new_name);
+                    for dependency in &mut authored.dependencies {
+                        changed += rewrite_graph_name_in_record(
+                            &mut dependency.record,
+                            &old_name,
+                            new_name,
+                        );
+                    }
+                }
+            }
+            self.compile_route_authoring()?;
+            Ok(changed)
+        })();
+        if result.is_err() {
+            self.route_authoring = before_routes;
+            self.objects = before_objects;
+            self.archive_edits = before_edits;
+        }
+        result
+    }
+
+    pub fn assign_object_route(&mut self, object_id: &str, graph_name: Option<&str>) -> Result<()> {
+        let value = graph_name.unwrap_or("(null)");
+        if graph_name.is_some() {
+            let routes = self.ensure_route_authoring()?;
+            if routes.graph_by_name(value).is_none() {
+                return Err(SceneError::StageExport(format!(
+                    "route graph {value:?} was not found"
+                )));
+            }
+        }
+        let object = self
+            .objects
+            .iter_mut()
+            .find(|object| object.id == object_id)
+            .ok_or_else(|| {
+                SceneError::StageExport(format!("object {object_id:?} was not found"))
+            })?;
+        object.set_raw_param("graph_name", value);
+        Ok(())
+    }
+
+    pub fn create_route_from_actor(&mut self, object_id: &str) -> Result<String> {
+        let object = self
+            .objects
+            .iter()
+            .find(|object| object.id == object_id)
+            .cloned()
+            .ok_or_else(|| {
+                SceneError::StageExport(format!("object {object_id:?} was not found"))
+            })?;
+        let routes = self.ensure_route_authoring()?;
+        let name = (1u32..)
+            .map(|serial| format!("Route{serial:03}"))
+            .find(|name| routes.graph_by_name(name).is_none())
+            .expect("route name space");
+        let yaw = object.transform.rotation_degrees[1].to_radians();
+        let first = object.transform.translation.map(|value| {
+            value
+                .round()
+                .clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16
+        });
+        let second = [
+            (object.transform.translation[0] + yaw.sin() * 500.0)
+                .round()
+                .clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16,
+            first[1],
+            (object.transform.translation[2] + yaw.cos() * 500.0)
+                .round()
+                .clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16,
+        ];
+        let graph_id = routes
+            .add_graph(name.clone(), first, second)
+            .map_err(|error| SceneError::StageExport(error.to_string()))?;
+        self.assign_object_route(object_id, Some(&name))?;
+        self.compile_route_authoring()?;
+        Ok(graph_id)
+    }
+
+    pub fn duplicate_route_and_reassign(&mut self, object_id: &str) -> Result<String> {
+        let current_name = self
+            .objects
+            .iter()
+            .find(|object| object.id == object_id)
+            .and_then(|object| object.raw_param("graph_name"))
+            .filter(|name| !name.is_empty() && *name != "(null)")
+            .map(str::to_string)
+            .ok_or_else(|| {
+                SceneError::StageExport("actor has no route to duplicate".to_string())
+            })?;
+        let routes = self.ensure_route_authoring()?;
+        let source_id = routes
+            .graph_by_name(&current_name)
+            .map(|graph| graph.id.clone())
+            .ok_or_else(|| {
+                SceneError::StageExport(format!("route graph {current_name:?} was not found"))
+            })?;
+        let new_name = (1u32..)
+            .map(|serial| format!("{current_name}_copy{serial:02}"))
+            .find(|name| routes.graph_by_name(name).is_none())
+            .expect("route name space");
+        let graph_id = routes
+            .duplicate_graph(&source_id, new_name.clone())
+            .map_err(|error| SceneError::StageExport(error.to_string()))?;
+        self.assign_object_route(object_id, Some(&new_name))?;
+        self.compile_route_authoring()?;
+        Ok(graph_id)
+    }
+    #[allow(clippy::empty_line_after_doc_comments)]
+    /// Adds a detached semantic resource to the authored archive overlay and
+    /// immediately exposes it through the document asset catalog.
+
+    pub fn insert_authored_resource(
+        &mut self,
+        raw_resource_path: impl Into<Vec<u8>>,
+        document: StageResourceDocument,
+    ) {
+        self.archive_edits
+            .insert_resource(raw_resource_path.into(), document);
+        self.sync_archive_edit_assets();
+    }
+
+    /// Inserts or replaces a detached semantic resource in the authored
+    /// archive overlay and immediately exposes it through the asset catalog.
+    pub fn upsert_authored_resource(
+        &mut self,
+        raw_resource_path: impl Into<Vec<u8>>,
+        document: StageResourceDocument,
+    ) {
+        self.archive_edits
+            .upsert_resource(raw_resource_path.into(), document);
+        self.sync_archive_edit_assets();
+    }
+
+    /// Restores the exact generic resource-overlay state for one archive path.
+    ///
+    /// Object authoring uses this narrow operation for undo/redo so importing
+    /// a catalog resource does not require snapshotting the complete archive
+    /// edit bundle. The edit and removal positions are intentionally independent:
+    /// malformed or forward-compatible project state can therefore be restored
+    /// byte-for-byte instead of being silently normalized by undo.
+    pub fn set_authored_resource_overlay_state(
+        &mut self,
+        raw_resource_path: impl Into<Vec<u8>>,
+        edit: Option<StageResourceEdit>,
+        edit_index: Option<usize>,
+        removal_index: Option<usize>,
+    ) {
+        self.set_authored_resource_overlay_states(std::iter::once((
+            raw_resource_path.into(),
+            edit,
+            edit_index,
+            removal_index,
+        )));
+    }
+
+    /// Restores several generic resource-overlay paths and refreshes the
+    /// virtual asset catalog once after the complete transaction.
+    pub fn set_authored_resource_overlay_states(
+        &mut self,
+        states: impl IntoIterator<
+            Item = (
+                Vec<u8>,
+                Option<StageResourceEdit>,
+                Option<usize>,
+                Option<usize>,
+            ),
+        >,
+    ) {
+        let states = states.into_iter().collect::<Vec<_>>();
+        for (raw_resource_path, _, _, _) in &states {
+            self.archive_edits
+                .resources
+                .retain(|candidate| candidate.raw_resource_path != *raw_resource_path);
+            self.archive_edits
+                .resource_removals
+                .retain(|candidate| candidate != raw_resource_path);
+        }
+
+        let mut resource_edits = states
+            .iter()
+            .filter_map(|(raw_resource_path, edit, edit_index, _)| {
+                edit.clone().map(|mut edit| {
+                    edit.raw_resource_path = raw_resource_path.clone();
+                    (edit_index.unwrap_or(usize::MAX), edit)
+                })
+            })
+            .collect::<Vec<_>>();
+        resource_edits.sort_by_key(|(index, _)| *index);
+        for (index, edit) in resource_edits {
+            self.archive_edits
+                .resources
+                .insert(index.min(self.archive_edits.resources.len()), edit);
+        }
+
+        let mut removals = states
+            .into_iter()
+            .filter_map(|(raw_resource_path, _, _, removal_index)| {
+                removal_index.map(|index| (index, raw_resource_path))
+            })
+            .collect::<Vec<_>>();
+        removals.sort_by_key(|(index, _)| *index);
+        for (index, raw_resource_path) in removals {
+            self.archive_edits.resource_removals.insert(
+                index.min(self.archive_edits.resource_removals.len()),
+                raw_resource_path,
+            );
+        }
+        self.sync_archive_edit_assets();
+    }
+
+    /// Returns whether a resource will exist after baseline removals and typed
+    /// resource, model, or collision edits are applied.
+    pub fn has_effective_resource(&self, raw_resource_path: &[u8]) -> bool {
+        let edited = self
+            .archive_edits
+            .resources
+            .iter()
+            .any(|edit| edit.raw_resource_path == raw_resource_path)
+            || self
+                .archive_edits
+                .models
+                .iter()
+                .any(|edit| edit.raw_resource_path == raw_resource_path)
+            || self
+                .archive_edits
+                .collisions
+                .iter()
+                .any(|edit| edit.raw_resource_path == raw_resource_path);
+        if edited {
+            return true;
+        }
+        if self
+            .archive_edits
+            .resource_removals
+            .iter()
+            .any(|removed| removed == raw_resource_path)
+        {
+            return false;
+        }
+        self.stage_archive
+            .as_ref()
+            .is_some_and(|archive| archive.resource(raw_resource_path).is_some())
+    }
+
+    fn sync_archive_edit_assets(&mut self) {
+        let Some(source_path) = self.stage_archive_source_path.as_ref() else {
+            return;
+        };
+
+        let normalized_path = |raw_path: &[u8]| {
+            raw_path
+                .iter()
+                .map(|byte| match byte {
+                    b'\\' => b'/',
+                    byte => byte.to_ascii_lowercase(),
+                })
+                .collect::<Vec<_>>()
+        };
+        let removed_paths = self
+            .archive_edits
+            .resource_removals
+            .iter()
+            .map(|path| normalized_path(path))
+            .collect::<BTreeSet<_>>();
+        let mut effective_paths = self
+            .stage_archive
+            .iter()
+            .flat_map(|archive| archive.resources())
+            .map(|resource| normalized_path(&resource.raw_path))
+            .filter(|path| !removed_paths.contains(path))
+            .collect::<BTreeSet<_>>();
+        effective_paths.extend(
+            self.archive_edits
+                .resources
+                .iter()
+                .map(|edit| normalized_path(&edit.raw_resource_path)),
+        );
+        effective_paths.extend(
+            self.archive_edits
+                .models
+                .iter()
+                .map(|edit| normalized_path(&edit.raw_resource_path)),
+        );
+        effective_paths.extend(
+            self.archive_edits
+                .collisions
+                .iter()
+                .map(|edit| normalized_path(&edit.raw_resource_path)),
+        );
+        self.assets.retain(|asset| {
+            semantic_resource_path_for_asset(source_path, &asset.path)
+                .is_none_or(|raw_path| effective_paths.contains(&normalized_path(&raw_path)))
+        });
+
+        let mut edited_paths = self
+            .archive_edits
+            .resources
+            .iter()
+            .map(|edit| edit.raw_resource_path.as_slice())
+            .chain(
+                self.archive_edits
+                    .models
+                    .iter()
+                    .map(|edit| edit.raw_resource_path.as_slice()),
+            )
+            .chain(
+                self.archive_edits
+                    .collisions
+                    .iter()
+                    .map(|edit| edit.raw_resource_path.as_slice()),
+            )
+            .collect::<Vec<_>>();
+        edited_paths.sort();
+        edited_paths.dedup();
+        for raw_path in edited_paths {
+            let path = PathBuf::from(format!(
+                "{}!/{}",
+                source_path.display(),
+                String::from_utf8_lossy(raw_path)
+            ));
+            if !self.assets.iter().any(|asset| asset.path == path) {
+                self.assets.push(StageAsset {
+                    path,
+                    kind: semantic_stage_asset_kind(raw_path),
+                });
+            }
+        }
+        self.assets
+            .sort_by(|left, right| left.path.cmp(&right.path));
     }
 
     pub fn with_registry(mut self, registry: ObjectRegistry) -> Self {
@@ -255,9 +1046,13 @@ impl StageDocument {
 
     pub fn set_registry(&mut self, registry: ObjectRegistry) {
         let (actor_previews, preview_issues) =
-            build_actor_preview_catalog(&self.base_root, &self.assets, &registry);
+            build_actor_preview_catalog(&self.base_root, &self.assets, &registry, |path| {
+                self.read_asset_bytes(path)
+                    .map_err(|error| error.to_string())
+            });
         let object_preview_issues =
             apply_registry_preview_hints(&mut self.objects, &self.assets, &registry);
+        refresh_object_manager_capacity_dependencies(&mut self.objects, &registry);
         self.actor_previews = actor_previews;
         self.load_issues.retain(|issue| {
             !issue.code.starts_with("enemy-preview-") && !issue.code.starts_with("object-preview-")
@@ -277,6 +1072,7 @@ impl StageDocument {
         registry: &ObjectRegistry,
     ) {
         let _ = apply_registry_preview_hints(objects, &self.assets, registry);
+        refresh_object_manager_capacity_dependencies(objects, registry);
     }
 
     pub fn actor_preview(&self, object: &SceneObject) -> Option<&ActorPreview> {
@@ -340,10 +1136,33 @@ impl StageDocument {
         let overlay = EditorSceneOverlay {
             stage_id: self.stage_id.clone(),
             objects: self.objects.clone(),
+            archive_edits: self.archive_edits.clone(),
+            lighting: Some(self.lighting.clone()),
+            route_authoring: self.route_authoring.clone(),
         };
         let bytes = serde_json::to_vec_pretty(&overlay)?;
         self.mark_changed_file(path, bytes)?;
         Ok(())
+    }
+
+    pub fn authored_stage_baseline_path(&self) -> Result<PathBuf> {
+        validate_stage_id(&self.stage_id)?;
+        Ok(PathBuf::from("editor")
+            .join("stages")
+            .join(format!("{}.stage.json", self.stage_id)))
+    }
+
+    fn queue_authored_stage_baseline_change(&mut self) -> Result<()> {
+        let Some(archive) = self.stage_archive.as_ref() else {
+            return Ok(());
+        };
+        if !matches!(archive.origin(), StageOrigin::Blank { .. }) {
+            return Ok(());
+        }
+        validate_authored_archive_target(archive, &self.stage_id)?;
+        let path = self.authored_stage_baseline_path()?;
+        let bytes = archive.to_semantic_json()?;
+        self.mark_changed_file(path, bytes)
     }
 
     pub fn editor_overlay_path(&self) -> Result<PathBuf> {
@@ -358,6 +1177,7 @@ impl StageDocument {
         project_root: impl AsRef<Path>,
     ) -> Result<ProjectSaveOutcome> {
         self.queue_editor_overlay_change()?;
+        self.queue_authored_stage_baseline_change()?;
         let project_root = project_root.as_ref();
         let loaded_root = if project_root.is_absolute() {
             project_root.to_path_buf()
@@ -377,6 +1197,10 @@ impl StageDocument {
 
     pub fn load_project_folder(&mut self, project_root: impl AsRef<Path>) -> Result<bool> {
         project_store::load_project_overlay(self, project_root.as_ref())
+    }
+
+    pub fn project_root_overlaps_base(&self, project_root: impl AsRef<Path>) -> Result<bool> {
+        project_store::project_root_overlaps_base(self, project_root.as_ref())
     }
 
     pub fn validate_for_export(&self) -> Result<()> {
@@ -402,19 +1226,195 @@ impl StageDocument {
 pub struct EditorSceneOverlay {
     pub stage_id: String,
     pub objects: Vec<SceneObject>,
+    #[serde(default)]
+    pub archive_edits: StageArchiveEdits,
+    /// Ordered typed `AmbAry`/`LightAry` state authored in the scene.
+    ///
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_authoring: Option<RouteAuthoringDocument>,
+    /// `None` preserves compatibility with older overlays, whose lighting is
+    /// inherited from the semantic stage baseline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lighting: Option<StageLighting>,
 }
+
+pub const OBJECT_AUTHORING_DEFAULTS_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SceneObject {
     pub id: String,
     pub source: Option<SourceLocation>,
+    /// Source-free address of this actor in the JDrama group tree.
+    ///
+    /// Existing records are edited in place. `CloneOf` retains only the typed
+    /// template address so export can clone the semantic record rather than
+    /// copying its original bytes. Authored placements own a fully typed prototype and
+    /// the support records needed to insert it without a retail source record.
+    #[serde(default)]
+    pub placement: Option<PlacementBinding>,
     pub factory_name: String,
     pub class_name: Option<String>,
     pub transform: Transform,
     pub raw_params: BTreeMap<String, SceneParameter>,
     pub asset_hints: Vec<AssetRef>,
-    #[serde(skip, default)]
-    pub source_record_bytes: Option<Vec<u8>>,
+    /// Exact managers selected through structural fields that do not carry a
+    /// direct `manager_name` reference (for example, a map-object resource).
+    ///
+    /// This decomp-derived closure is persisted so headless project export can
+    /// retain clone capacity requirements without regenerating the registry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub manager_capacity_dependencies: Vec<String>,
+    /// Editor-selected actors that satisfy fixed runtime name lookups.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runtime_references: Vec<SceneRuntimeReferenceBinding>,
+    /// Version of editor-owned safe defaults applied to an authored record.
+    ///
+    /// Retail/imported objects remain zero. Missing values in older project
+    /// overlays also deserialize as zero so narrowly scoped migrations can
+    /// distinguish legacy authored objects from deliberate current settings.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub authoring_defaults_version: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SceneRuntimeReferenceBinding {
+    pub required_factory_name: String,
+    pub runtime_name: String,
+    #[serde(
+        default = "runtime_reference_required_default",
+        skip_serializing_if = "is_true"
+    )]
+    pub required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_object_id: Option<String>,
+}
+
+fn runtime_reference_required_default() -> bool {
+    true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct PlacementAddress {
+    pub raw_resource_path: Vec<u8>,
+    pub record_path: Vec<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AuthoredPlacementDependencyTarget {
+    IndexedGroup { group_index: u32 },
+    NamedGroup { type_name: String, name: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AuthoredPlacementDependency {
+    /// Exact semantic parent container selected from the retail source.
+    ///
+    /// Older project overlays only persisted `target_group_index`; a missing
+    /// target therefore retains the original IdxGroup behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<AuthoredPlacementDependencyTarget>,
+    pub target_group_index: u32,
+    pub record: JDramaRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AuthoredPlacement {
+    pub raw_resource_path: Vec<u8>,
+    pub target_group_index: u32,
+    pub prototype: JDramaRecord,
+    #[serde(default)]
+    pub dependencies: Vec<AuthoredPlacementDependency>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "address", rename_all = "snake_case")]
+pub enum PlacementBinding {
+    Existing(PlacementAddress),
+    CloneOf(PlacementAddress),
+    Authored(AuthoredPlacement),
+}
+
+impl PlacementBinding {
+    pub fn source_address(&self) -> Option<&PlacementAddress> {
+        match self {
+            Self::Existing(address) | Self::CloneOf(address) => Some(address),
+            Self::Authored(_) => None,
+        }
+    }
+
+    pub fn raw_resource_path(&self) -> &[u8] {
+        match self {
+            Self::Existing(address) | Self::CloneOf(address) => &address.raw_resource_path,
+            Self::Authored(authored) => &authored.raw_resource_path,
+        }
+    }
+
+    pub fn duplicate_for_new_object(&self) -> Self {
+        match self {
+            Self::Existing(address) | Self::CloneOf(address) => Self::CloneOf(address.clone()),
+            Self::Authored(authored) => Self::Authored(authored.clone()),
+        }
+    }
+}
+fn graph_name_in_record_count(record: &JDramaRecord, graph_name: &str) -> usize {
+    let fields = match &record.payload {
+        JDramaRecordPayload::Actor { fields, .. }
+        | JDramaRecordPayload::Fields { fields }
+        | JDramaRecordPayload::Group { fields, .. } => fields,
+        JDramaRecordPayload::Empty => return 0,
+    };
+    let own = fields
+        .iter()
+        .filter(|field| {
+            field.name == "graph_name"
+                && matches!(&field.value, JDramaFieldValue::String(value) if value == graph_name)
+        })
+        .count();
+    own + match &record.payload {
+        JDramaRecordPayload::Group { children, .. } => children
+            .iter()
+            .map(|child| graph_name_in_record_count(child, graph_name))
+            .sum(),
+        _ => 0,
+    }
+}
+
+fn rewrite_graph_name_in_record(
+    record: &mut JDramaRecord,
+    old_name: &str,
+    new_name: &str,
+) -> usize {
+    let fields = match &mut record.payload {
+        JDramaRecordPayload::Actor { fields, .. }
+        | JDramaRecordPayload::Fields { fields }
+        | JDramaRecordPayload::Group { fields, .. } => fields,
+        JDramaRecordPayload::Empty => return 0,
+    };
+    let mut changed = 0;
+    for field in fields.iter_mut().filter(|field| field.name == "graph_name") {
+        if let JDramaFieldValue::String(value) = &mut field.value {
+            if value == old_name {
+                *value = new_name.to_string();
+                changed += 1;
+            }
+        }
+    }
+    if let JDramaRecordPayload::Group { children, .. } = &mut record.payload {
+        changed += children
+            .iter_mut()
+            .map(|child| rewrite_graph_name_in_record(child, old_name, new_name))
+            .sum::<usize>();
+    }
+    changed
 }
 
 impl SceneObject {
@@ -422,12 +1422,15 @@ impl SceneObject {
         Self {
             id: id.into(),
             source: None,
+            placement: None,
             factory_name: factory_name.into(),
             class_name: None,
             transform: Transform::default(),
             raw_params: BTreeMap::new(),
             asset_hints: Vec::new(),
-            source_record_bytes: None,
+            manager_capacity_dependencies: Vec::new(),
+            authoring_defaults_version: 0,
+            runtime_references: Vec::new(),
         }
     }
 
@@ -460,6 +1463,64 @@ impl SceneObject {
     pub fn raw_param(&self, key: &str) -> Option<&str> {
         self.raw_params.get(key).map(SceneParameter::raw)
     }
+
+    /// Refreshes the source-derived manager closure persisted for headless
+    /// export. Structural selector parameters are read-only, so duplicating
+    /// this object can safely retain the refreshed exact names.
+    pub fn refresh_manager_capacity_dependencies(&mut self, registry: &ObjectRegistry) {
+        self.manager_capacity_dependencies =
+            derived_object_manager_capacity_dependencies(self, registry)
+                .into_iter()
+                .collect();
+    }
+}
+
+fn derived_object_manager_capacity_dependencies(
+    object: &SceneObject,
+    registry: &ObjectRegistry,
+) -> BTreeSet<String> {
+    let mut manager_names = object
+        .raw_param("launched_enemy_name")
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    if let Some(manager_name) = object
+        .raw_param("resource_name")
+        .and_then(|resource_name| registry.find_map_obj_resource(resource_name))
+        .map(|resource| resource.required_manager_name.as_str())
+        .filter(|name| !name.is_empty())
+    {
+        manager_names.insert(manager_name.to_string());
+    }
+    manager_names
+}
+
+fn refresh_object_manager_capacity_dependencies(
+    objects: &mut [SceneObject],
+    registry: &ObjectRegistry,
+) {
+    for object in objects {
+        object.refresh_manager_capacity_dependencies(registry);
+    }
+}
+
+pub(crate) fn resolved_object_manager_capacity_dependencies(
+    object: &SceneObject,
+    registry: Option<&ObjectRegistry>,
+) -> BTreeSet<String> {
+    let mut manager_names = object
+        .manager_capacity_dependencies
+        .iter()
+        .filter(|name| !name.is_empty())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if let Some(registry) = registry {
+        manager_names.extend(derived_object_manager_capacity_dependencies(
+            object, registry,
+        ));
+    }
+    manager_names
 }
 
 #[derive(Debug, Clone)]
@@ -710,8 +1771,153 @@ fn is_portable_project_component(component: &OsStr) -> bool {
         .is_some_and(|suffix| matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"))
 }
 
+fn validate_authored_archive_target(
+    archive: &SourceFreeStageArchive,
+    stage_id: &str,
+) -> Result<()> {
+    match archive.origin() {
+        StageOrigin::Blank { target_slot, .. } if target_slot.eq_ignore_ascii_case(stage_id) => {
+            Ok(())
+        }
+        StageOrigin::Blank { target_slot, .. } => Err(SceneError::StageExport(format!(
+            "authored stage target '{target_slot}' does not match document stage '{stage_id}'"
+        ))),
+        StageOrigin::ImportedArchive => Err(SceneError::StageExport(format!(
+            "stage '{stage_id}' requires a blank authored archive origin"
+        ))),
+    }
+}
+
+/// Returns the virtual game-relative archive identity for an authored stage.
+/// The path is not created and may intentionally not exist in the extracted
+/// retail base.
+pub fn authored_stage_virtual_source_path(base_root: &Path, stage_id: &str) -> Result<PathBuf> {
+    validate_stage_id(stage_id)?;
+    Ok(base_root
+        .join("files")
+        .join("data")
+        .join("scene")
+        .join(format!("{stage_id}.szs")))
+}
+
+/// Lists validated authored stage ids persisted in a managed project.
+/// Retail stages without a semantic authored baseline are not returned.
+pub fn discover_authored_project_stage_ids(project_root: impl AsRef<Path>) -> Result<Vec<String>> {
+    project_store::discover_authored_stage_ids(project_root.as_ref())
+}
+
+fn authored_stage_assets(
+    base_root: &Path,
+    source_path: &Path,
+    archive: &SourceFreeStageArchive,
+) -> Result<Vec<StageAsset>> {
+    let mut assets = scan_common_stage_assets(base_root)?;
+    assets.extend(archive.resources().iter().map(|resource| StageAsset {
+        path: PathBuf::from(format!(
+            "{}!/{}",
+            source_path.display(),
+            String::from_utf8_lossy(&resource.raw_path)
+        )),
+        kind: semantic_stage_asset_kind(&resource.raw_path),
+    }));
+    assets.sort_by(|left, right| left.path.cmp(&right.path));
+    assets.dedup_by(|left, right| left.path == right.path);
+    Ok(assets)
+}
+
+fn semantic_stage_asset_kind(raw_path: &[u8]) -> StageAssetKind {
+    let path = String::from_utf8_lossy(raw_path);
+    match Path::new(path.as_ref())
+        .extension()
+        .and_then(OsStr::to_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "arc" | "szs" => StageAssetKind::Archive,
+        "bmd" | "bdl" => StageAssetKind::Model,
+        "bmt" => StageAssetKind::MaterialTable,
+        "bti" | "bmp" => StageAssetKind::Texture,
+        "col" => StageAssetKind::Collision,
+        "bmg" => StageAssetKind::Message,
+        "jpa" | "jpc" => StageAssetKind::Particle,
+        "bck" | "btp" | "btk" | "brk" | "bas" => StageAssetKind::Animation,
+        "bin" | "prm" | "map" => StageAssetKind::Placement,
+        _ => StageAssetKind::Other,
+    }
+}
+
+fn read_semantic_stage_asset_bytes(
+    archive: &SourceFreeStageArchive,
+    source_path: &Path,
+    path: &Path,
+) -> Result<Vec<u8>> {
+    if let Some(bytes) = read_matching_semantic_stage_asset(archive, source_path, path)? {
+        Ok(bytes)
+    } else {
+        Ok(read_stage_asset_bytes(path)?)
+    }
+}
+
+fn read_matching_semantic_stage_asset(
+    archive: &SourceFreeStageArchive,
+    source_path: &Path,
+    path: &Path,
+) -> Result<Option<Vec<u8>>> {
+    let Some(raw_resource_path) = semantic_resource_path_for_asset(source_path, path) else {
+        return Ok(None);
+    };
+    archive
+        .resource_bytes(&raw_resource_path)?
+        .map(Some)
+        .ok_or_else(|| {
+            SceneError::StageExport(format!(
+                "semantic stage resource '{}' is not present in the authored archive",
+                String::from_utf8_lossy(&raw_resource_path)
+            ))
+        })
+}
+
+fn semantic_resource_path_for_asset(source_path: &Path, path: &Path) -> Option<Vec<u8>> {
+    let path_text = path.to_string_lossy();
+    let (archive_path, resource_path) = path_text.split_once("!/")?;
+    if !stage_archive_paths_match(Path::new(archive_path), source_path) {
+        return None;
+    }
+    Some(
+        resource_path
+            .replace('\\', "/")
+            .trim_start_matches('/')
+            .as_bytes()
+            .to_vec(),
+    )
+}
+
+fn stage_archive_paths_match(left: &Path, right: &Path) -> bool {
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left
+            .to_string_lossy()
+            .replace('\\', "/")
+            .trim_end_matches('/')
+            .eq_ignore_ascii_case(
+                right
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .trim_end_matches('/'),
+            ),
+    }
+}
+
 fn load_scene_objects_from_assets(
     assets: &[StageAsset],
+) -> (Vec<SceneObject>, Vec<ValidationIssue>, StageLighting) {
+    load_scene_objects_from_assets_with_reader(assets, |path| Ok(read_stage_asset_bytes(path)?))
+}
+
+fn load_scene_objects_from_assets_with_reader(
+    assets: &[StageAsset],
+    mut read_asset: impl FnMut(&Path) -> Result<Vec<u8>>,
 ) -> (Vec<SceneObject>, Vec<ValidationIssue>, StageLighting) {
     let mut objects = Vec::new();
     let mut issues = Vec::new();
@@ -753,7 +1959,7 @@ fn load_scene_objects_from_assets(
         let path_text = asset.path.to_string_lossy().replace('\\', "/");
         let asset_identity = stable_path_identity(&path_text);
 
-        let bytes = match read_stage_asset_bytes(&asset.path) {
+        let bytes = match read_asset(&asset.path) {
             Ok(bytes) => bytes,
             Err(err) => {
                 issues.push(ValidationIssue::error(
@@ -773,6 +1979,7 @@ fn load_scene_objects_from_assets(
                 continue;
             }
         };
+        let semantic_placement = JDramaDocument::parse(&bytes).ok();
 
         for record in records {
             if let Some(light) = record.light.clone() {
@@ -799,12 +2006,13 @@ fn load_scene_objects_from_assets(
                 offset: Some(record.offset as u64),
                 length: Some(record.size as u64),
             });
+            object.placement = archive_resource_path(&asset.path).map(|raw_resource_path| {
+                PlacementBinding::Existing(PlacementAddress {
+                    raw_resource_path,
+                    record_path: record.record_path.clone(),
+                })
+            });
             object.class_name = Some(type_name);
-            object.source_record_bytes = record
-                .offset
-                .checked_add(record.size)
-                .and_then(|end| bytes.get(record.offset..end))
-                .map(<[u8]>::to_vec);
             object.transform = Transform {
                 translation: transform.translation,
                 rotation_degrees: transform.rotation,
@@ -851,6 +2059,12 @@ fn load_scene_objects_from_assets(
             if let Some(blade_count) = record.map_obj_grass_blade_count {
                 object.insert_source_raw_param("grass_blade_count", blade_count.to_string());
             }
+            if let Some(semantic_record) = semantic_placement
+                .as_ref()
+                .and_then(|document| jdrama_record_at(&document.root, &record.record_path))
+            {
+                insert_typed_jdrama_params(&mut object, semantic_record);
+            }
 
             if let Some(model_path) = infer_preview_model_path(&object, &model_index) {
                 object.asset_hints.push(AssetRef {
@@ -871,6 +2085,48 @@ fn load_scene_objects_from_assets(
     }
 
     (objects, issues, lighting)
+}
+
+fn jdrama_record_at<'a>(mut record: &'a JDramaRecord, path: &[usize]) -> Option<&'a JDramaRecord> {
+    for index in path {
+        let JDramaRecordPayload::Group { children, .. } = &record.payload else {
+            return None;
+        };
+        record = children.get(*index)?;
+    }
+    Some(record)
+}
+
+fn insert_typed_jdrama_params(object: &mut SceneObject, record: &JDramaRecord) {
+    let fields: &[JDramaField] = match &record.payload {
+        JDramaRecordPayload::Actor { fields, .. }
+        | JDramaRecordPayload::Fields { fields }
+        | JDramaRecordPayload::Group { fields, .. } => fields,
+        JDramaRecordPayload::Empty => &[],
+    };
+    for field in fields {
+        let raw_value = match &field.value {
+            JDramaFieldValue::U32(value) => value.to_string(),
+            JDramaFieldValue::I32(value) => value.to_string(),
+            JDramaFieldValue::F32(value) => value.to_string(),
+            JDramaFieldValue::Vec2F32(value) => format!("{},{}", value[0], value[1]),
+            JDramaFieldValue::Vec3F32(value) => {
+                format!("{},{},{}", value[0], value[1], value[2])
+            }
+            JDramaFieldValue::ColorRgba8(value) => {
+                format!("{},{},{},{}", value[0], value[1], value[2], value[3])
+            }
+            JDramaFieldValue::String(value) => value.clone(),
+            JDramaFieldValue::LightMap(_) => continue,
+        };
+        object.insert_source_raw_param(field.name.clone(), raw_value);
+    }
+}
+
+fn archive_resource_path(path: &Path) -> Option<Vec<u8>> {
+    path.to_string_lossy()
+        .split_once("!/")
+        .map(|(_, internal_path)| internal_path.as_bytes().to_vec())
 }
 
 fn stable_path_identity(path: &str) -> u64 {
@@ -917,13 +2173,22 @@ fn apply_registry_preview_hints(
                 role: AssetRole::InferredPreviewModel,
             });
         }
-        let resource_name = object.raw_param("actor_tail_string");
+        let resource_name = object.raw_param("actor_tail_string").map(str::to_string);
         let object_definition = registry.find_object(&object.factory_name);
+        if let Some(definition) = object_definition {
+            // Class names are schema provenance rather than serialized stage
+            // data. Refresh them alongside the other registry-derived hints
+            // so a newer decomp extractor can repair old "Unknown" labels
+            // without rewriting the placement record.
+            object.class_name = Some(definition.class_name.clone());
+        }
         let is_map_static =
             object_definition.is_some_and(|definition| definition.class_name == "TMapStaticObj");
         let is_map_obj = registry.is_map_obj_factory(&object.factory_name);
         let map_obj_resource = if is_map_obj {
-            resource_name.and_then(|resource_name| registry.find_map_obj_resource(resource_name))
+            resource_name
+                .as_deref()
+                .and_then(|resource_name| registry.find_map_obj_resource(resource_name))
         } else {
             None
         };
@@ -982,7 +2247,7 @@ fn apply_registry_preview_hints(
         }
 
         let map_static_binding = if is_map_static {
-            resource_name.and_then(|resource_name| {
+            resource_name.as_deref().and_then(|resource_name| {
                 registry
                     .map_static_models
                     .iter()
@@ -1110,6 +2375,7 @@ fn enemy_runtime_uniform_scale(
     actor: &EnemyActorDefinition,
     manager: &EnemyManagerDefinition,
     assets: &[StageAsset],
+    read_asset: &mut impl FnMut(&Path) -> std::result::Result<Vec<u8>, String>,
 ) -> std::result::Result<Option<f32>, String> {
     let Some(definition) = &actor.runtime_uniform_scale else {
         return Ok(None);
@@ -1167,7 +2433,7 @@ fn enemy_runtime_uniform_scale(
             manager.factory_name
         ));
     }
-    let bytes = read_stage_asset_bytes(&asset.path).map_err(|error| {
+    let bytes = read_asset(&asset.path).map_err(|error| {
         format!(
             "Could not read runtime scale parameters {}: {error}",
             asset.path.display()
@@ -1239,6 +2505,7 @@ fn build_actor_preview_catalog(
     base_root: &Path,
     assets: &[StageAsset],
     registry: &ObjectRegistry,
+    mut read_asset: impl FnMut(&Path) -> std::result::Result<Vec<u8>, String>,
 ) -> (BTreeMap<String, ActorPreview>, Vec<ValidationIssue>) {
     let chara_folders = match load_obj_chara_folders(base_root) {
         Ok(folders) => folders,
@@ -1284,7 +2551,7 @@ fn build_actor_preview_catalog(
                 .ends_with("/map/scene.bin")
         })
     {
-        let Ok(bytes) = read_stage_asset_bytes(&asset.path) else {
+        let Ok(bytes) = read_asset(&asset.path) else {
             issues.push(ValidationIssue::warning(
                 "enemy-preview-placement-read-failed",
                 format!(
@@ -1329,7 +2596,12 @@ fn build_actor_preview_catalog(
                 else {
                     continue;
                 };
-                match enemy_runtime_uniform_scale(actor, manager, &parameter_assets) {
+                match enemy_runtime_uniform_scale(
+                    actor,
+                    manager,
+                    &parameter_assets,
+                    &mut read_asset,
+                ) {
                     Ok(scale) => {
                         runtime_uniform_scales.insert(
                             (actor.factory_name.clone(), manager.factory_name.clone()),
@@ -1795,6 +3067,77 @@ mod tests {
     }
 
     #[test]
+    fn restoring_resource_overlay_drops_stale_virtual_assets_and_keeps_baseline_assets() {
+        let parameter_document = || {
+            StageResourceDocument::Parameters(PrmFile {
+                entries: Vec::new(),
+            })
+        };
+        let source_path = PathBuf::from("virtual/custom0.szs");
+        let baseline_path = PathBuf::from("virtual/custom0.szs!/map/base.prm");
+        let extra_path = PathBuf::from("virtual/custom0.szs!/map/catalog.prm");
+        let mut archive = SourceFreeStageArchive::new().unwrap();
+        archive
+            .insert_resource(b"map/base.prm".to_vec(), parameter_document())
+            .unwrap();
+        let mut document = StageDocument {
+            stage_id: "custom0".to_string(),
+            base_root: PathBuf::from("."),
+            assets: vec![StageAsset {
+                path: baseline_path.clone(),
+                kind: StageAssetKind::Placement,
+            }],
+            objects: Vec::new(),
+            changed_files: BTreeMap::new(),
+            stage_archive: Some(archive),
+            stage_archive_source_path: Some(source_path),
+            archive_edits: StageArchiveEdits::default(),
+            registry: None,
+            route_authoring: None,
+            load_issues: Vec::new(),
+            lighting: StageLighting::default(),
+            actor_previews: BTreeMap::new(),
+            loaded_project: None,
+        };
+
+        document.set_authored_resource_overlay_state(
+            b"map/catalog.prm".to_vec(),
+            Some(StageResourceEdit {
+                raw_resource_path: b"map/catalog.prm".to_vec(),
+                document: parameter_document(),
+                mode: StageResourceEditMode::Insert,
+            }),
+            None,
+            None,
+        );
+        document.set_authored_resource_overlay_state(
+            b"map/base.prm".to_vec(),
+            Some(StageResourceEdit {
+                raw_resource_path: b"map/base.prm".to_vec(),
+                document: parameter_document(),
+                mode: StageResourceEditMode::Upsert,
+            }),
+            None,
+            None,
+        );
+        assert!(document.assets.iter().any(|asset| asset.path == extra_path));
+        assert!(document
+            .assets
+            .iter()
+            .any(|asset| asset.path == baseline_path));
+
+        document.set_authored_resource_overlay_state(b"map/catalog.prm".to_vec(), None, None, None);
+        document.set_authored_resource_overlay_state(b"map/base.prm".to_vec(), None, None, None);
+
+        assert!(!document.assets.iter().any(|asset| asset.path == extra_path));
+        assert!(document
+            .assets
+            .iter()
+            .any(|asset| asset.path == baseline_path));
+        assert!(document.archive_edits.resources.is_empty());
+    }
+
+    #[test]
     fn selects_primary_object_light_and_ambient_by_runtime_names() {
         let lighting = StageLighting {
             lights: vec![JDramaLight {
@@ -1842,7 +3185,11 @@ mod tests {
             assets: vec![],
             objects: vec![],
             changed_files: BTreeMap::new(),
+            stage_archive: None,
+            stage_archive_source_path: None,
+            archive_edits: StageArchiveEdits::default(),
             registry: None,
+            route_authoring: None,
             load_issues: Vec::new(),
             lighting: StageLighting::default(),
             actor_previews: BTreeMap::new(),
@@ -1868,6 +3215,98 @@ mod tests {
                 && issue.severity == ValidationSeverity::Error));
     }
 
+    fn authored_shine_for_validation(
+        id: &str,
+        collection_type: &str,
+        shine_id: i32,
+        in_stage: i32,
+    ) -> SceneObject {
+        let prototype = JDramaRecord {
+            type_name: "Shine".to_string(),
+            name: format!("Graffito-Editor Shine {id}"),
+            payload: JDramaRecordPayload::Actor {
+                transform: sms_formats::JDramaTransform {
+                    translation: [0.0; 3],
+                    rotation: [0.0; 3],
+                    scale: [1.0; 3],
+                },
+                character_name: "??????".to_string(),
+                light_map: sms_formats::JDramaLightMap::default(),
+                fields: vec![
+                    JDramaField {
+                        name: "collection_type".to_string(),
+                        value: JDramaFieldValue::String(collection_type.to_string()),
+                    },
+                    JDramaField {
+                        name: "shine_id".to_string(),
+                        value: JDramaFieldValue::I32(shine_id),
+                    },
+                    JDramaField {
+                        name: "in_stage".to_string(),
+                        value: JDramaFieldValue::I32(in_stage),
+                    },
+                ],
+            },
+        };
+        let mut object = SceneObject::new(id, "Shine");
+        seed_scene_object_parameters(&mut object, &prototype).unwrap();
+        object.placement = Some(PlacementBinding::Authored(AuthoredPlacement {
+            raw_resource_path: b"map/scene.bin".to_vec(),
+            target_group_index: 4,
+            prototype,
+            dependencies: Vec::new(),
+        }));
+        object
+    }
+
+    #[test]
+    fn validates_authored_shine_runtime_modes_flags_and_camera_values() {
+        let mut doc = empty_document("fixture0");
+        doc.objects
+            .push(authored_shine_for_validation("shine-a", "demo", 12, 1));
+        doc.objects
+            .push(authored_shine_for_validation("shine-b", "normal", 12, -1));
+        doc.objects
+            .push(authored_shine_for_validation("shine-c", "normal", 120, 0));
+
+        let issues = doc.validate();
+        for code in [
+            "shine-requires-external-trigger",
+            "invalid-shine-camera-mode",
+            "invalid-shine-id",
+            "duplicate-authored-shine-id",
+        ] {
+            assert!(
+                issues.iter().any(|issue| issue.code == code),
+                "missing validation issue {code}: {issues:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn authored_normal_shine_with_unique_flag_has_no_shine_warning() {
+        let mut doc = empty_document("fixture0");
+        doc.objects
+            .push(authored_shine_for_validation("shine-a", "normal", 12, -1));
+
+        assert!(doc
+            .validate()
+            .iter()
+            .all(|issue| !issue.code.contains("shine")));
+    }
+
+    #[test]
+    fn authored_quick_shine_without_retail_camera_is_a_validation_error() {
+        let mut doc = empty_document("fixture0");
+        doc.objects
+            .push(authored_shine_for_validation("shine-a", "quickly", 12, -1));
+
+        assert!(doc.validate().iter().any(|issue| {
+            issue.code == "missing-shine-quick-camera"
+                && issue.severity == ValidationSeverity::Error
+        }));
+    }
+
     #[test]
     fn queues_editor_overlay_as_changed_file() {
         let mut doc = StageDocument {
@@ -1876,7 +3315,11 @@ mod tests {
             assets: vec![],
             objects: vec![SceneObject::new("obj-1", "coin")],
             changed_files: BTreeMap::new(),
+            stage_archive: None,
+            stage_archive_source_path: None,
+            archive_edits: StageArchiveEdits::default(),
             registry: None,
+            route_authoring: None,
             load_issues: Vec::new(),
             lighting: StageLighting::default(),
             actor_previews: BTreeMap::new(),
@@ -1910,11 +3353,30 @@ mod tests {
     }
 
     #[test]
+    fn ignores_legacy_embedded_archive_with_non_finite_json_nulls() {
+        let overlay: EditorSceneOverlay = serde_json::from_str(
+            r#"{
+                "stage_id": "dolpic",
+                "objects": [],
+                "archive_edits": {},
+                "stage_archive": {
+                    "resources": [{"parameters": [1000000.0, 0.000001, null]}]
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(overlay.stage_id, "dolpic");
+        assert!(overlay.objects.is_empty());
+        assert_eq!(overlay.archive_edits, StageArchiveEdits::default());
+        assert!(overlay.lighting.is_none());
+    }
+
+    #[test]
     fn scene_parameters_keep_one_raw_decoded_dirty_state_and_legacy_json_shape() {
         let mut object = SceneObject::new("fixture", "Fixture");
         object.insert_source_raw_param("source", "17");
         object.set_decoded_param("edited", "23", ParamValue::Int(23));
-        object.source_record_bytes = Some(vec![1, 2, 3, 4]);
 
         assert!(!object.raw_params["source"].is_dirty());
         assert!(object.raw_params["edited"].is_dirty());
@@ -1933,12 +3395,50 @@ mod tests {
         assert_eq!(restored.raw_param("source"), Some("17"));
         assert_eq!(restored.raw_param("edited"), Some("23"));
         assert!(!restored.raw_params["edited"].is_dirty());
-        assert!(restored.source_record_bytes.is_none());
+        assert_eq!(restored.id, "fixture");
 
         assert_eq!(
             SceneParameter::from_source("23"),
             SceneParameter::edited("23", Some(ParamValue::Int(23)))
         );
+    }
+
+    #[test]
+    fn typed_jdrama_stream_colors_populate_source_parameters_without_record_bytes() {
+        let record = JDramaRecord::new(
+            "FixturePaint",
+            "paint",
+            JDramaRecordPayload::Actor {
+                transform: sms_formats::JDramaTransform {
+                    translation: [0.0; 3],
+                    rotation: [0.0; 3],
+                    scale: [1.0; 3],
+                },
+                character_name: "paint".to_string(),
+                light_map: sms_formats::JDramaLightMap::default(),
+                fields: vec![
+                    JDramaField {
+                        name: "tev_red".to_string(),
+                        value: JDramaFieldValue::U32(511),
+                    },
+                    JDramaField {
+                        name: "tev_green".to_string(),
+                        value: JDramaFieldValue::U32(120),
+                    },
+                    JDramaField {
+                        name: "tev_blue".to_string(),
+                        value: JDramaFieldValue::U32(9),
+                    },
+                ],
+            },
+        )
+        .unwrap();
+        let mut object = SceneObject::new("paint", "FixturePaint");
+        insert_typed_jdrama_params(&mut object, &record);
+        assert_eq!(object.raw_param("tev_red"), Some("511"));
+        assert_eq!(object.raw_param("tev_green"), Some("120"));
+        assert_eq!(object.raw_param("tev_blue"), Some("9"));
+        assert!(object.raw_params.values().all(|value| !value.is_dirty()));
     }
 
     #[test]
@@ -2032,19 +3532,214 @@ mod tests {
         let root = unique_test_project_root("overlay-round-trip");
         let mut saved = empty_document("dolpic");
         saved.objects = vec![SceneObject::new("edited-object", "Coin")];
+        saved.lighting = StageLighting {
+            lights: vec![JDramaLight {
+                name: Some("authored key".to_string()),
+                position: [10.0, 20.0, 30.0],
+                color: [40, 50, 60, 255],
+            }],
+            ambients: vec![JDramaAmbient {
+                name: Some("authored ambient".to_string()),
+                color: [70, 80, 90, 255],
+            }],
+        };
+        saved.archive_edits.replace_collision(
+            b"map/map.col".to_vec(),
+            sms_formats::ColFile::new(vec![], vec![]),
+        );
+        saved.archive_edits.insert_placement(
+            b"map/scene.bin".to_vec(),
+            Vec::new(),
+            JDramaRecord::new("NameRef", "inserted", JDramaRecordPayload::Empty).unwrap(),
+        );
         saved.queue_editor_overlay_change().unwrap();
         saved.save_project_folder(&root).unwrap();
 
         let mut reopened = empty_document("dolpic");
         assert!(reopened.load_project_folder(&root).unwrap());
         assert_eq!(reopened.objects, saved.objects);
+        assert_eq!(reopened.archive_edits, saved.archive_edits);
+        assert_eq!(reopened.lighting, saved.lighting);
         assert!(reopened.loaded_project.is_some());
 
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn project_overlay_reload_reattaches_source_bytes_and_refreshes_derived_metadata() {
+    fn authored_stage_project_round_trip_restores_baseline_before_overlay() {
+        let fixture_root = unique_test_project_root("authored-stage-round-trip");
+        let base_root = fixture_root.join("base");
+        let project_root = fixture_root.join("project");
+        let scene_root = base_root.join("files/data/scene");
+        fs::create_dir_all(&scene_root).unwrap();
+
+        let retail_archive = authored_stage_archive("test11", 1.0, [10, 20, 30, 255], 1);
+        fs::write(
+            scene_root.join("test11.szs"),
+            retail_archive.encode().unwrap(),
+        )
+        .unwrap();
+
+        let authored_archive = authored_stage_archive("test11", 9.0, [90, 80, 70, 255], 9);
+        let mut expected_archive = authored_archive.clone();
+        blank_stage::ensure_blank_stage_runtime_resources(&mut expected_archive).unwrap();
+        let expected_baseline = expected_archive.to_semantic_json().unwrap();
+        let mut saved =
+            StageDocument::from_authored_archive(&base_root, "test11", authored_archive).unwrap();
+
+        assert!(matches!(
+            saved.stage_archive.as_ref().unwrap().origin(),
+            StageOrigin::Blank { target_slot, .. } if target_slot == "test11"
+        ));
+        assert_eq!(saved.objects.len(), 1);
+        assert_eq!(saved.objects[0].factory_name, "Mario");
+        assert_eq!(saved.objects[0].transform.translation[0], 9.0);
+        assert_eq!(
+            saved.lighting.object_lighting().unwrap().color,
+            [90, 80, 70, 255]
+        );
+        assert_authored_parameter_asset(&saved, 9);
+
+        saved.objects[0].transform.translation[0] = 42.0;
+        saved.save_project_folder(&project_root).unwrap();
+        let baseline_path = project_root.join("files/editor/stages/test11.stage.json");
+        assert_eq!(fs::read(&baseline_path).unwrap(), expected_baseline);
+
+        // Repeated saves must not introduce semantic-document drift.
+        saved.save_project_folder(&project_root).unwrap();
+        assert_eq!(fs::read(&baseline_path).unwrap(), expected_baseline);
+
+        let mut reopened = StageDocument::open(&base_root, "test11").unwrap();
+        assert!(matches!(
+            reopened.stage_archive.as_ref().unwrap().origin(),
+            StageOrigin::ImportedArchive
+        ));
+        assert_eq!(reopened.objects[0].transform.translation[0], 1.0);
+        assert!(reopened.load_project_folder(&project_root).unwrap());
+        assert!(matches!(
+            reopened.stage_archive.as_ref().unwrap().origin(),
+            StageOrigin::Blank { target_slot, .. } if target_slot == "test11"
+        ));
+        assert_eq!(reopened.objects.len(), 1);
+        assert_eq!(reopened.objects[0].transform.translation[0], 42.0);
+        assert_eq!(
+            reopened.lighting.object_lighting().unwrap().color,
+            [90, 80, 70, 255]
+        );
+        assert_authored_parameter_asset(&reopened, 9);
+
+        fs::remove_dir_all(fixture_root).unwrap();
+    }
+
+    #[test]
+    fn genuinely_new_authored_stage_reopens_without_a_retail_archive() {
+        let fixture_root = unique_test_project_root("new-authored-stage-round-trip");
+        let base_root = fixture_root.join("base");
+        let project_root = fixture_root.join("project");
+        fs::create_dir_all(&base_root).unwrap();
+
+        let authored_archive = authored_stage_archive("custom_stage0", 9.0, [90, 80, 70, 255], 9);
+        let mut saved =
+            StageDocument::from_authored_archive(&base_root, "custom_stage0", authored_archive)
+                .unwrap();
+        let virtual_source = base_root.join("files/data/scene/custom_stage0.szs");
+        assert_eq!(
+            saved.stage_archive_source_path.as_deref(),
+            Some(virtual_source.as_path())
+        );
+        assert!(!virtual_source.exists());
+        saved.objects[0].transform.translation[0] = 42.0;
+        saved.lighting.lights[5].color = [12, 34, 56, 255];
+        saved.lighting.ambients[2].color = [78, 90, 123, 255];
+        saved.save_project_folder(&project_root).unwrap();
+
+        assert_eq!(
+            discover_authored_project_stage_ids(&project_root).unwrap(),
+            ["custom_stage0"]
+        );
+        let reopened =
+            StageDocument::open_authored_project_stage(&base_root, "custom_stage0", &project_root)
+                .unwrap();
+        assert_eq!(reopened.objects[0].transform.translation[0], 42.0);
+        assert_eq!(reopened.lighting.lights[5].color, [12, 34, 56, 255]);
+        assert_eq!(reopened.lighting.ambients[2].color, [78, 90, 123, 255]);
+        assert_eq!(
+            reopened.stage_archive_source_path.as_deref(),
+            Some(virtual_source.as_path())
+        );
+        assert!(!virtual_source.exists());
+
+        // The normal open-then-load path also recovers the authored baseline
+        // even though semantic retail import reports no archive for this id.
+        let mut open_then_load = StageDocument::open(&base_root, "custom_stage0").unwrap();
+        assert!(open_then_load.stage_archive.is_none());
+        assert!(open_then_load.load_project_folder(&project_root).unwrap());
+        assert_eq!(open_then_load.objects[0].transform.translation[0], 42.0);
+        assert_eq!(
+            open_then_load.stage_archive_source_path.as_deref(),
+            Some(virtual_source.as_path())
+        );
+
+        fs::remove_dir_all(fixture_root).unwrap();
+    }
+
+    #[test]
+    fn authored_stage_id_substring_does_not_import_a_retail_level() {
+        let fixture_root = unique_test_project_root("authored-stage-no-fuzzy-retail");
+        let base_root = fixture_root.join("base");
+        let retail_path = base_root.join("files/data/scene/airport0.szs");
+        fs::create_dir_all(retail_path.parent().unwrap()).unwrap();
+        fs::write(&retail_path, b"must not be opened").unwrap();
+        let authored_archive = authored_stage_archive("airport", 0.0, [1, 2, 3, 255], 1);
+
+        let document =
+            StageDocument::from_authored_archive(&base_root, "airport", authored_archive).unwrap();
+
+        assert!(document
+            .assets
+            .iter()
+            .all(|asset| !asset.path.to_string_lossy().contains("airport0.szs")));
+        fs::remove_dir_all(fixture_root).unwrap();
+    }
+
+    #[test]
+    fn authored_stage_project_rejects_a_baseline_for_another_target_slot() {
+        let fixture_root = unique_test_project_root("authored-stage-target-validation");
+        let base_root = fixture_root.join("base");
+        let project_root = fixture_root.join("project");
+        let scene_root = base_root.join("files/data/scene");
+        fs::create_dir_all(&scene_root).unwrap();
+
+        let retail_archive = authored_stage_archive("test11", 1.0, [10, 20, 30, 255], 1);
+        fs::write(
+            scene_root.join("test11.szs"),
+            retail_archive.encode().unwrap(),
+        )
+        .unwrap();
+
+        let authored_archive = authored_stage_archive("test11", 9.0, [90, 80, 70, 255], 9);
+        let mut saved =
+            StageDocument::from_authored_archive(&base_root, "test11", authored_archive).unwrap();
+        saved.save_project_folder(&project_root).unwrap();
+
+        let wrong_target = authored_stage_archive("bianco0", 7.0, [70, 60, 50, 255], 7);
+        fs::write(
+            project_root.join("files/editor/stages/test11.stage.json"),
+            wrong_target.to_semantic_json().unwrap(),
+        )
+        .unwrap();
+
+        let mut reopened = StageDocument::open(&base_root, "test11").unwrap();
+        let error = reopened.load_project_folder(&project_root).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("authored stage target 'bianco0' does not match document stage 'test11'"));
+
+        fs::remove_dir_all(fixture_root).unwrap();
+    }
+
+    #[test]
+    fn project_overlay_reload_refreshes_source_identity_and_derived_metadata() {
         let root = unique_test_project_root("source-record-round-trip");
         let source_root = unique_test_project_root("source-record-alias");
         fs::create_dir_all(&source_root).unwrap();
@@ -2060,7 +3755,6 @@ mod tests {
         };
         let mut base_object = SceneObject::new("retail-object", "Coin");
         base_object.source = Some(overlay_source.clone());
-        base_object.source_record_bytes = Some(vec![1, 2, 3, 4]);
 
         let mut saved = empty_document("dolpic");
         saved.objects = vec![base_object.clone()];
@@ -2097,10 +3791,6 @@ mod tests {
         reopened.objects = vec![base_object];
         reopened.load_project_folder(&root).unwrap();
         assert_eq!(reopened.objects[0].source, Some(reopened_source));
-        assert_eq!(
-            reopened.objects[0].source_record_bytes.as_deref(),
-            Some([1, 2, 3, 4].as_slice())
-        );
         assert_eq!(reopened.objects[0].transform.translation[0], 42.0);
         assert_eq!(
             reopened.objects[0].raw_param("name"),
@@ -2129,6 +3819,115 @@ mod tests {
     }
 
     #[test]
+    fn project_overlay_reload_reattaches_shifted_source_by_semantic_placement() {
+        let root = unique_test_project_root("shifted-source-record-round-trip");
+        let source_root = unique_test_project_root("shifted-source-record-source");
+        fs::create_dir_all(&source_root).unwrap();
+        let archive_path = source_root.join("stage.szs");
+        fs::write(&archive_path, []).unwrap();
+        let source_path = PathBuf::from(format!(
+            "{}!/map/scene.bin",
+            fs::canonicalize(&archive_path).unwrap().display()
+        ));
+        let address = PlacementAddress {
+            raw_resource_path: b"map/scene.bin".to_vec(),
+            record_path: vec![5, 2, 4, 0],
+        };
+
+        let mut saved_object = SceneObject::new("retail-object", "Pollution");
+        saved_object.source = Some(SourceLocation {
+            path: source_path.clone(),
+            offset: Some(2_390),
+            length: Some(90),
+        });
+        saved_object.placement = Some(PlacementBinding::Existing(address.clone()));
+        saved_object.transform.translation[0] = 42.0;
+        let mut saved = empty_document("test01");
+        saved.objects = vec![saved_object];
+        saved.save_project_folder(&root).unwrap();
+
+        let refreshed_source = SourceLocation {
+            path: source_path,
+            offset: Some(2_512),
+            length: Some(90),
+        };
+        let mut base_object = SceneObject::new("retail-object", "Pollution");
+        base_object.source = Some(refreshed_source.clone());
+        base_object.placement = Some(PlacementBinding::Existing(address));
+        let mut reopened = empty_document("test01");
+        reopened.objects = vec![base_object];
+
+        assert!(reopened.load_project_folder(&root).unwrap());
+        assert_eq!(reopened.objects[0].source, Some(refreshed_source));
+        assert_eq!(reopened.objects[0].transform.translation[0], 42.0);
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(source_root).unwrap();
+    }
+
+    #[test]
+    fn version_two_project_sources_migrate_to_semantic_existing_and_clone_bindings() {
+        let root = unique_test_project_root("v2-placement-migration");
+        let source_root = unique_test_project_root("v2-placement-source");
+        fs::create_dir_all(&source_root).unwrap();
+        let archive_path = source_root.join("stage.szs");
+        fs::write(&archive_path, []).unwrap();
+        let source = SourceLocation {
+            path: PathBuf::from(format!(
+                "{}!/map/scene.bin",
+                fs::canonicalize(&archive_path).unwrap().display()
+            )),
+            offset: Some(32),
+            length: Some(16),
+        };
+        let address = PlacementAddress {
+            raw_resource_path: b"map/scene.bin".to_vec(),
+            record_path: vec![2, 4],
+        };
+        let mut original = SceneObject::new("retail-object", "Coin");
+        original.source = Some(source.clone());
+        original.placement = Some(PlacementBinding::Existing(address.clone()));
+        original.insert_source_raw_param("name", "coin");
+        let mut duplicate = original.clone();
+        duplicate.id = "duplicate".to_string();
+        duplicate.placement = Some(PlacementBinding::CloneOf(address.clone()));
+
+        let mut saved = empty_document("dolpic");
+        saved.objects = vec![original.clone(), duplicate];
+        saved.save_project_folder(&root).unwrap();
+
+        let overlay_path = root.join("files/editor/stages/dolpic.scene.json");
+        let mut overlay: serde_json::Value =
+            serde_json::from_slice(&fs::read(&overlay_path).unwrap()).unwrap();
+        for object in overlay["objects"].as_array_mut().unwrap() {
+            object.as_object_mut().unwrap().remove("placement");
+        }
+        overlay.as_object_mut().unwrap().remove("archive_edits");
+        fs::write(&overlay_path, serde_json::to_vec_pretty(&overlay).unwrap()).unwrap();
+        let manifest_path = root.join("sms-project.toml");
+        let mut manifest: EditorProjectManifest =
+            toml::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        manifest.format_version = 2;
+        fs::write(&manifest_path, toml::to_string_pretty(&manifest).unwrap()).unwrap();
+
+        let mut reopened = empty_document("dolpic");
+        reopened.objects = vec![original];
+        assert!(reopened.load_project_folder(&root).unwrap());
+        assert_eq!(
+            reopened.objects[0].placement,
+            Some(PlacementBinding::Existing(address.clone()))
+        );
+        assert_eq!(
+            reopened.objects[1].placement,
+            Some(PlacementBinding::CloneOf(address))
+        );
+        assert_eq!(reopened.archive_edits, StageArchiveEdits::default());
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(source_root).unwrap();
+    }
+
+    #[test]
     fn project_save_always_persists_the_current_scene_overlay() {
         let root = unique_test_project_root("automatic-overlay");
         let mut document = empty_document("dolpic");
@@ -2141,6 +3940,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(overlay.objects, document.objects);
+        assert_eq!(overlay.archive_edits, document.archive_edits);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2418,7 +4218,11 @@ mod tests {
             assets: vec![],
             objects: vec![],
             changed_files: BTreeMap::new(),
+            stage_archive: None,
+            stage_archive_source_path: None,
+            archive_edits: StageArchiveEdits::default(),
             registry: None,
+            route_authoring: None,
             load_issues: Vec::new(),
             lighting: StageLighting::default(),
             actor_previews: BTreeMap::new(),
@@ -2435,6 +4239,131 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    fn authored_stage_archive(
+        target_slot: &str,
+        spawn_x: f32,
+        object_light_color: [u8; 4],
+        parameter_value: i32,
+    ) -> SourceFreeStageArchive {
+        let field = |name: &str, value: JDramaFieldValue| JDramaField {
+            name: name.to_string(),
+            value,
+        };
+        let mut children = (0..6)
+            .map(|index| {
+                JDramaRecord::new(
+                    "Light",
+                    format!("light {index}"),
+                    JDramaRecordPayload::Fields {
+                        fields: vec![
+                            field(
+                                "position",
+                                JDramaFieldValue::Vec3F32([index as f32, 2.0, 3.0]),
+                            ),
+                            field(
+                                "color",
+                                JDramaFieldValue::ColorRgba8(if index == 5 {
+                                    object_light_color
+                                } else {
+                                    [index as u8; 4]
+                                }),
+                            ),
+                            field("range", JDramaFieldValue::F32(50.0)),
+                        ],
+                    },
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        children.extend((0..3).map(|index| {
+            JDramaRecord::new(
+                "AmbColor",
+                format!("ambient {index}"),
+                JDramaRecordPayload::Fields {
+                    fields: vec![field(
+                        "color",
+                        JDramaFieldValue::ColorRgba8(if index == 2 {
+                            [40, 50, 60, 255]
+                        } else {
+                            [index as u8; 4]
+                        }),
+                    )],
+                },
+            )
+            .unwrap()
+        }));
+        children.push(
+            JDramaRecord::new(
+                "Mario",
+                "Mario",
+                JDramaRecordPayload::Actor {
+                    transform: sms_formats::JDramaTransform {
+                        translation: [spawn_x, 20.0, 30.0],
+                        rotation: [0.0, 90.0, 0.0],
+                        scale: [1.0; 3],
+                    },
+                    character_name: "Mario Character".to_string(),
+                    light_map: sms_formats::JDramaLightMap::default(),
+                    fields: vec![
+                        field("starting_water", JDramaFieldValue::U32(100)),
+                        field("equipment_flags", JDramaFieldValue::U32(0)),
+                    ],
+                },
+            )
+            .unwrap(),
+        );
+
+        let mut archive = SourceFreeStageArchive::new_for_blank(target_slot, 1).unwrap();
+        archive
+            .insert_resource(
+                b"map/scene.bin".to_vec(),
+                StageResourceDocument::Placement(JDramaDocument {
+                    root: JDramaRecord::new(
+                        "GroupObj",
+                        "root",
+                        JDramaRecordPayload::Group {
+                            fields: Vec::new(),
+                            children,
+                        },
+                    )
+                    .unwrap(),
+                }),
+            )
+            .unwrap();
+        archive
+            .insert_resource(
+                b"map/authored.prm".to_vec(),
+                StageResourceDocument::Parameters(PrmFile {
+                    entries: vec![sms_formats::PrmEntry::new(
+                        "mNum",
+                        sms_formats::PrmValue::I32(parameter_value),
+                    )
+                    .unwrap()],
+                }),
+            )
+            .unwrap();
+        archive
+    }
+
+    fn assert_authored_parameter_asset(document: &StageDocument, expected_value: i32) {
+        let asset = document
+            .assets
+            .iter()
+            .find(|asset| {
+                asset
+                    .path
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .ends_with("/map/authored.prm")
+            })
+            .expect("authored parameter asset");
+        let parameters = PrmFile::parse(&document.read_asset_bytes(&asset.path).unwrap()).unwrap();
+        assert_eq!(
+            parameters.value("mNum"),
+            Some(&sms_formats::PrmValue::I32(expected_value))
+        );
     }
 
     #[test]
@@ -2482,8 +4411,17 @@ mod tests {
             .push(sms_schema::MapObjResourceDefinition {
                 resource_name: "WoodBox".to_string(),
                 actor_type: 0x4000_0003,
+                object_flags: 0,
+                required_manager_name: "fixture map object manager".to_string(),
+                has_hold_dependency: false,
+                has_move_dependency: false,
+                uses_resource_name_model_fallback: false,
                 primary_model: Some("kibako.bmd".to_string()),
+                animation_resources: Vec::new(),
+                hold_model_path: None,
+                move_bck_path: None,
                 load_flags: 0x1022_0000,
+                collision_resources: Vec::new(),
                 source_file: "src/MoveBG/MapObjInit.cpp".to_string(),
             });
         let assets = vec![
@@ -2530,8 +4468,17 @@ mod tests {
             map_obj_resources: vec![sms_schema::MapObjResourceDefinition {
                 resource_name: "DokanGate".to_string(),
                 actor_type: 0x4000_0084,
+                object_flags: 0,
+                required_manager_name: "fixture map object manager".to_string(),
+                has_hold_dependency: false,
+                has_move_dependency: false,
+                uses_resource_name_model_fallback: false,
                 primary_model: Some("efDokanGate.bmd".to_string()),
+                animation_resources: Vec::new(),
+                hold_model_path: None,
+                move_bck_path: None,
                 load_flags: 0x1122_0000,
+                collision_resources: Vec::new(),
                 source_file: "src/MoveBG/MapObjInit.cpp".to_string(),
             }],
             map_static_models: vec![sms_schema::MapStaticModelDefinition {
@@ -2565,8 +4512,17 @@ mod tests {
             map_obj_resources: vec![sms_schema::MapObjResourceDefinition {
                 resource_name: "MapSmoke".to_string(),
                 actor_type: 0x4000_0004,
+                object_flags: 0,
+                required_manager_name: "fixture map object manager".to_string(),
+                has_hold_dependency: false,
+                has_move_dependency: false,
+                uses_resource_name_model_fallback: false,
                 primary_model: None,
+                animation_resources: Vec::new(),
+                hold_model_path: None,
+                move_bck_path: None,
                 load_flags: 0x1022_0000,
+                collision_resources: Vec::new(),
                 source_file: "src/MoveBG/MapObjInit.cpp".to_string(),
             }],
             ..ObjectRegistry::default()
@@ -2593,8 +4549,17 @@ mod tests {
             map_obj_resources: vec![sms_schema::MapObjResourceDefinition {
                 resource_name: "SurfGesoRed".to_string(),
                 actor_type: 0x4000_0005,
+                object_flags: 0,
+                required_manager_name: "fixture map object manager".to_string(),
+                has_hold_dependency: false,
+                has_move_dependency: false,
+                uses_resource_name_model_fallback: false,
                 primary_model: None,
+                animation_resources: Vec::new(),
+                hold_model_path: None,
+                move_bck_path: None,
                 load_flags: 0x1022_0000,
+                collision_resources: Vec::new(),
                 source_file: "src/MoveBG/MapObjInit.cpp".to_string(),
             }],
             map_obj_model_overrides: vec![sms_schema::MapObjModelOverrideDefinition {
@@ -2679,8 +4644,17 @@ mod tests {
             map_obj_resources: vec![sms_schema::MapObjResourceDefinition {
                 resource_name: "WoodBox".to_string(),
                 actor_type: 0x4000_0003,
+                object_flags: 0,
+                required_manager_name: "fixture map object manager".to_string(),
+                has_hold_dependency: false,
+                has_move_dependency: false,
+                uses_resource_name_model_fallback: false,
                 primary_model: Some("kibako.bmd".to_string()),
+                animation_resources: Vec::new(),
+                hold_model_path: None,
+                move_bck_path: None,
                 load_flags: 0x1022_0000,
+                collision_resources: Vec::new(),
                 source_file: "src/MoveBG/MapObjInit.cpp".to_string(),
             }],
             ..ObjectRegistry::default()
@@ -2713,8 +4687,17 @@ mod tests {
             .push(sms_schema::MapObjResourceDefinition {
                 resource_name: "MareGate".to_string(),
                 actor_type: 0x4000_0006,
+                object_flags: 0,
+                required_manager_name: "fixture map object manager".to_string(),
+                has_hold_dependency: false,
+                has_move_dependency: false,
+                uses_resource_name_model_fallback: false,
                 primary_model: Some("wrong_map_obj_model.bmd".to_string()),
+                animation_resources: Vec::new(),
+                hold_model_path: None,
+                move_bck_path: None,
                 load_flags: 0x1022_0000,
+                collision_resources: Vec::new(),
                 source_file: "src/MoveBG/MapObjInit.cpp".to_string(),
             });
         registry
@@ -2779,8 +4762,17 @@ mod tests {
             map_obj_resources: vec![sms_schema::MapObjResourceDefinition {
                 resource_name: "WoodBox".to_string(),
                 actor_type: 0x4000_0003,
+                object_flags: 0,
+                required_manager_name: "fixture map object manager".to_string(),
+                has_hold_dependency: false,
+                has_move_dependency: false,
+                uses_resource_name_model_fallback: false,
                 primary_model: Some("kibako.bmd".to_string()),
+                animation_resources: Vec::new(),
+                hold_model_path: None,
+                move_bck_path: None,
                 load_flags: 0x1022_0000,
+                collision_resources: Vec::new(),
                 source_file: "src/MoveBG/MapObjInit.cpp".to_string(),
             }],
             ..ObjectRegistry::default()
@@ -2849,7 +4841,10 @@ mod tests {
                     .map(|asset| asset.path.to_string_lossy().replace('\\', "/"))
                     .filter(|path| path.to_ascii_lowercase().contains("hinokuri2")),
             );
-            let (catalog, issues) = build_actor_preview_catalog(&base_root, &assets, &registry);
+            let (catalog, issues) =
+                build_actor_preview_catalog(&base_root, &assets, &registry, |path| {
+                    read_stage_asset_bytes(path).map_err(|error| error.to_string())
+                });
             assert!(
                 issues.is_empty(),
                 "enemy preview issues in {}: {issues:?}",
@@ -3099,8 +5094,8 @@ mod tests {
         let path = root.join("map/params/enemy/fixture.prm");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         let mut bytes = 2u32.to_be_bytes().to_vec();
-        for (key, name, value) in [(1u16, "lowScale", 0.75f32), (2u16, "highScale", 1.25f32)] {
-            bytes.extend_from_slice(&key.to_be_bytes());
+        for (name, value) in [("mSLBodyScaleLow", 0.75f32), ("mSLBodyScaleHigh", 1.25f32)] {
+            bytes.extend_from_slice(&sms_formats::jdrama_key_code(name).unwrap().to_be_bytes());
             bytes.extend_from_slice(&(name.len() as u16).to_be_bytes());
             bytes.extend_from_slice(name.as_bytes());
             bytes.extend_from_slice(&4u32.to_be_bytes());
@@ -3117,8 +5112,8 @@ mod tests {
             indexed_models: Vec::new(),
             manager_factories: vec!["FixtureManager".to_string()],
             runtime_uniform_scale: Some(sms_schema::EnemyRuntimeUniformScaleDefinition {
-                low_parameter: "lowScale".to_string(),
-                high_parameter: "highScale".to_string(),
+                low_parameter: "mSLBodyScaleLow".to_string(),
+                high_parameter: "mSLBodyScaleHigh".to_string(),
                 source_file: "src/Enemy/fixture.cpp".to_string(),
             }),
         };
@@ -3136,7 +5131,10 @@ mod tests {
         }];
 
         assert_eq!(
-            enemy_runtime_uniform_scale(&actor, &manager, &assets).unwrap(),
+            enemy_runtime_uniform_scale(&actor, &manager, &assets, &mut |path| {
+                read_stage_asset_bytes(path).map_err(|error| error.to_string())
+            })
+            .unwrap(),
             Some(1.0)
         );
         fs::remove_dir_all(root).unwrap();
@@ -3439,6 +5437,26 @@ mod tests {
         assert!(objects[0].asset_hints.is_empty());
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].code, "object-preview-model-ambiguous");
+    }
+
+    #[test]
+    fn registry_refresh_replaces_stale_unknown_class_metadata() {
+        let mut registry = ObjectRegistry::default();
+        registry.objects.push(sms_schema::ObjectDefinition {
+            factory_name: "Mario".to_string(),
+            class_name: "TMario".to_string(),
+            category: "System".to_string(),
+            source: sms_schema::SchemaSource::MarNameRefGen,
+            display_name: None,
+            preview_model: None,
+            hidden: false,
+            unsafe_to_edit: false,
+        });
+        let mut objects = vec![SceneObject::new("player", "Mario")];
+        objects[0].class_name = Some("Unknown".to_string());
+
+        assert!(apply_registry_preview_hints(&mut objects, &[], &registry).is_empty());
+        assert_eq!(objects[0].class_name.as_deref(), Some("TMario"));
     }
 
     #[test]

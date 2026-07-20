@@ -71,12 +71,9 @@ pub(super) fn map_obj_stream_tev_color(
     if component_count != 3 {
         return None;
     }
-    let byte_count = component_count.checked_mul(4)?;
-    let record = object.source_record_bytes.as_deref()?;
-    let rgb = record.get(record.len().checked_sub(byte_count)?..)?;
     let mut color = [0i16; 4];
-    for (channel, bytes) in rgb.chunks_exact(4).enumerate() {
-        color[channel] = u32::from_be_bytes(bytes.try_into().ok()?) as u8 as i16;
+    for (channel, name) in ["tev_red", "tev_green", "tev_blue"].into_iter().enumerate() {
+        color[channel] = object.raw_param(name)?.parse::<u32>().ok()? as u8 as i16;
     }
     color[3] = definition.alpha;
     Some(sms_schema::MapObjTevColorDefinition {

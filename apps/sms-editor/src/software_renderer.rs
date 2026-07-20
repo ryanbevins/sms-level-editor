@@ -412,6 +412,40 @@ pub(super) fn rasterize_preview_triangle(
     }
 }
 
+pub(super) fn rasterize_depth_tested_segment(
+    image: &mut egui::ColorImage,
+    depth: &[f32],
+    start: ProjectedVertex,
+    end: ProjectedVertex,
+    color: egui::Color32,
+) {
+    let dx = end.x - start.x;
+    let dy = end.y - start.y;
+    let steps = dx.abs().max(dy.abs()).ceil().max(1.0) as usize;
+    let width = image.size[0];
+    let height = image.size[1];
+
+    for step in 0..=steps {
+        let t = step as f32 / steps as f32;
+        let x = (start.x + dx * t).round() as isize;
+        let y = (start.y + dy * t).round() as isize;
+        if x < 0 || y < 0 || x >= width as isize || y >= height as isize {
+            continue;
+        }
+        let inv_depth = start.inv_depth + (end.inv_depth - start.inv_depth) * t;
+        if !inv_depth.is_finite() || inv_depth <= 0.0 {
+            continue;
+        }
+        let segment_depth = 1.0 / inv_depth;
+        let index = y as usize * width + x as usize;
+        let stored_depth = depth[index];
+        let tolerance = (stored_depth.abs() * 0.001).max(0.5);
+        if segment_depth <= stored_depth + tolerance {
+            image.pixels[index] = color;
+        }
+    }
+}
+
 pub(super) fn software_output_color_for_pass(color: [f32; 4], write_depth: bool) -> [f32; 4] {
     if write_depth {
         [color[0], color[1], color[2], 1.0]

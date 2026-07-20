@@ -7,6 +7,7 @@ mod map_obj_shared_model_extractor;
 mod map_obj_stream_tev_extractor;
 mod map_obj_string_tev_extractor;
 mod source_inventory;
+mod stage_name_extractor;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -26,6 +27,7 @@ use map_obj_shared_model_extractor::{
 use map_obj_stream_tev_extractor::extract_map_obj_stream_tev_colors;
 use map_obj_string_tev_extractor::extract_nozzle_box_tev_program;
 use source_inventory::SourceInventory;
+pub use stage_name_extractor::{extract_stage_name_tables, StageNameTables};
 
 #[derive(Debug, Error)]
 pub enum SchemaError {
@@ -81,6 +83,10 @@ pub enum SchemaExtractor {
     NpcResources,
     NpcInitData,
     NpcRootColors,
+    NpcActionPresets,
+    StageNames,
+    CollisionSurfaces,
+    CollisionLimits,
 }
 
 impl std::fmt::Display for SchemaExtractor {
@@ -104,6 +110,10 @@ impl std::fmt::Display for SchemaExtractor {
             Self::NpcResources => "NPC model resource",
             Self::NpcInitData => "NPC initialization",
             Self::NpcRootColors => "NPC root color",
+            Self::NpcActionPresets => "NPC action preset",
+            Self::StageNames => "stage name",
+            Self::CollisionSurfaces => "collision surface",
+            Self::CollisionLimits => "collision runtime limit",
         };
         formatter.write_str(name)
     }
@@ -143,17 +153,42 @@ pub struct ObjectRegistry {
     pub actor_particle_bindings: Vec<ActorParticleBinding>,
     #[serde(default)]
     pub npc_actors: Vec<NpcActorDefinition>,
+    /// Stage-local resource directories opened directly by NPC manager animation loaders.
+    #[serde(default)]
+    pub npc_resource_folders: Vec<NpcResourceFolderDefinition>,
     /// Root-model color programs selected by NPC instance body/cloth indices.
     #[serde(default)]
     pub npc_material_colors: Vec<NpcMaterialColorDefinition>,
+    /// Action-flag lookup tables selected by the NPC instance preset index.
+    #[serde(default)]
+    pub npc_action_presets: Vec<NpcActionPresetDefinition>,
     #[serde(default)]
     pub enemy_managers: Vec<EnemyManagerDefinition>,
+    /// Stage-local animation folders opened directly by enemy manager
+    /// createAnmData overrides instead of through registered character data.
+    #[serde(default)]
+    pub enemy_manager_animation_folders: Vec<EnemyManagerAnimationFolderDefinition>,
+    /// Map-object slots instantiated directly by actor and manager runtime methods.
+    #[serde(default)]
+    pub runtime_map_obj_dependencies: Vec<RuntimeMapObjDependencyDefinition>,
+    /// Fixed JDrama name lookups issued by actor runtime methods.
+    ///
+    /// These are extracted from decomp callsites so authoring can expose actor
+    /// links and transplant support records without per-object tables.
+    #[serde(default)]
+    pub runtime_name_references: Vec<RuntimeNameReferenceDefinition>,
     #[serde(default)]
     pub enemy_actors: Vec<EnemyActorDefinition>,
     #[serde(default)]
     pub enemy_material_colors: Vec<EnemyMaterialTevColorDefinition>,
     #[serde(default)]
     pub map_obj_flags: Vec<MapObjFlagDefinition>,
+    /// Collision type and property-flag names extracted from `BGTypeBits`.
+    #[serde(default)]
+    pub collision_surfaces: Vec<CollisionSurfaceDefinition>,
+    /// Stack-backed transform capacity used by moving map collision.
+    #[serde(default)]
+    pub moving_collision_vertex_limit: Option<u16>,
 }
 
 impl ObjectRegistry {
@@ -169,6 +204,15 @@ impl ObjectRegistry {
             .iter()
             .filter(|definition| actor_key.starts_with(&definition.actor_key))
             .max_by_key(|definition| definition.actor_key.len())
+    }
+
+    pub fn npc_resource_folders_for<'a>(
+        &'a self,
+        factory_name: &'a str,
+    ) -> impl Iterator<Item = &'a NpcResourceFolderDefinition> + 'a {
+        self.npc_resource_folders
+            .iter()
+            .filter(move |definition| definition.factory_name == factory_name)
     }
 
     pub fn find_enemy_manager(&self, factory_name: &str) -> Option<&EnemyManagerDefinition> {
@@ -262,6 +306,14 @@ impl ObjectRegistry {
         self.npc_material_colors.iter().filter(move |definition| {
             actor_key.is_some_and(|actor_key| definition.actor_key == actor_key)
         })
+    }
+
+    pub fn npc_action_presets_for(&self, factory_name: &str) -> Option<&NpcActionPresetDefinition> {
+        let actor_key = factory_name.strip_prefix("NPC")?;
+        self.npc_action_presets
+            .iter()
+            .filter(|definition| actor_key.starts_with(&definition.actor_family))
+            .max_by_key(|definition| definition.actor_family.len())
     }
 
     pub fn apply_overlay(&mut self, overlay: SchemaOverlay) {
@@ -381,14 +433,91 @@ pub struct MapObjResourceDefinition {
     /// Exact runtime actor type stored in `TMapObjData::unk4`.
     #[serde(default)]
     pub actor_type: u32,
+    /// Exact `TMapObjData::unk34` behavior flags copied into
+    /// `TMapObjBase::unkF8` before model and collision initialization.
+    #[serde(default)]
+    pub object_flags: u32,
+    /// Exact `TMapObjData::unk8` name passed to
+    /// `TNameRefGen::search<TLiveManager>` before the actor is registered.
+    ///
+    /// An empty value is retained only for compatibility with registries
+    /// serialized before this dependency was exposed; source-free stock-slot
+    /// authoring must reject such entries instead of guessing a manager.
+    #[serde(default)]
+    pub required_manager_name: String,
+    /// True when `TMapObjData::mHold` points at compiled hold-model/joint data.
+    /// Replacing only the primary BMD cannot satisfy this dependency.
+    #[serde(default)]
+    pub has_hold_dependency: bool,
+    /// True when `TMapObjData::mMove` points at compiled BCK/joint motion data.
+    /// Replacing only the primary BMD cannot satisfy this dependency.
+    #[serde(default)]
+    pub has_move_dependency: bool,
+    /// True only when the compiled table has no animation-info entry and
+    /// `TMapObjBase::makeMActors` therefore loads `<resource_name>.bmd`.
+    #[serde(default)]
+    pub uses_resource_name_model_fallback: bool,
     /// Primary BMD passed to `TMapObjBase::initMActor`, or `None` when actor count is zero.
     pub primary_model: Option<String>,
+    /// Exact `TMapObjAnimData` entries consumed by this slot, truncated to
+    /// `TMapObjAnimDataInfo::unk0` just as retail does.
+    ///
+    /// This includes model switches, extensionless animation identities, the
+    /// unresolved extra string, and animation-sound BAS paths. An empty list
+    /// means the slot uses the `<resource_name>.bmd` fallback or has no actors.
+    #[serde(default)]
+    pub animation_resources: Vec<MapObjAnimationResourceDefinition>,
+    /// Exact BMD path loaded by `TMapObjBase::initHoldData` from
+    /// `TMapObjHoldData::unk0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_model_path: Option<String>,
+    /// Exact BCK path loaded by `TMapObjBase::initBckMoveData` from
+    /// `TMapObjMoveData::unk0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub move_bck_path: Option<String>,
+
     /// Effective `TMActorKeeper::mModelLoaderFlags` selected from `TMapObjData::unk34`.
     ///
     /// The default preserves registries serialized before this field was exposed.
     #[serde(default = "default_map_obj_model_load_flags")]
     pub load_flags: u32,
+    /// Exact collision basenames and loader flags selected by this stock slot.
+    #[serde(default)]
+    pub collision_resources: Vec<MapObjCollisionResourceDefinition>,
     pub source_file: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MapObjAnimationResourceDefinition {
+    /// Exact `TMapObjAnimData::unk0` model name passed to `initMActor`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_name: Option<String>,
+    /// Exact `TMapObjAnimData::unk4` identity passed to `MActor::setAnimation`.
+    /// It is an extensionless basename, not specifically a BCK path; consumers
+    /// must match it against the supported animation extensions in the actor's
+    /// resource folder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub animation_name: Option<String>,
+    /// Exact `TMapObjAnimData::unk8` MActor animation channel.
+    #[serde(default)]
+    pub animation_channel: u8,
+    /// Exact, currently unresolved `TMapObjAnimData::unkC` string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_name: Option<String>,
+    /// Exact `TMapObjAnimData::unk10` BAS path passed to `setAnmSound`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bas_path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MapObjCollisionResourceDefinition {
+    pub resource_name: String,
+    pub flags: u16,
+    /// Low two flag bits passed to `TMapCollisionManager::createCollision`.
+    pub collision_kind: u8,
+    /// Present for moving collision, whose transformed vertices use a fixed stack array.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_vertices: Option<u16>,
 }
 
 fn default_map_obj_model_load_flags() -> u32 {
@@ -463,6 +592,19 @@ pub struct MapObjFlagDefinition {
     pub source_file: String,
 }
 
+/// A named value accepted in the COL triangle type field.
+///
+/// Property flags are kept alongside concrete types because Sunshine composes
+/// them into the same raw `u16` value. Consumers must preserve unknown raw
+/// values even when no decomp-authored name is available.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollisionSurfaceDefinition {
+    pub name: String,
+    pub value: u16,
+    pub is_property_flag: bool,
+    pub source_file: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MapObjFlagAreaSpeed {
     pub area_index: u32,
@@ -491,6 +633,14 @@ pub struct NpcActorDefinition {
     pub parts: Vec<NpcPartDefinition>,
 }
 
+/// A complete archive directory passed to an NPC manager's animation-data loader.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NpcResourceFolderDefinition {
+    pub factory_name: String,
+    pub folder: String,
+    pub source_file: String,
+}
+
 /// A root NPC model color change selected from `TNpcInitInfo::unk34`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NpcMaterialColorDefinition {
@@ -500,6 +650,14 @@ pub struct NpcMaterialColorDefinition {
     /// Index into the instance color tuple (`0` body, `1` cloth in retail).
     pub color_index_channel: u8,
     pub change: NpcColorChangeDefinition,
+    pub source_file: String,
+}
+
+/// The exact `sBaseActionFlagTable` consumed by one NPC family.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NpcActionPresetDefinition {
+    pub actor_family: String,
+    pub action_flags: Vec<u32>,
     pub source_file: String,
 }
 
@@ -538,6 +696,36 @@ pub struct EnemyManagerDefinition {
     #[serde(default)]
     pub parameter_path: Option<String>,
     pub models: Vec<EnemyModelDefinition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnemyManagerAnimationFolderDefinition {
+    pub factory_name: String,
+    pub folder: String,
+    pub source_file: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeMapObjDependencyDefinition {
+    pub factory_name: String,
+    pub resource_name: String,
+    pub source_file: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RuntimeNameReferenceTarget {
+    Actor { factory_name: String },
+    PlacementRecord { type_name: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct RuntimeNameReferenceDefinition {
+    pub factory_name: String,
+    pub target: RuntimeNameReferenceTarget,
+    pub required: bool,
+    pub record_name: String,
+    pub source_file: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -656,6 +844,7 @@ impl SchemaGenerator {
         self.scan_params_and_assets(&sources, &mut registry)?;
         self.scan_map_static_models(&sources, &mut registry)?;
         self.scan_map_obj_flags(&sources, &mut registry)?;
+        self.scan_collision_surfaces(&sources, &mut registry)?;
         self.scan_particle_bindings(&sources, &mut registry)?;
         self.scan_npc_resource_bindings(&sources, &mut registry)?;
         self.scan_npc_init_data(&sources, &mut registry)?;
@@ -728,6 +917,10 @@ impl SchemaGenerator {
         let mut part_model_indices = BTreeMap::<String, usize>::new();
         let mut manager_actor_classes = BTreeMap::<String, String>::new();
         let mut manager_parameter_paths = BTreeMap::<String, String>::new();
+        let mut manager_animation_folders = BTreeMap::<String, Vec<(String, String)>>::new();
+        let mut runtime_map_obj_dependencies = BTreeMap::<String, Vec<(String, String)>>::new();
+        let mut runtime_name_references =
+            BTreeMap::<String, Vec<ExtractedRuntimeNameReference>>::new();
         let mut inheritance = BTreeMap::<String, String>::new();
         let mut tev_color_bindings = Vec::new();
         let mut init_tev_colors = BTreeMap::new();
@@ -795,6 +988,24 @@ impl SchemaGenerator {
                 for (class_name, path) in extract_enemy_manager_parameter_paths(text) {
                     manager_parameter_paths.entry(class_name).or_insert(path);
                 }
+                for (class_name, dependencies) in
+                    extract_runtime_map_obj_dependencies(text, &source_file)
+                {
+                    runtime_map_obj_dependencies
+                        .entry(class_name)
+                        .or_default()
+                        .extend(dependencies);
+                }
+                for (class_name, folders) in
+                    extract_enemy_manager_animation_folders(text, &source_file)
+                {
+                    // Preserve even an empty override: some subclasses call
+                    // TObjManager here specifically to avoid inheriting the
+                    // parent's hardcoded stage-local animation directory.
+                    manager_animation_folders
+                        .entry(class_name)
+                        .or_insert(folders);
+                }
                 tev_color_bindings.extend(extract_enemy_tev_color_bindings(text, &source_file));
                 extract_enemy_init_tev_colors(text, &mut init_tev_colors);
             }
@@ -806,6 +1017,27 @@ impl SchemaGenerator {
             "enemy/animal/strategic C++ sources",
         )?;
 
+        // Fixed actor-name lookups are a game-wide authoring contract, not an
+        // enemy-specific one. Scan every gameplay source while keeping the
+        // owning class and source provenance decomp-derived.
+        for file in sources.files_under_any(&["src/", "include/"]) {
+            if !matches!(file.extension(), "cpp" | "hpp" | "h") {
+                continue;
+            }
+            let text = file.text();
+            extract_class_inheritance(text, &mut inheritance);
+            if file.extension() != "cpp" {
+                continue;
+            }
+            let source_file = file.relative_path().to_string();
+            for (class_name, references) in extract_runtime_name_references(text, &source_file) {
+                runtime_name_references
+                    .entry(class_name)
+                    .or_default()
+                    .extend(references);
+            }
+        }
+
         // A few retail-only manager subclasses are declared beside their
         // factory registrations rather than in public headers.
         for file_name in ["MarNameRefGen_Enemy.cpp", "MarNameRefGen_BossEnemy.cpp"] {
@@ -816,6 +1048,39 @@ impl SchemaGenerator {
             for (class_name, parent) in supplemental {
                 inheritance.entry(class_name).or_insert(parent);
             }
+        }
+
+        for object in &registry.objects {
+            registry.runtime_map_obj_dependencies.extend(
+                inherited_actor_models_union(
+                    &object.class_name,
+                    &runtime_map_obj_dependencies,
+                    &inheritance,
+                )
+                .into_iter()
+                .map(|(resource_name, source_file)| {
+                    RuntimeMapObjDependencyDefinition {
+                        factory_name: object.factory_name.clone(),
+                        resource_name,
+                        source_file,
+                    }
+                }),
+            );
+            registry.runtime_name_references.extend(
+                inherited_actor_models_union(
+                    &object.class_name,
+                    &runtime_name_references,
+                    &inheritance,
+                )
+                .into_iter()
+                .map(|reference| RuntimeNameReferenceDefinition {
+                    factory_name: object.factory_name.clone(),
+                    target: reference.target,
+                    required: reference.required,
+                    record_name: reference.record_name,
+                    source_file: reference.source_file,
+                }),
+            );
         }
 
         for definition in &mut registry.enemy_actors {
@@ -892,8 +1157,15 @@ impl SchemaGenerator {
             registry
                 .enemy_managers
                 .retain(|definition| definition.factory_name != object.factory_name);
+            let animation_folders = inherited_actor_models(
+                &object.class_name,
+                &manager_animation_folders,
+                &inheritance,
+            )
+            .unwrap_or_default();
+            let factory_name = object.factory_name;
             registry.enemy_managers.push(EnemyManagerDefinition {
-                factory_name: object.factory_name,
+                factory_name: factory_name.clone(),
                 spawned_actor_class: inherited_actor_class(
                     &object.class_name,
                     &manager_actor_classes,
@@ -908,6 +1180,15 @@ impl SchemaGenerator {
                 model_index,
                 models,
             });
+            registry
+                .enemy_manager_animation_folders
+                .extend(animation_folders.into_iter().map(|(folder, source_file)| {
+                    EnemyManagerAnimationFolderDefinition {
+                        factory_name: factory_name.clone(),
+                        folder,
+                        source_file,
+                    }
+                }));
         }
         registry
             .enemy_managers
@@ -965,6 +1246,22 @@ impl SchemaGenerator {
                     detail: format!("failed to extract map-object resources: {detail}"),
                 }
             })?;
+        let collision_limit_path = "src/Map/MapMakeData.cpp";
+        let collision_limit =
+            extract_moving_collision_vertex_limit(sources.required(collision_limit_path)?.text())
+                .ok_or_else(|| SchemaError::ExtractionDrift {
+                extractor: SchemaExtractor::CollisionLimits,
+                source_path: self.repo_root.join(collision_limit_path),
+                expected: "fixed moving-collision vertex transform capacity",
+            })?;
+        registry.moving_collision_vertex_limit = Some(collision_limit);
+        for resource in &mut registry.map_obj_resources {
+            for collision in &mut resource.collision_resources {
+                if collision.collision_kind == 1 {
+                    collision.max_vertices = Some(collision_limit);
+                }
+            }
+        }
         ensure_extracted(
             SchemaExtractor::MapObjResources,
             self.repo_root.join(relative_path),
@@ -1295,6 +1592,22 @@ impl SchemaGenerator {
         Ok(())
     }
 
+    fn scan_collision_surfaces(
+        &self,
+        sources: &SourceInventory,
+        registry: &mut ObjectRegistry,
+    ) -> Result<()> {
+        let source_path = "include/Map/MapData.hpp";
+        let source = sources.required(source_path)?.text();
+        registry.collision_surfaces = extract_collision_surfaces(source, source_path);
+        ensure_extracted(
+            SchemaExtractor::CollisionSurfaces,
+            self.repo_root.join(source_path),
+            registry.collision_surfaces.len(),
+            "BGTypeBits collision types and property flags",
+        )
+    }
+
     fn scan_npc_init_data(
         &self,
         sources: &SourceInventory,
@@ -1315,6 +1628,15 @@ impl SchemaGenerator {
             self.repo_root.join(relative_path),
             registry.npc_material_colors.len(),
             "TNpcInitInfo root-model color bindings",
+        )?;
+        let action_path = "src/NPC/NpcInitActionData.cpp";
+        registry.npc_action_presets =
+            extract_npc_action_presets(sources.required(action_path)?.text(), action_path);
+        ensure_extracted(
+            SchemaExtractor::NpcActionPresets,
+            self.repo_root.join(action_path),
+            registry.npc_action_presets.len(),
+            "NPC family action-flag lookup tables",
         )?;
         Ok(())
     }
@@ -1344,6 +1666,10 @@ impl SchemaGenerator {
                 .into_iter()
                 .collect::<BTreeMap<_, _>>();
         let resource_bases = extract_npc_manager_resource_bases(manager_text);
+        let manager_animation_folders =
+            extract_enemy_manager_animation_folders(manager_text, manager_path)
+                .into_iter()
+                .collect::<BTreeMap<_, _>>();
 
         let mut inheritance = BTreeMap::new();
         for file in sources.files_under_any(&["src/NPC/", "include/NPC/"]) {
@@ -1371,6 +1697,18 @@ impl SchemaGenerator {
             };
             let resource_base =
                 inherited_string_value(manager_class, &resource_bases, &inheritance);
+            let animation_folders =
+                inherited_actor_models(manager_class, &manager_animation_folders, &inheritance)
+                    .unwrap_or_default();
+            registry
+                .npc_resource_folders
+                .extend(animation_folders.into_iter().map(|(folder, source_file)| {
+                    NpcResourceFolderDefinition {
+                        factory_name: factory_name.clone(),
+                        folder,
+                        source_file,
+                    }
+                }));
             registry
                 .object_resources
                 .extend(models.into_iter().enumerate().map(|(model_index, model)| {
@@ -1534,6 +1872,42 @@ fn extract_npc_material_color_definitions(
         }
     }
 
+    definitions
+}
+
+fn extract_npc_action_presets(text: &str, source_file: &str) -> Vec<NpcActionPresetDefinition> {
+    let method_re =
+        Regex::new(r"void\s+TBaseNPC::set([A-Za-z_][A-Za-z0-9_]*)ActionFlag_\s*\(\s*\)\s*\{")
+            .expect("valid NPC action-preset method regex");
+    let table_re = Regex::new(r"static\s+const\s+u32\s+sBaseActionFlagTable\s*\[\s*\]\s*=\s*\{")
+        .expect("valid NPC action-preset table regex");
+    let mut definitions = Vec::new();
+
+    for captures in method_re.captures_iter(text) {
+        let Some(method_match) = captures.get(0) else {
+            continue;
+        };
+        let Some(method_body) = braced_body(text, method_match.end() - 1) else {
+            continue;
+        };
+        let Some(table_match) = table_re.find(method_body) else {
+            continue;
+        };
+        let Some(table_body) = braced_body(method_body, table_match.end() - 1) else {
+            continue;
+        };
+        let action_flags = split_cpp_initializer_fields(table_body)
+            .into_iter()
+            .filter_map(parse_cpp_u32)
+            .collect::<Vec<_>>();
+        if !action_flags.is_empty() {
+            definitions.push(NpcActionPresetDefinition {
+                actor_family: captures[1].to_string(),
+                action_flags,
+                source_file: source_file.to_string(),
+            });
+        }
+    }
     definitions
 }
 
@@ -1949,6 +2323,185 @@ fn extract_enemy_manager_parameter_paths(text: &str) -> Vec<(String, String)> {
             let body = braced_body(text, whole.end() - 1)?;
             let path = path_re.captures(body)?;
             Some((method[1].to_string(), path[1].to_string()))
+        })
+        .collect()
+}
+
+fn extract_runtime_map_obj_dependencies(
+    text: &str,
+    source_file: &str,
+) -> Vec<(String, Vec<(String, String)>)> {
+    let method_re = Regex::new(
+        r"(?m)^[^\r\n{};]*\b([A-Za-z_][A-Za-z0-9_]*)::[A-Za-z_][A-Za-z0-9_]*\s*\([^;{}]*\)\s*(?:const\s*)?\{",
+    )
+    .expect("valid runtime map-object method regex");
+    let dependency_re = Regex::new(r#"(?:newAndRegisterObj)\s*\(\s*"([^"]+)""#)
+        .expect("valid runtime map-object dependency regex");
+    let mut by_class = BTreeMap::<String, BTreeSet<(String, String)>>::new();
+    for method in method_re.captures_iter(text) {
+        let Some(whole) = method.get(0) else {
+            continue;
+        };
+        let Some(body) = braced_body(text, whole.end() - 1) else {
+            continue;
+        };
+        by_class.entry(method[1].to_string()).or_default().extend(
+            dependency_re
+                .captures_iter(body)
+                .map(|dependency| (dependency[1].to_string(), source_file.to_string())),
+        );
+    }
+    by_class
+        .into_iter()
+        .map(|(class_name, dependencies)| (class_name, dependencies.into_iter().collect()))
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ExtractedRuntimeNameReference {
+    target: RuntimeNameReferenceTarget,
+    required: bool,
+    record_name: String,
+    source_file: String,
+}
+
+fn extract_runtime_name_references(
+    text: &str,
+    source_file: &str,
+) -> Vec<(String, Vec<ExtractedRuntimeNameReference>)> {
+    let method_re = Regex::new(
+        r"(?m)^[^\r\n{};]*\b([A-Za-z_][A-Za-z0-9_]*)::[A-Za-z_][A-Za-z0-9_]*\s*\([^;{}]*\)\s*(?:const\s*)?\{",
+    )
+    .expect("valid runtime name-reference method regex");
+    let shine_demo_re =
+        Regex::new(r#"(?s)makeShineAppearWithDemo(?:Offset)?\s*\(\s*"([^"]+)"\s*,\s*"([^"]+)""#)
+            .expect("valid Shine demo dependency regex");
+    let shine_time_re = Regex::new(r#"(?s)makeShineAppearWithTime(?:Offset)?\s*\(\s*"([^"]+)""#)
+        .expect("valid timed Shine dependency regex");
+    let mut by_class = BTreeMap::<String, BTreeSet<ExtractedRuntimeNameReference>>::new();
+    let nerve_re = Regex::new(r"(?m)^\s*DEFINE_NERVE\s*\([^)]*\)\s*\{")
+        .expect("valid nerve implementation regex");
+    let nerve_body_re = Regex::new(
+        r"([A-Za-z_][A-Za-z0-9_]*)\s*\*\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\*\s*\)\s*spine->getBody\s*\(",
+    )
+    .expect("valid nerve body actor regex");
+
+    for method in method_re.captures_iter(text) {
+        let Some(whole) = method.get(0) else {
+            continue;
+        };
+        let Some(body) = braced_body(text, whole.end() - 1) else {
+            continue;
+        };
+        let references = by_class.entry(method[1].to_string()).or_default();
+        for call in shine_demo_re.captures_iter(body) {
+            references.insert(ExtractedRuntimeNameReference {
+                target: RuntimeNameReferenceTarget::Actor {
+                    factory_name: "Shine".to_string(),
+                },
+                required: false,
+                record_name: call[1].to_string(),
+                source_file: source_file.to_string(),
+            });
+            references.insert(ExtractedRuntimeNameReference {
+                target: RuntimeNameReferenceTarget::PlacementRecord {
+                    type_name: "CameraMapInfo".to_string(),
+                },
+                required: false,
+                record_name: call[2].to_string(),
+                source_file: source_file.to_string(),
+            });
+        }
+        for call in shine_time_re.captures_iter(body) {
+            references.insert(ExtractedRuntimeNameReference {
+                target: RuntimeNameReferenceTarget::Actor {
+                    factory_name: "Shine".to_string(),
+                },
+                required: false,
+                record_name: call[1].to_string(),
+                source_file: source_file.to_string(),
+            });
+        }
+    }
+
+    // State-machine implementations are emitted through DEFINE_NERVE rather than
+    // ordinary Class::method definitions. Attribute a name lookup to the actor
+    // type recovered from the nerve body's checked getBody cast.
+    for nerve in nerve_re.find_iter(text) {
+        let Some(body) = braced_body(text, nerve.end() - 1) else {
+            continue;
+        };
+        let Some(actor) = nerve_body_re.captures(body) else {
+            continue;
+        };
+        if actor[1] != actor[2] {
+            continue;
+        }
+        let references = by_class.entry(actor[1].to_string()).or_default();
+        for call in shine_demo_re.captures_iter(body) {
+            references.insert(ExtractedRuntimeNameReference {
+                target: RuntimeNameReferenceTarget::Actor {
+                    factory_name: "Shine".to_string(),
+                },
+                required: true,
+                record_name: call[1].to_string(),
+                source_file: source_file.to_string(),
+            });
+            references.insert(ExtractedRuntimeNameReference {
+                target: RuntimeNameReferenceTarget::PlacementRecord {
+                    type_name: "CameraMapInfo".to_string(),
+                },
+                required: true,
+                record_name: call[2].to_string(),
+                source_file: source_file.to_string(),
+            });
+        }
+        for call in shine_time_re.captures_iter(body) {
+            references.insert(ExtractedRuntimeNameReference {
+                target: RuntimeNameReferenceTarget::Actor {
+                    factory_name: "Shine".to_string(),
+                },
+                required: true,
+                record_name: call[1].to_string(),
+                source_file: source_file.to_string(),
+            });
+        }
+    }
+    by_class
+        .into_iter()
+        .map(|(class_name, references)| (class_name, references.into_iter().collect()))
+        .collect()
+}
+
+fn extract_enemy_manager_animation_folders(
+    text: &str,
+    source_file: &str,
+) -> Vec<(String, Vec<(String, String)>)> {
+    let constants = extract_cpp_string_constants(text);
+    let method_re = Regex::new(r"void\s+([A-Za-z_][A-Za-z0-9_]*)::createAnmData\s*\([^)]*\)\s*\{")
+        .expect("valid enemy manager animation method regex");
+    let init_re = Regex::new(
+        r#"(?:->|\.)init\s*\(\s*([^,]+)\s*,\s*(?:\([^)]*\)\s*)?(?:NULL|nullptr|0)\s*\)"#,
+    )
+    .expect("valid manager animation init regex");
+    method_re
+        .captures_iter(text)
+        .filter_map(|method| {
+            let whole = method.get(0)?;
+            let body = braced_body(text, whole.end() - 1)?;
+            let folders = init_re
+                .captures_iter(body)
+                .filter_map(|init| {
+                    let argument = init[1].trim();
+                    parse_cpp_string(argument)
+                        .or_else(|| constants.get(argument).cloned())
+                        .filter(|folder| folder.starts_with("/scene/"))
+                        .map(|folder| (folder, source_file.to_string()))
+                })
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            Some((method[1].to_string(), folders))
         })
         .collect()
 }
@@ -2512,6 +3065,65 @@ fn extract_model_data_tables(
     tables
 }
 
+fn extract_collision_surfaces(text: &str, source_file: &str) -> Vec<CollisionSurfaceDefinition> {
+    let declaration = Regex::new(r"enum\s+BGTypeBits\s*\{")
+        .expect("valid BGTypeBits declaration regex")
+        .find(text);
+    let Some(declaration) = declaration else {
+        return Vec::new();
+    };
+    let Some(body) = braced_body(text, declaration.end() - 1) else {
+        return Vec::new();
+    };
+    let block_comments = Regex::new(r"(?s)/\*.*?\*/").expect("valid block-comment regex");
+    let line_comments = Regex::new(r"//[^\r\n]*").expect("valid line-comment regex");
+    let without_comments = block_comments.replace_all(body, " ");
+    let without_comments = line_comments.replace_all(&without_comments, " ");
+    let name_re = Regex::new(r"^([A-Za-z_][A-Za-z0-9_]*)$").expect("valid identifier regex");
+
+    let mut symbols = BTreeMap::new();
+    let mut definitions = Vec::new();
+    for entry in without_comments.split(',') {
+        let Some((raw_name, raw_expression)) = entry.split_once('=') else {
+            continue;
+        };
+        let name = raw_name.split_whitespace().last().unwrap_or_default();
+        if !name_re.is_match(name) {
+            continue;
+        }
+        let Some(value) = parse_cpp_u32_expression(raw_expression.trim(), &symbols) else {
+            continue;
+        };
+        symbols.insert(name.to_string(), value);
+        if !(name.starts_with("BG_TYPE_") || name.starts_with("BG_PROPERTY_FLAG_")) {
+            continue;
+        }
+        let Ok(value) = u16::try_from(value) else {
+            continue;
+        };
+        definitions.push(CollisionSurfaceDefinition {
+            name: name.to_string(),
+            value,
+            is_property_flag: name.starts_with("BG_PROPERTY_FLAG_"),
+            source_file: source_file.to_string(),
+        });
+    }
+    definitions
+}
+
+fn extract_moving_collision_vertex_limit(text: &str) -> Option<u16> {
+    let array_re = Regex::new(r"\bVec\s+[A-Za-z_][A-Za-z0-9_]*\s*\[\s*([0-9]+)\s*\]")
+        .expect("valid moving-collision stack-array regex");
+    let values = array_re
+        .captures_iter(text)
+        .filter_map(|captures| captures[1].parse::<u16>().ok())
+        .collect::<BTreeSet<_>>();
+    match values.into_iter().collect::<Vec<_>>().as_slice() {
+        [value] => Some(*value),
+        _ => None,
+    }
+}
+
 fn extract_cpp_u32_constants(text: &str) -> BTreeMap<String, u32> {
     let constant_re = Regex::new(r"([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(0[xX][0-9A-Fa-f]+|[0-9]+)")
         .expect("valid numeric constant regex");
@@ -2899,6 +3511,26 @@ fn inherited_actor_models<T: Clone>(
         current = inheritance.get(current)?.rsplit("::").next()?;
     }
     None
+}
+
+fn inherited_actor_models_union<T: Clone + Ord>(
+    class_name: &str,
+    actor_models: &BTreeMap<String, Vec<T>>,
+    inheritance: &BTreeMap<String, String>,
+) -> Vec<T> {
+    let mut current = class_name.rsplit("::").next().unwrap_or(class_name);
+    let mut visited = BTreeSet::new();
+    let mut models = BTreeSet::new();
+    while visited.insert(current.to_string()) {
+        if let Some(current_models) = actor_models.get(current) {
+            models.extend(current_models.iter().cloned());
+        }
+        let Some(parent) = inheritance.get(current) else {
+            break;
+        };
+        current = parent.rsplit("::").next().unwrap_or(parent);
+    }
+    models.into_iter().collect()
 }
 
 fn inherited_actor_value<T: Clone>(
@@ -3301,6 +3933,16 @@ fn dedup_registry(registry: &mut ObjectRegistry) -> Result<()> {
         .map_obj_flags
         .dedup_by(|a, b| a.factory_name == b.factory_name);
 
+    registry.collision_surfaces.sort_by(|a, b| {
+        a.value
+            .cmp(&b.value)
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.source_file.cmp(&b.source_file))
+    });
+    registry
+        .collision_surfaces
+        .dedup_by(|a, b| a.name == b.name && a.value == b.value);
+
     registry.particle_resources.sort_by(|a, b| {
         a.effect_id
             .cmp(&b.effect_id)
@@ -3323,6 +3965,15 @@ fn dedup_registry(registry: &mut ObjectRegistry) -> Result<()> {
     registry
         .npc_actors
         .dedup_by(|a, b| a.actor_key == b.actor_key);
+    registry.npc_resource_folders.sort_by(|a, b| {
+        a.factory_name
+            .cmp(&b.factory_name)
+            .then_with(|| a.folder.cmp(&b.folder))
+            .then_with(|| a.source_file.cmp(&b.source_file))
+    });
+    registry
+        .npc_resource_folders
+        .dedup_by(|a, b| a.factory_name == b.factory_name && a.folder == b.folder);
     registry.npc_material_colors.sort_by(|a, b| {
         a.actor_key
             .cmp(&b.actor_key)
@@ -3331,6 +3982,34 @@ fn dedup_registry(registry: &mut ObjectRegistry) -> Result<()> {
             .then_with(|| a.change.material_name.cmp(&b.change.material_name))
     });
     registry.npc_material_colors.dedup();
+    registry
+        .npc_action_presets
+        .sort_by(|a, b| a.actor_family.cmp(&b.actor_family));
+    registry
+        .npc_action_presets
+        .dedup_by(|a, b| a.actor_family == b.actor_family);
+
+    registry.runtime_map_obj_dependencies.sort_by(|a, b| {
+        a.factory_name
+            .cmp(&b.factory_name)
+            .then_with(|| a.resource_name.cmp(&b.resource_name))
+            .then_with(|| a.source_file.cmp(&b.source_file))
+    });
+    registry
+        .runtime_map_obj_dependencies
+        .dedup_by(|a, b| a.factory_name == b.factory_name && a.resource_name == b.resource_name);
+    registry.runtime_name_references.sort();
+    registry.runtime_name_references.dedup();
+
+    registry.enemy_manager_animation_folders.sort_by(|a, b| {
+        a.factory_name
+            .cmp(&b.factory_name)
+            .then_with(|| a.folder.cmp(&b.folder))
+            .then_with(|| a.source_file.cmp(&b.source_file))
+    });
+    registry
+        .enemy_manager_animation_folders
+        .dedup_by(|a, b| a.factory_name == b.factory_name && a.folder == b.folder);
 
     registry.enemy_managers.sort_by(|a, b| {
         a.factory_name
@@ -3386,11 +4065,145 @@ fn validate_registry(registry: &ObjectRegistry) -> Result<()> {
         });
     }
 
+    let mut collision_surface_values = BTreeMap::new();
+    for surface in &registry.collision_surfaces {
+        if surface.source_file.is_empty() {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!("collision surface {} has no provenance", surface.name),
+            });
+        }
+        if let Some(previous) = collision_surface_values.insert(&surface.name, surface.value) {
+            if previous != surface.value {
+                return Err(SchemaError::RegistryInvariant {
+                    detail: format!(
+                        "collision surface {} resolves to conflicting values {previous:#06x} and {:#06x}",
+                        surface.name, surface.value
+                    ),
+                });
+            }
+        }
+    }
+
     let objects = registry
         .objects
         .iter()
         .map(|object| (object.factory_name.as_str(), object))
         .collect::<BTreeMap<_, _>>();
+    for folder in &registry.npc_resource_folders {
+        if folder.folder.is_empty() || folder.source_file.is_empty() {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!(
+                    "NPC {} has a runtime resource folder without a path or provenance",
+                    folder.factory_name
+                ),
+            });
+        }
+        if !objects.contains_key(folder.factory_name.as_str()) {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!(
+                    "NPC resource folder {} has no registered factory {}",
+                    folder.folder, folder.factory_name
+                ),
+            });
+        }
+    }
+
+    let map_obj_resource_names = registry
+        .map_obj_resources
+        .iter()
+        .map(|resource| resource.resource_name.as_str())
+        .collect::<BTreeSet<_>>();
+    for dependency in &registry.runtime_map_obj_dependencies {
+        if dependency.resource_name.is_empty() || dependency.source_file.is_empty() {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!(
+                    "factory {} has a runtime map-object dependency without a name or provenance",
+                    dependency.factory_name
+                ),
+            });
+        }
+        if !objects.contains_key(dependency.factory_name.as_str()) {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!(
+                    "runtime map-object dependency {} has no registered factory {}",
+                    dependency.resource_name, dependency.factory_name
+                ),
+            });
+        }
+        if !map_obj_resource_names.contains(dependency.resource_name.as_str()) {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!(
+                    "factory {} instantiates unknown map-object resource {}",
+                    dependency.factory_name, dependency.resource_name
+                ),
+            });
+        }
+    }
+
+    for reference in &registry.runtime_name_references {
+        if reference.record_name.is_empty() || reference.source_file.is_empty() {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!(
+                    "factory {} has a runtime name reference without a name or provenance",
+                    reference.factory_name
+                ),
+            });
+        }
+        if !objects.contains_key(reference.factory_name.as_str()) {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!(
+                    "runtime name reference {:?} has no registered owner factory {}",
+                    reference.record_name, reference.factory_name
+                ),
+            });
+        }
+        match &reference.target {
+            RuntimeNameReferenceTarget::Actor { factory_name }
+                if !objects.contains_key(factory_name.as_str()) =>
+            {
+                return Err(SchemaError::RegistryInvariant {
+                    detail: format!(
+                        "runtime name reference {:?} targets unknown actor factory {}",
+                        reference.record_name, factory_name
+                    ),
+                });
+            }
+            RuntimeNameReferenceTarget::PlacementRecord { type_name } if type_name.is_empty() => {
+                return Err(SchemaError::RegistryInvariant {
+                    detail: format!(
+                        "runtime name reference {:?} has an empty placement-record type",
+                        reference.record_name
+                    ),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    let enemy_manager_factories = registry
+        .enemy_managers
+        .iter()
+        .map(|manager| manager.factory_name.as_str())
+        .collect::<BTreeSet<_>>();
+    for animation in &registry.enemy_manager_animation_folders {
+        if animation.folder.is_empty() || animation.source_file.is_empty() {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!(
+                    "enemy manager {} has an animation folder without a path or provenance",
+                    animation.factory_name
+                ),
+            });
+        }
+        if !enemy_manager_factories.contains(animation.factory_name.as_str()) {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!(
+                    "animation folder {} has no enemy manager factory {}",
+                    animation.folder, animation.factory_name
+                ),
+            });
+        }
+    }
+
     for resource in &registry.object_resources {
         if !objects.contains_key(resource.factory_name.as_str()) {
             return Err(SchemaError::RegistryInvariant {
@@ -3612,6 +4425,16 @@ fn validate_registry(registry: &ObjectRegistry) -> Result<()> {
                     "NPC {} has root color metadata without material/provenance",
                     color.actor_key
                 ),
+            });
+        }
+    }
+    for presets in &registry.npc_action_presets {
+        if presets.actor_family.is_empty()
+            || presets.action_flags.is_empty()
+            || presets.source_file.is_empty()
+        {
+            return Err(SchemaError::RegistryInvariant {
+                detail: "NPC action presets have an empty family, table, or provenance".to_string(),
             });
         }
     }
@@ -3966,6 +4789,114 @@ mod tests {
         )
         .expect("inherit runtime scale metadata");
         assert_eq!(inherited.source_file, "src/Enemy/fixture.cpp");
+    }
+
+    #[test]
+    fn extracts_runtime_map_object_dependencies_across_class_inheritance() {
+        let text = r#"
+            void TFixtureManager::loadAfter() {
+                TSmallEnemyManager::loadAfter();
+                TMapObjBaseManager::newAndRegisterObj("mushroom1up");
+            }
+
+            void TFixtureVariantManager::loadAfter() {
+                TFixtureManager::loadAfter();
+                gpMapObjManager->newAndRegisterObj("mario_cap");
+            }
+        "#;
+        let extracted = extract_runtime_map_obj_dependencies(text, "src/Enemy/fixture.cpp")
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        let inheritance = BTreeMap::from([(
+            "TFixtureVariantManager".to_string(),
+            "TFixtureManager".to_string(),
+        )]);
+        assert_eq!(
+            inherited_actor_models_union("TFixtureVariantManager", &extracted, &inheritance,),
+            [
+                ("mario_cap".to_string(), "src/Enemy/fixture.cpp".to_string()),
+                (
+                    "mushroom1up".to_string(),
+                    "src/Enemy/fixture.cpp".to_string()
+                ),
+            ]
+        );
+    }
+    #[test]
+    fn extracts_runtime_shine_and_demo_camera_name_references() {
+        let text = r#"
+            DEFINE_NERVE(TNerveFixtureBossDie, TLiveActor) {
+                TFixtureBoss* boss = (TFixtureBoss*)spine->getBody();
+                gpItemManager->makeShineAppearWithDemo(
+                    "reward shine", "reward camera", 1.0f, 2.0f, 3.0f);
+            }
+
+            void TTimedActor::finish() {
+                gpItemManager->makeShineAppearWithTime(
+                    "timed reward", 60, 1.0f, 2.0f, 3.0f, 0, 0, 0);
+            }
+        "#;
+        let extracted = extract_runtime_name_references(text, "src/Enemy/fixture.cpp")
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+
+        assert!(extracted["TFixtureBoss"].iter().any(|reference| {
+            reference.required
+                && reference.record_name == "reward shine"
+                && matches!(
+                    &reference.target,
+                    RuntimeNameReferenceTarget::Actor { factory_name }
+                        if factory_name == "Shine"
+                )
+        }));
+        assert!(extracted["TFixtureBoss"].iter().any(|reference| {
+            reference.record_name == "reward camera"
+                && matches!(
+                    &reference.target,
+                    RuntimeNameReferenceTarget::PlacementRecord { type_name }
+                        if type_name == "CameraMapInfo"
+                )
+        }));
+        assert_eq!(extracted["TTimedActor"][0].record_name, "timed reward");
+        assert!(!extracted["TTimedActor"][0].required);
+    }
+
+    #[test]
+    fn extracts_direct_manager_animation_folders_and_preserves_empty_overrides() {
+        let text = r#"
+            const char* cFixtureAnimationFolder = "/scene/fixtureanm";
+
+            void TFixtureManager::createAnmData() {
+                MActorAnmData* data = new MActorAnmData;
+                data->init(cFixtureAnimationFolder, (const char**)NULL);
+                unk20 = data;
+            }
+
+            void TFixtureVariantManager::createAnmData() {
+                TObjManager::createAnmData();
+            }
+        "#;
+        let extracted = extract_enemy_manager_animation_folders(text, "src/Enemy/fixture.cpp")
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            extracted["TFixtureManager"],
+            [(
+                "/scene/fixtureanm".to_string(),
+                "src/Enemy/fixture.cpp".to_string()
+            )]
+        );
+        assert!(extracted["TFixtureVariantManager"].is_empty());
+
+        let inheritance = BTreeMap::from([(
+            "TFixtureVariantManager".to_string(),
+            "TFixtureManager".to_string(),
+        )]);
+        assert!(
+            inherited_actor_models("TFixtureVariantManager", &extracted, &inheritance,)
+                .expect("explicit override")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -4409,6 +5340,41 @@ mod tests {
     }
 
     #[test]
+    fn extracts_npc_action_presets_and_matches_the_factory_family() {
+        let text = r#"
+            void TBaseNPC::setMonteActionFlag_()
+            {
+                static const u32 sBaseActionFlagTable[] = {
+                    0, 1, 2, 0x10, 0x4088,
+                };
+            }
+            void TBaseNPC::setMareActionFlag_()
+            {
+                static const u32 sBaseActionFlagTable[] = { 0, 4, 0x20 };
+            }
+        "#;
+        let presets = extract_npc_action_presets(text, "src/NPC/NpcInitActionData.cpp");
+        assert_eq!(presets.len(), 2);
+        assert_eq!(presets[0].actor_family, "Monte");
+        assert_eq!(presets[0].action_flags, [0, 1, 2, 0x10, 0x4088]);
+        assert_eq!(presets[1].actor_family, "Mare");
+        assert_eq!(presets[1].action_flags, [0, 4, 0x20]);
+
+        let registry = ObjectRegistry {
+            npc_action_presets: presets,
+            ..ObjectRegistry::default()
+        };
+        assert_eq!(
+            registry
+                .npc_action_presets_for("NPCMonteMH")
+                .unwrap()
+                .action_flags[4],
+            0x4088
+        );
+        assert!(registry.npc_action_presets_for("npcMonteMH").is_none());
+    }
+
+    #[test]
     fn extracts_map_static_model_paths_and_loader_flags_from_decomp_table() {
         let text = r#"
             static const TMapStaticObj::ActorDataTableEntry actor_data_table[] = {
@@ -4649,9 +5615,29 @@ mod tests {
         assert!(!first.is_map_obj_factory("MapObjFlag"));
         assert_eq!(
             first
+                .collision_surfaces
+                .iter()
+                .find(|surface| surface.name == "BG_TYPE_SHADED_WET_GROUND")
+                .map(|surface| surface.value),
+            Some(0x4004)
+        );
+        assert_eq!(
+            first
                 .find_map_obj_resource("FixtureMapObj")
                 .and_then(|resource| resource.primary_model.as_deref()),
             Some("FixturePrimary.bmd")
+        );
+        let fixture_resource = first.find_map_obj_resource("FixtureMapObj").unwrap();
+        assert_eq!(first.moving_collision_vertex_limit, Some(350));
+        assert_eq!(fixture_resource.collision_resources.len(), 1);
+        assert_eq!(
+            fixture_resource.collision_resources[0].resource_name,
+            "FixturePrimary"
+        );
+        assert_eq!(fixture_resource.collision_resources[0].collision_kind, 1);
+        assert_eq!(
+            fixture_resource.collision_resources[0].max_vertices,
+            Some(350)
         );
         let shared = first
             .find_map_obj_model_override("SharedFixture", "SharedFixture")
@@ -4678,6 +5664,36 @@ mod tests {
                 ..
             } if source_path.ends_with("MarNameRefGen_BossEnemy.cpp")
         ));
+    }
+
+    #[test]
+    fn collision_surface_extractor_resolves_symbolic_compositions() {
+        let definitions = extract_collision_surfaces(
+            r#"
+                enum BGTypeBits {
+                    BG_TYPE_WET_GROUND = 0x4,
+                    BG_PROPERTY_FLAG_SHADOW = 0x4000,
+                    BG_PROPERTY_FLAG_CAMERA_WONT_CLIP = 0x8000,
+                    BG_TYPE_SHADED_WET_GROUND
+                        = BG_TYPE_WET_GROUND | BG_PROPERTY_FLAG_SHADOW,
+                    BG_TYPE_CAM_NOCLIP_SHADED_WET_GROUND
+                        = BG_TYPE_WET_GROUND | BG_PROPERTY_FLAG_SHADOW
+                          | BG_PROPERTY_FLAG_CAMERA_WONT_CLIP, // 0xC004
+                };
+            "#,
+            "include/Map/MapData.hpp",
+        );
+        let by_name = definitions
+            .iter()
+            .map(|definition| (definition.name.as_str(), definition))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(by_name["BG_TYPE_SHADED_WET_GROUND"].value, 0x4004);
+        assert_eq!(
+            by_name["BG_TYPE_CAM_NOCLIP_SHADED_WET_GROUND"].value,
+            0xC004
+        );
+        assert!(by_name["BG_PROPERTY_FLAG_SHADOW"].is_property_flag);
+        assert!(!by_name["BG_TYPE_WET_GROUND"].is_property_flag);
     }
 
     #[test]
@@ -4718,8 +5734,17 @@ mod tests {
         let resource = MapObjResourceDefinition {
             resource_name: "WoodBox".to_string(),
             actor_type: 0x4000_0003,
+            object_flags: 0,
+            required_manager_name: "map object manager".to_string(),
+            has_hold_dependency: false,
+            has_move_dependency: false,
+            uses_resource_name_model_fallback: true,
             primary_model: Some("kibako.bmd".to_string()),
+            animation_resources: Vec::new(),
+            hold_model_path: None,
+            move_bck_path: None,
             load_flags: 0x1022_0000,
+            collision_resources: Vec::new(),
             source_file: "src/MoveBG/MapObjInit.cpp".to_string(),
         };
         let mut registry = ObjectRegistry {
@@ -4762,6 +5787,14 @@ mod tests {
         )
         .expect("deserialize pre-loader-flags schema");
         assert_eq!(resource.actor_type, 0);
+        assert_eq!(resource.object_flags, 0);
+        assert!(resource.required_manager_name.is_empty());
+        assert!(!resource.has_hold_dependency);
+        assert!(!resource.has_move_dependency);
+        assert!(!resource.uses_resource_name_model_fallback);
+        assert!(resource.animation_resources.is_empty());
+        assert_eq!(resource.hold_model_path, None);
+        assert_eq!(resource.move_bck_path, None);
         assert_eq!(resource.load_flags, 0x1022_0000);
 
         let map_static: MapStaticModelDefinition = toml::from_str(
@@ -4844,6 +5877,75 @@ mod tests {
                 .filter(|resource| resource.primary_model.is_none())
                 .count(),
             27
+        );
+        let normal_block = registry
+            .find_map_obj_resource("NormalBlock")
+            .expect("decomp stock NormalBlock slot");
+        assert_eq!(
+            normal_block.primary_model.as_deref(),
+            Some("NormalBlock.bmd")
+        );
+        assert_eq!(normal_block.load_flags, 0x1022_0000);
+        assert_eq!(
+            normal_block.required_manager_name,
+            "地形オブジェマネージャー"
+        );
+        assert_eq!(normal_block.collision_resources.len(), 1);
+        assert_eq!(
+            normal_block.collision_resources[0],
+            MapObjCollisionResourceDefinition {
+                resource_name: "NormalBlock".to_string(),
+                flags: 1,
+                collision_kind: 1,
+                max_vertices: Some(350),
+            }
+        );
+        let z_turn_disk = registry
+            .find_map_obj_resource("zTurnDisk")
+            .expect("decomp stock zTurnDisk slot");
+        assert!(z_turn_disk.uses_resource_name_model_fallback);
+        assert_eq!(z_turn_disk.primary_model.as_deref(), Some("zTurnDisk.bmd"));
+        assert!(!z_turn_disk.has_hold_dependency);
+        assert!(z_turn_disk.has_move_dependency);
+        assert!(z_turn_disk.animation_resources.is_empty());
+        assert_eq!(
+            z_turn_disk.move_bck_path.as_deref(),
+            Some("/scene/mapObj/zTurnDisk.bck")
+        );
+
+        let wood_barrel = registry
+            .find_map_obj_resource("wood_barrel")
+            .expect("decomp stock wood_barrel slot");
+        assert!(wood_barrel.has_hold_dependency);
+        assert!(!wood_barrel.has_move_dependency);
+        assert_eq!(
+            wood_barrel.hold_model_path.as_deref(),
+            Some("/scene/mapObj/barrel_offset.bmd")
+        );
+        assert_eq!(wood_barrel.animation_resources.len(), 7);
+        assert_eq!(
+            wood_barrel.animation_resources[0].model_name.as_deref(),
+            Some("barrel_normal.bmd")
+        );
+        assert_eq!(
+            wood_barrel.animation_resources[2].model_name.as_deref(),
+            Some("barrel_crash.bmd")
+        );
+        assert_eq!(
+            wood_barrel.animation_resources[2].animation_name.as_deref(),
+            Some("barrel_crash")
+        );
+        assert_eq!(
+            wood_barrel.animation_resources[2].bas_path.as_deref(),
+            Some("/scene/mapObj/barrel_crash.bas")
+        );
+        assert_eq!(
+            wood_barrel.animation_resources[5].animation_name.as_deref(),
+            Some("barrel_rot")
+        );
+        assert_eq!(
+            wood_barrel.animation_resources[5].bas_path.as_deref(),
+            Some("/scene/mapObj/barrel_rot.bas")
         );
         assert_eq!(
             registry
@@ -5046,6 +6148,19 @@ mod tests {
     fn complete_generator_fixture() -> SchemaFixture {
         let fixture = SchemaFixture::new("complete");
         fixture.write(
+            "include/Map/MapData.hpp",
+            r#"
+                enum BGTypeBits {
+                    BG_TYPE_WET_GROUND = 0x4,
+                    BG_TYPE_WATER = 0x100,
+                    BG_PROPERTY_FLAG_SHADOW = 0x4000,
+                    BG_PROPERTY_FLAG_CAMERA_WONT_CLIP = 0x8000,
+                    BG_TYPE_SHADED_WET_GROUND
+                        = BG_TYPE_WET_GROUND | BG_PROPERTY_FLAG_SHADOW,
+                };
+            "#,
+        );
+        fixture.write(
             "include/JSystem/J3D/J3DGraphLoader/J3DModelLoaderFlags.hpp",
             "J3DMLF_Test = 0x10000000;",
         );
@@ -5093,6 +6208,12 @@ mod tests {
         fixture.write(
             "src/MoveBG/MapObjInit.cpp",
             r#"
+                static const TMapObjCollisionData fixture_collision_data[] = {
+                    { "FixturePrimary", 1 },
+                };
+                static const TMapObjCollisionInfo fixture_collision_info = {
+                    1, 1, fixture_collision_data,
+                };
                 static const TMapObjAnimData fixture_anim_data[] = {
                     { "FixturePrimary.bmd", nullptr, 0, nullptr, nullptr },
                 };
@@ -5101,17 +6222,17 @@ mod tests {
                 };
                 static const TMapObjAnimDataInfo no_data_anim_info = { 0, 0, nullptr };
                 static TMapObjData fixture_data = {
-                    "FixtureMapObj", 0x40000001, nullptr, nullptr, &fixture_anim_info,
-                    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                    "FixtureMapObj", 0x40000001, "fixture map object manager", nullptr, &fixture_anim_info,
+                    nullptr, &fixture_collision_info, nullptr, nullptr, nullptr, nullptr, nullptr,
                     0.0f, 0x00000000, 0,
                 };
                 static TMapObjData shared_fixture_data = {
-                    "SharedFixture", 0x40000002, nullptr, nullptr, &no_data_anim_info,
+                    "SharedFixture", 0x40000002, "fixture map object manager", nullptr, &no_data_anim_info,
                     nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
                     0.0f, 0x00008000, 0,
                 };
                 static TMapObjData nozzle_box_data = {
-                    "NozzleBox", 0x40000003, nullptr, nullptr, nullptr,
+                    "NozzleBox", 0x40000003, "fixture map object manager", nullptr, nullptr,
                     nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
                     0.0f, 0x00000000, 0,
                 };
@@ -5141,6 +6262,10 @@ mod tests {
                     unkF8 = mMapObjData->unk34;
                 }
             "#,
+        );
+        fixture.write(
+            "src/Map/MapMakeData.cpp",
+            "void TMapCollisionBase::update() { Vec transformed[350]; }",
         );
         fixture.write(
             "src/MoveBG/SharedFixture.cpp",
@@ -5305,6 +6430,14 @@ mod tests {
                 static const TNpcInitInfo sExample_InitData = {
                     nullptr, {}, { { &sBody } }, 1.0f, 2.0f, 3.0f, 4.0f,
                 };
+            "#,
+        );
+        fixture.write(
+            "src/NPC/NpcInitActionData.cpp",
+            r#"
+                void TBaseNPC::setMonteActionFlag_() {
+                    static const u32 sBaseActionFlagTable[] = { 0, 1, 8, 0x4088 };
+                }
             "#,
         );
         fixture

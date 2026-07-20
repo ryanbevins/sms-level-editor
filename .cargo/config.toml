@@ -1,0 +1,3 @@
+[alias]
+regression = "run --package sms-xtask -- regression"
+gltf-fixtures = "run --package sms-xtask -- gltf-fixtures"

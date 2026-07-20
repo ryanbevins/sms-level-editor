@@ -158,7 +158,7 @@ fn load_wire_definitions(document: &StageDocument) -> Vec<WireDefinition> {
                 .to_ascii_lowercase()
                 .ends_with("/map/tables.bin")
     }) {
-        let Ok(bytes) = read_stage_asset_bytes(&asset.path) else {
+        let Ok(bytes) = document.read_asset_bytes(&asset.path) else {
             continue;
         };
         let Ok(records) = parse_jdrama_object_records(&bytes) else {
@@ -214,7 +214,7 @@ fn load_wire_style(document: &StageDocument) -> WireStyle {
                 .to_ascii_lowercase()
                 .ends_with("/map/scene.bin")
     }) {
-        let Ok(bytes) = read_stage_asset_bytes(&asset.path) else {
+        let Ok(bytes) = document.read_asset_bytes(&asset.path) else {
             continue;
         };
         let Ok(records) = parse_jdrama_object_records(&bytes) else {
@@ -443,7 +443,7 @@ fn load_wire_fitting_preview(document: &StageDocument) -> Option<J3dGeometryPrev
             )),
         ];
         for candidate in candidates {
-            let Ok(bytes) = read_stage_asset_bytes(&candidate) else {
+            let Ok(bytes) = document.read_asset_bytes(&candidate) else {
                 continue;
             };
             let Ok(file) = J3dFile::parse(&bytes) else {

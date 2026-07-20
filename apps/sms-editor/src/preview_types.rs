@@ -4,6 +4,11 @@ use super::*;
 pub(super) struct ModelPreview {
     pub(super) points: Vec<PreviewPoint>,
     pub(super) triangles: Vec<PreviewTriangle>,
+    pub(super) collision_triangles: Vec<CollisionPreviewTriangle>,
+    pub(super) collision_file_count: usize,
+    pub(super) collision_surface_count: usize,
+    pub(super) failed_collision_files: usize,
+    pub(super) collision_failures: Vec<PreviewModelFailure>,
     pub(super) textures: Vec<PreviewTexture>,
     pub(super) materials: Vec<J3dMaterial>,
     pub(super) texture_srt_animations: Vec<J3dTextureSrtAnimation>,
@@ -31,6 +36,12 @@ pub(super) struct ModelPreview {
     pub(super) actor_particles: Vec<LevelTransformParticlePreview>,
     pub(super) level_transform_duration_frames: f32,
     pub(super) level_transform_particle_end_frames: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct CollisionPreviewTriangle {
+    pub(super) vertices: [[f32; 3]; 3],
+    pub(super) surface_type: u16,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -375,6 +386,7 @@ pub(super) struct AnimatedAccessoryInstance {
 #[derive(Clone, PartialEq)]
 pub(super) struct ModelFramebufferKey {
     pub(super) stage_id: String,
+    pub(super) view_mode: ViewMode,
     pub(super) size: [usize; 2],
     pub(super) camera_focus: [u32; 3],
     pub(super) camera_yaw: u32,
@@ -385,4 +397,5 @@ pub(super) struct ModelFramebufferKey {
     pub(super) triangle_count: usize,
     pub(super) texture_count: usize,
     pub(super) source_triangles: usize,
+    pub(super) collision_triangle_count: usize,
 }

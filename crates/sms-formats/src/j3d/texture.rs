@@ -88,6 +88,51 @@ pub(super) fn decode_timg(bytes: &[u8], header_offset: usize) -> Result<J3dTextu
     let max_lod = checked_slice(FORMAT, bytes, header_offset + 0x17, 1)?[0] as i8 as f32 / 8.0;
     let mipmap_count = checked_slice(FORMAT, bytes, header_offset + 0x18, 1)?[0];
     let lod_bias = be_i16(bytes, header_offset + 0x1A, FORMAT)? as f32 / 100.0;
+    let palette_format = checked_slice(FORMAT, bytes, header_offset + 0x09, 1)?[0];
+    let palette_entry_count = be_u16(bytes, header_offset + 0x0A, FORMAT)? as usize;
+    let palette_offset = be_u32(bytes, header_offset + 0x0C, FORMAT)? as usize;
+    let palette = if matches!(format, GX_TF_C4 | GX_TF_C8 | GX_TF_C14X2) {
+        if palette_entry_count == 0 {
+            return Err(FormatError::Unsupported {
+                format: FORMAT,
+                message: "paletted texture has no palette entries".to_string(),
+            });
+        }
+        let capacity = match format {
+            GX_TF_C4 => 16,
+            GX_TF_C8 => 256,
+            GX_TF_C14X2 => 16_384,
+            _ => unreachable!(),
+        };
+        if palette_entry_count > capacity {
+            return Err(FormatError::ResourceLimit {
+                format: FORMAT,
+                resource: "GX palette entries",
+                requested: palette_entry_count,
+                limit: capacity,
+            });
+        }
+        if palette_offset == 0 {
+            return Err(FormatError::Unsupported {
+                format: FORMAT,
+                message: "paletted texture has a null palette offset".to_string(),
+            });
+        }
+        let absolute = header_offset
+            .checked_add(palette_offset)
+            .ok_or_else(|| invalid_offset(header_offset, bytes.len()))?;
+        let encoded = checked_slice(FORMAT, bytes, absolute, palette_entry_count * 2)?;
+        let mut colors = Vec::with_capacity(palette_entry_count);
+        for entry in encoded.chunks_exact(2) {
+            colors.push(decode_palette_entry(
+                palette_format,
+                u16::from_be_bytes([entry[0], entry[1]]),
+            )?);
+        }
+        Some(colors)
+    } else {
+        None
+    };
     if width == 0 || height == 0 {
         return Err(FormatError::Unsupported {
             format: FORMAT,
@@ -142,6 +187,7 @@ pub(super) fn decode_timg(bytes: &[u8], header_offset: usize) -> Result<J3dTextu
             format,
             level_width,
             level_height,
+            palette.as_deref(),
             &mut rgba,
         )?;
         mips.push(J3dTextureMipPreview {
@@ -211,6 +257,7 @@ pub(super) fn decode_texture_level(
     format: u8,
     width: u16,
     height: u16,
+    palette: Option<&[[u8; 4]]>,
     rgba: &mut [u8],
 ) -> Result<()> {
     match format {
@@ -221,6 +268,30 @@ pub(super) fn decode_texture_level(
         GX_TF_RGB565 => decode_rgb565(bytes, offset, width, height, rgba),
         GX_TF_RGB5A3 => decode_rgb5a3(bytes, offset, width, height, rgba),
         GX_TF_RGBA8 => decode_rgba8(bytes, offset, width, height, rgba),
+        GX_TF_C4 => decode_c4(
+            bytes,
+            offset,
+            width,
+            height,
+            required_palette(palette)?,
+            rgba,
+        ),
+        GX_TF_C8 => decode_c8(
+            bytes,
+            offset,
+            width,
+            height,
+            required_palette(palette)?,
+            rgba,
+        ),
+        GX_TF_C14X2 => decode_c14x2(
+            bytes,
+            offset,
+            width,
+            height,
+            required_palette(palette)?,
+            rgba,
+        ),
         GX_TF_CMPR => decode_cmpr(bytes, offset, width, height, rgba),
         _ => Err(FormatError::Unsupported {
             format: FORMAT,
@@ -231,9 +302,9 @@ pub(super) fn decode_texture_level(
 
 pub(super) fn encoded_texture_level_size(format: u8, width: u16, height: u16) -> Result<usize> {
     let (tile_width, tile_height, tile_bytes) = match format {
-        GX_TF_I4 | GX_TF_CMPR => (8usize, 8usize, 32usize),
-        GX_TF_I8 | GX_TF_IA4 => (8usize, 4usize, 32usize),
-        GX_TF_IA8 | GX_TF_RGB565 | GX_TF_RGB5A3 => (4usize, 4usize, 32usize),
+        GX_TF_I4 | GX_TF_C4 | GX_TF_CMPR => (8usize, 8usize, 32usize),
+        GX_TF_I8 | GX_TF_IA4 | GX_TF_C8 => (8usize, 4usize, 32usize),
+        GX_TF_IA8 | GX_TF_RGB565 | GX_TF_RGB5A3 | GX_TF_C14X2 => (4usize, 4usize, 32usize),
         GX_TF_RGBA8 => (4usize, 4usize, 64usize),
         _ => {
             return Err(FormatError::Unsupported {
@@ -450,6 +521,108 @@ pub(super) fn decode_rgba8(
             let ar = pixel * 2;
             let gb = 32 + pixel * 2;
             [tile[ar + 1], tile[gb], tile[gb + 1], tile[ar]]
+        },
+        rgba,
+    )
+}
+
+fn required_palette(palette: Option<&[[u8; 4]]>) -> Result<&[[u8; 4]]> {
+    palette.ok_or_else(|| FormatError::Unsupported {
+        format: FORMAT,
+        message: "paletted texture is missing decoded palette data".to_string(),
+    })
+}
+
+fn decode_palette_entry(format: u8, value: u16) -> Result<[u8; 4]> {
+    match format {
+        0 => {
+            let intensity = value as u8;
+            Ok([intensity, intensity, intensity, (value >> 8) as u8])
+        }
+        1 => Ok(rgb565_to_rgba(value)),
+        2 => Ok(rgb5a3_to_rgba(value)),
+        _ => Err(FormatError::Unsupported {
+            format: FORMAT,
+            message: format!("unsupported GX palette format {format}"),
+        }),
+    }
+}
+
+fn palette_color(palette: &[[u8; 4]], index: usize) -> [u8; 4] {
+    palette.get(index).copied().unwrap_or([0, 0, 0, 0])
+}
+
+pub(super) fn decode_c4(
+    bytes: &[u8],
+    offset: usize,
+    width: u16,
+    height: u16,
+    palette: &[[u8; 4]],
+    rgba: &mut [u8],
+) -> Result<()> {
+    decode_tiled(
+        bytes,
+        offset,
+        width,
+        height,
+        8,
+        8,
+        32,
+        |tile, x, y| {
+            let pixel = y * 8 + x;
+            let packed = tile[pixel / 2];
+            let index = if pixel.is_multiple_of(2) {
+                packed >> 4
+            } else {
+                packed & 0x0f
+            };
+            palette_color(palette, index as usize)
+        },
+        rgba,
+    )
+}
+
+pub(super) fn decode_c8(
+    bytes: &[u8],
+    offset: usize,
+    width: u16,
+    height: u16,
+    palette: &[[u8; 4]],
+    rgba: &mut [u8],
+) -> Result<()> {
+    decode_tiled(
+        bytes,
+        offset,
+        width,
+        height,
+        8,
+        4,
+        32,
+        |tile, x, y| palette_color(palette, tile[y * 8 + x] as usize),
+        rgba,
+    )
+}
+
+pub(super) fn decode_c14x2(
+    bytes: &[u8],
+    offset: usize,
+    width: u16,
+    height: u16,
+    palette: &[[u8; 4]],
+    rgba: &mut [u8],
+) -> Result<()> {
+    decode_tiled(
+        bytes,
+        offset,
+        width,
+        height,
+        4,
+        4,
+        32,
+        |tile, x, y| {
+            let pixel = (y * 4 + x) * 2;
+            let index = u16::from_be_bytes([tile[pixel], tile[pixel + 1]]) & 0x3fff;
+            palette_color(palette, index as usize)
         },
         rgba,
     )

@@ -34,6 +34,10 @@ const MAX_TEX1_RETAINED_BYTES: usize = 512 * 1024 * 1024;
 pub const SMS_MAP_MODEL_LOAD_FLAGS: u32 = 0x1002_0000;
 pub const SMS_POLLUTION_MODEL_LOAD_FLAGS: u32 = 0x1122_0000;
 pub const SMS_DEFAULT_OBJECT_MODEL_LOAD_FLAGS: u32 = 0x1022_0000;
+/// Loader flags hardcoded by Sunshine's `SmJ3DAct` constructor.
+///
+/// Source: `JSystem/JDrama/JDRSmJ3DAct.cpp` in the decompilation.
+pub const SMS_SM_J3D_ACT_MODEL_LOAD_FLAGS: u32 = 0x0024_0000;
 const GX_VA_PNMTXIDX: u32 = 0;
 const GX_VA_POS: u32 = 9;
 const GX_VA_NRM: u32 = 10;
@@ -78,6 +82,9 @@ const GX_TF_IA8: u8 = 0x3;
 const GX_TF_RGB565: u8 = 0x4;
 const GX_TF_RGB5A3: u8 = 0x5;
 const GX_TF_RGBA8: u8 = 0x6;
+const GX_TF_C4: u8 = 0x8;
+const GX_TF_C8: u8 = 0x9;
+const GX_TF_C14X2: u8 = 0xA;
 const GX_TF_CMPR: u8 = 0xE;
 const J3D_HIERARCHY_END: u16 = 0x00;
 const J3D_HIERARCHY_BEGIN_CHILD: u16 = 0x01;
@@ -420,9 +427,9 @@ pub struct J3dIndirectScale {
 pub struct J3dIndirectMaterial {
     pub enabled: bool,
     pub stage_count: u8,
-    pub orders: [Option<J3dIndirectOrder>; 3],
+    pub orders: [Option<J3dIndirectOrder>; 4],
     pub matrices: [Option<J3dIndirectMatrix>; 3],
-    pub scales: [Option<J3dIndirectScale>; 3],
+    pub scales: [Option<J3dIndirectScale>; 4],
     pub tev_stages: [J3dIndirectTevStage; 16],
 }
 
@@ -2837,7 +2844,7 @@ fn read_material_indirect(
 
     J3dIndirectMaterial {
         enabled: true,
-        stage_count: info[1].min(3),
+        stage_count: info[1].min(4),
         orders,
         matrices,
         scales,
@@ -3037,7 +3044,7 @@ fn resolve_pe_state(
 fn preview_texture_is_base_color(format: u8) -> bool {
     matches!(
         format,
-        GX_TF_RGB565 | GX_TF_RGB5A3 | GX_TF_RGBA8 | GX_TF_CMPR
+        GX_TF_RGB565 | GX_TF_RGB5A3 | GX_TF_RGBA8 | GX_TF_C4 | GX_TF_C8 | GX_TF_C14X2 | GX_TF_CMPR
     )
 }
 

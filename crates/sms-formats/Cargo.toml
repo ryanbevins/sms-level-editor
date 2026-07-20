@@ -11,3 +11,6 @@ encoding_rs.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 walkdir.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

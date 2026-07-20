@@ -750,6 +750,11 @@ fn geometry_update_preview() -> ModelPreview {
     ModelPreview {
         points: Vec::<PreviewPoint>::new(),
         triangles: vec![triangle(0, 0.0), triangle(1, 10.0)],
+        collision_triangles: Vec::new(),
+        collision_file_count: 0,
+        collision_surface_count: 0,
+        failed_collision_files: 0,
+        collision_failures: Vec::new(),
         textures: Vec::new(),
         materials: Vec::new(),
         texture_srt_animations: Vec::new(),
@@ -790,6 +795,204 @@ fn shared_static_quad_preview() -> ModelPreview {
     triangles[1].model_index = 1;
     triangles[1].vertices = [[0.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]];
     preview
+}
+
+#[test]
+fn placed_authored_hierarchy_is_submitted_to_filled_gpu_batches() {
+    use crate::model_assets::{
+        append_authored_model_instances, build_authored_model_preview, AuthoredModelPreviewKey,
+        EditorModelInstance,
+    };
+    use sms_authoring::{AssetId, ModelImportOptions, ModelInstancePlacement};
+    use sms_formats::SMS_SM_J3D_ACT_MODEL_LOAD_FLAGS;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+        "../../crates/sms-authoring/tests/fixtures/gltf/valid/hierarchy-multiprimitive/model.glb",
+    );
+    let asset = sms_authoring::import_model(source, &ModelImportOptions::default())
+        .expect("import authored hierarchy fixture")
+        .asset;
+    let bounds = asset
+        .converted_bounds()
+        .expect("compute converted bounds")
+        .expect("fixture has render bounds");
+    assert_eq!(bounds.min, [-100.0, 300.0, 400.0]);
+    assert_eq!(bounds.max, [500.0, 500.0, 750.0]);
+
+    let asset_id = AssetId::new();
+    let authored = build_authored_model_preview(&asset, SMS_SM_J3D_ACT_MODEL_LOAD_FLAGS)
+        .expect("build authored J3D preview");
+    let cache = BTreeMap::from([(
+        AuthoredModelPreviewKey {
+            asset_id,
+            loader_flags: SMS_SM_J3D_ACT_MODEL_LOAD_FLAGS,
+        },
+        Arc::new(authored),
+    )]);
+    let mut placement = ModelInstancePlacement::new(asset_id, "HierarchyFixture");
+    placement.transform[3][0] = 250.0;
+    placement.transform[3][1] = 10.0;
+    placement.transform[3][2] = -30.0;
+    let instance = EditorModelInstance {
+        stage_id: "test11".to_string(),
+        placement,
+        local_bounds: [bounds.min, bounds.max],
+    };
+
+    let mut preview = geometry_update_preview();
+    let base_triangle_count = preview.triangles.len();
+    let before = GpuSceneData::from_preview(&preview);
+    let appended = append_authored_model_instances(
+        &mut preview,
+        &cache,
+        std::slice::from_ref(&instance),
+        "test11",
+        None,
+    );
+    assert_eq!(appended, 6);
+
+    let authored_triangles = &preview.triangles[base_triangle_count..];
+    assert!(authored_triangles.iter().all(|triangle| {
+        triangle.render_layer == PreviewRenderLayer::Main
+            && triangle
+                .vertices
+                .iter()
+                .flatten()
+                .all(|value| value.is_finite())
+            && triangle
+                .material_index
+                .is_some_and(|index| index < preview.materials.len())
+    }));
+    let mut authored_min = [f32::INFINITY; 3];
+    let mut authored_max = [f32::NEG_INFINITY; 3];
+    for vertex in authored_triangles
+        .iter()
+        .flat_map(|triangle| triangle.vertices)
+    {
+        for axis in 0..3 {
+            authored_min[axis] = authored_min[axis].min(vertex[axis]);
+            authored_max[axis] = authored_max[axis].max(vertex[axis]);
+        }
+    }
+    assert_eq!(authored_min, [150.0, 310.0, 370.0]);
+    assert_eq!(authored_max, [750.0, 510.0, 720.0]);
+
+    let submitted_corner_count = |scene: &GpuSceneData| {
+        scene
+            .batches
+            .iter()
+            .map(|batch| {
+                batch
+                    .indices
+                    .as_ref()
+                    .map_or(batch.vertices.len(), Vec::len)
+            })
+            .sum::<usize>()
+    };
+    let after = GpuSceneData::from_preview(&preview);
+    assert_eq!(
+        submitted_corner_count(&after) - submitted_corner_count(&before),
+        appended * 3
+    );
+}
+
+#[test]
+fn repository_authored_textured_import_renders_non_black() {
+    use crate::model_assets::{
+        append_authored_model_instances, build_authored_model_preview, AuthoredModelPreviewKey,
+        EditorModelInstance,
+    };
+    use sms_authoring::{AssetId, ModelImportOptions, ModelInstancePlacement};
+    use sms_formats::SMS_SM_J3D_ACT_MODEL_LOAD_FLAGS;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../crates/sms-authoring/tests/fixtures/gltf/valid/material-textures/model.gltf");
+    let asset = sms_authoring::import_model(source, &ModelImportOptions::default())
+        .expect("import repository-authored textured fixture")
+        .asset;
+    let bounds = asset
+        .converted_bounds()
+        .expect("compute fixture bounds")
+        .expect("textured fixture has render bounds");
+    let authored = build_authored_model_preview(&asset, SMS_SM_J3D_ACT_MODEL_LOAD_FLAGS)
+        .expect("compile and reopen authored BMD3 preview");
+    let fixture_material = authored
+        .preview
+        .materials
+        .iter()
+        .position(|material| material.name == "Mask")
+        .expect("two-sided fixture material");
+    assert_eq!(
+        authored.preview.materials[fixture_material].tev_stages[0]
+            .order
+            .color_channel,
+        4,
+        "the base-color TEV program must select GX_COLOR0A0"
+    );
+
+    let asset_id = AssetId::new();
+    let cache = BTreeMap::from([(
+        AuthoredModelPreviewKey {
+            asset_id,
+            loader_flags: SMS_SM_J3D_ACT_MODEL_LOAD_FLAGS,
+        },
+        Arc::new(authored),
+    )]);
+    let instance = EditorModelInstance {
+        stage_id: "test11".to_string(),
+        placement: ModelInstancePlacement::new(asset_id, "MaterialFixture"),
+        local_bounds: [bounds.min, bounds.max],
+    };
+    let mut preview = geometry_update_preview();
+    preview.triangles.clear();
+    preview.textures.clear();
+    preview.materials.clear();
+    preview.material_animation_bindings.clear();
+    assert_eq!(
+        append_authored_model_instances(&mut preview, &cache, &[instance], "test11", None),
+        6
+    );
+    preview
+        .triangles
+        .retain(|triangle| triangle.material_index == Some(fixture_material));
+    assert_eq!(preview.triangles.len(), 2);
+
+    let camera_position = [0.0, 300.0, 0.0];
+    let image = render_preview_offscreen(
+        &preview,
+        GpuViewportFrame {
+            camera_position,
+            right: [1.0, 0.0, 0.0],
+            up: [0.0, 0.0, -1.0],
+            forward: [0.0, -1.0, 0.0],
+            focal: 350.0,
+            viewport_size: [512.0, 512.0],
+            viewport_pan: [0.0; 2],
+            near: 1.0,
+            animation_seconds: 0.0,
+            light_position: camera_position,
+            light_color: [1.0; 4],
+            ambient_color: Some([1.0; 4]),
+        },
+        [512, 512],
+    )
+    .expect("render repository-authored model through WGPU");
+    let colored_pixels = image
+        .pixels
+        .iter()
+        .filter(|pixel| {
+            let [red, green, blue, _] = pixel.to_srgba_unmultiplied();
+            red != 0 || green != 0 || blue != 0
+        })
+        .count();
+    assert!(
+        colored_pixels > 1_000,
+        "authored textured model rendered black ({colored_pixels} colored pixels)"
+    );
 }
 
 fn gpu_triangle_vertex_bytes(scene: &GpuSceneData, triangle_index: usize) -> &[u8] {

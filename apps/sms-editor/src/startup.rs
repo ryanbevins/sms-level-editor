@@ -59,6 +59,7 @@ pub(super) fn sms_repo_marker_exists(path: &std::path::Path) -> bool {
 
 #[derive(Debug, Default)]
 pub(super) struct EditorStartupArgs {
+    pub(super) project_file: Option<PathBuf>,
     pub(super) repo_root: Option<String>,
     pub(super) base_root: Option<String>,
     pub(super) stage_id: Option<String>,
@@ -70,10 +71,15 @@ pub(super) struct EditorStartupArgs {
 }
 
 pub(super) fn editor_startup_args() -> EditorStartupArgs {
+    editor_startup_args_from(std::env::args().skip(1))
+}
+
+fn editor_startup_args_from(args: impl IntoIterator<Item = String>) -> EditorStartupArgs {
     let mut parsed = EditorStartupArgs::default();
-    let mut args = std::env::args().skip(1);
+    let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--project" => parsed.project_file = args.next().map(PathBuf::from),
             "--repo-root" => parsed.repo_root = args.next(),
             "--base-root" => parsed.base_root = args.next(),
             "--stage" | "--stage-id" => parsed.stage_id = args.next(),
@@ -95,6 +101,14 @@ pub(super) fn editor_startup_args() -> EditorStartupArgs {
             "--camera-pitch" => {
                 parsed.camera_pitch = args.next().and_then(|value| value.parse().ok())
             }
+            _ if !arg.starts_with('-')
+                && std::path::Path::new(&arg)
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("sms")) =>
+            {
+                parsed.project_file = Some(PathBuf::from(arg));
+            }
             _ => {}
         }
     }
@@ -108,4 +122,28 @@ pub(super) fn parse_vec3_arg(value: &str) -> Option<[f32; 3]> {
     let y = parts.next()?.parse().ok()?;
     let z = parts.next()?.parse().ok()?;
     parts.next().is_none().then_some([x, y, z])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_accepts_a_positional_sms_project() {
+        let parsed = editor_startup_args_from([r"C:\Mods\Isle Delfino.sms".to_string()]);
+        assert_eq!(
+            parsed.project_file,
+            Some(PathBuf::from(r"C:\Mods\Isle Delfino.sms"))
+        );
+    }
+
+    #[test]
+    fn explicit_project_flag_accepts_a_mixed_case_extension() {
+        let parsed =
+            editor_startup_args_from(["--project".to_string(), r"C:\Mods\Bianco.SMS".to_string()]);
+        assert_eq!(
+            parsed.project_file,
+            Some(PathBuf::from(r"C:\Mods\Bianco.SMS"))
+        );
+    }
 }

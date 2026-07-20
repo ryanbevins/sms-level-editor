@@ -4,16 +4,31 @@ use regex::Regex;
 
 use super::{
     braced_body, cpp_identifier, parse_cpp_string, parse_cpp_u32, split_cpp_initializer_fields,
-    MapObjResourceDefinition,
+    MapObjAnimationResourceDefinition, MapObjCollisionResourceDefinition, MapObjResourceDefinition,
 };
 
 #[derive(Debug)]
 struct ParsedMapObjData {
     resource_name: Option<String>,
     actor_type: u32,
+    object_flags: u32,
+    required_manager_name: Option<String>,
+    has_hold_dependency: bool,
+    has_move_dependency: bool,
+    uses_resource_name_model_fallback: bool,
     primary_model: Option<String>,
+    animation_resources: Vec<MapObjAnimationResourceDefinition>,
+    hold_model_path: Option<String>,
+    move_bck_path: Option<String>,
     load_flags: u32,
+    collision_resources: Vec<MapObjCollisionResourceDefinition>,
     is_terminal: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ParsedAnimationInfo {
+    actor_count: u32,
+    resources: Vec<MapObjAnimationResourceDefinition>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,9 +152,26 @@ pub(super) fn extract_map_obj_resources(
     let reachable_data = table.iter().cloned().collect::<BTreeSet<_>>();
     let reachable_infos = referenced_anim_infos(text, &reachable_data)?;
     let reachable_arrays = referenced_anim_arrays(text, &reachable_infos)?;
-    let anim_arrays = extract_anim_array_primary_models(text, &reachable_arrays)?;
-    let anim_infos = extract_anim_info_primary_models(text, &anim_arrays, &reachable_infos)?;
-    let data = extract_map_obj_data(text, &anim_infos, &reachable_data, loader_policy)?;
+    let anim_arrays = extract_anim_arrays(text, &reachable_arrays)?;
+    let anim_infos = extract_anim_infos(text, &anim_arrays, &reachable_infos)?;
+    let reachable_collision_infos = referenced_collision_infos(text, &reachable_data)?;
+    let reachable_collision_arrays = referenced_collision_arrays(text, &reachable_collision_infos)?;
+    let collision_arrays = extract_collision_arrays(text, &reachable_collision_arrays)?;
+    let collision_infos =
+        extract_collision_infos(text, &collision_arrays, &reachable_collision_infos)?;
+    let reachable_holds = referenced_map_obj_data(text, &reachable_data, 10, "hold")?;
+    let hold_models = extract_hold_models(text, &reachable_holds)?;
+    let reachable_moves = referenced_map_obj_data(text, &reachable_data, 11, "move")?;
+    let move_bcks = extract_move_bcks(text, &reachable_moves)?;
+    let data = extract_map_obj_data(
+        text,
+        &anim_infos,
+        &collision_infos,
+        &hold_models,
+        &move_bcks,
+        &reachable_data,
+        loader_policy,
+    )?;
 
     let mut definitions = Vec::new();
     let mut seen_variables = BTreeSet::new();
@@ -173,8 +205,21 @@ pub(super) fn extract_map_obj_resources(
         definitions.push(MapObjResourceDefinition {
             resource_name,
             actor_type: record.actor_type,
+            object_flags: record.object_flags,
+            required_manager_name: record.required_manager_name.clone().ok_or_else(|| {
+                format!(
+                    "non-terminal sObjDataTable entry {variable} has no required TLiveManager name"
+                )
+            })?,
+            has_hold_dependency: record.has_hold_dependency,
+            has_move_dependency: record.has_move_dependency,
+            uses_resource_name_model_fallback: record.uses_resource_name_model_fallback,
             primary_model: record.primary_model.clone(),
+            animation_resources: record.animation_resources.clone(),
+            hold_model_path: record.hold_model_path.clone(),
+            move_bck_path: record.move_bck_path.clone(),
             load_flags: record.load_flags,
+            collision_resources: record.collision_resources.clone(),
             source_file: source_file.to_string(),
         });
     }
@@ -184,14 +229,15 @@ pub(super) fn extract_map_obj_resources(
     Ok(definitions)
 }
 
-fn extract_anim_array_primary_models(
+fn extract_anim_arrays(
     text: &str,
     reachable: &BTreeSet<String>,
-) -> Result<BTreeMap<String, Option<String>>, String> {
+) -> Result<BTreeMap<String, Vec<MapObjAnimationResourceDefinition>>, String> {
     let declaration = Regex::new(
         r"static\s+const\s+TMapObjAnimData\s+([A-Za-z_][A-Za-z0-9_]*)\s*\[\s*\]\s*=\s*\{",
     )
     .expect("valid TMapObjAnimData regex");
+    let entry_re = Regex::new(r"\{([^{}]*)\}").expect("valid animation-data entry regex");
     let mut arrays = BTreeMap::new();
     for captures in declaration.captures_iter(text) {
         if !reachable.contains(&captures[1]) {
@@ -202,32 +248,51 @@ fn extract_anim_array_primary_models(
             .ok_or_else(|| "missing animation-array declaration match".to_string())?;
         let body = braced_body(text, whole.end() - 1)
             .ok_or_else(|| format!("unterminated animation array {}", &captures[1]))?;
-        let first_entry_open = body
-            .find('{')
-            .ok_or_else(|| format!("animation array {} has no entries", &captures[1]))?;
-        let first_entry = braced_body(body, first_entry_open).ok_or_else(|| {
-            format!(
-                "unterminated first entry in animation array {}",
-                &captures[1]
-            )
-        })?;
-        let fields = split_cpp_initializer_fields(first_entry);
-        let primary_model = fields.first().and_then(|field| parse_cpp_string(field));
-        if arrays
-            .insert(captures[1].to_string(), primary_model)
-            .is_some()
-        {
+        let mut resources = Vec::new();
+        for entry in entry_re.captures_iter(body) {
+            let fields = split_cpp_initializer_fields(&entry[1]);
+            if fields.len() != 5 {
+                return Err(format!(
+                    "animation array {} has an entry with {} fields; expected 5",
+                    &captures[1],
+                    fields.len()
+                ));
+            }
+            let channel = parse_cpp_u32(fields[2]).ok_or_else(|| {
+                format!(
+                    "animation array {} has a non-numeric animation channel",
+                    &captures[1]
+                )
+            })?;
+            let animation_channel = u8::try_from(channel).map_err(|_| {
+                format!(
+                    "animation array {} has an animation channel exceeding u8",
+                    &captures[1]
+                )
+            })?;
+            resources.push(MapObjAnimationResourceDefinition {
+                model_name: parse_cpp_string(fields[0]),
+                animation_name: parse_cpp_string(fields[1]),
+                animation_channel,
+                extra_name: parse_cpp_string(fields[3]),
+                bas_path: parse_cpp_string(fields[4]),
+            });
+        }
+        if resources.is_empty() {
+            return Err(format!("animation array {} has no entries", &captures[1]));
+        }
+        if arrays.insert(captures[1].to_string(), resources).is_some() {
             return Err(format!("duplicate animation array {}", &captures[1]));
         }
     }
     Ok(arrays)
 }
 
-fn extract_anim_info_primary_models(
+fn extract_anim_infos(
     text: &str,
-    arrays: &BTreeMap<String, Option<String>>,
+    arrays: &BTreeMap<String, Vec<MapObjAnimationResourceDefinition>>,
     reachable: &BTreeSet<String>,
-) -> Result<BTreeMap<String, Option<String>>, String> {
+) -> Result<BTreeMap<String, ParsedAnimationInfo>, String> {
     let declaration =
         Regex::new(r"static\s+const\s+TMapObjAnimDataInfo\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\{")
             .expect("valid TMapObjAnimDataInfo regex");
@@ -249,40 +314,61 @@ fn extract_anim_info_primary_models(
                 fields.len()
             ));
         }
+        let entry_count = parse_cpp_u32(fields[0]).ok_or_else(|| {
+            format!(
+                "animation info {} has a non-numeric entry count",
+                &captures[1]
+            )
+        })? as usize;
         let actor_count = parse_cpp_u32(fields[1]).ok_or_else(|| {
             format!(
                 "animation info {} has a non-numeric actor count",
                 &captures[1]
             )
         })?;
-        let primary_model = if actor_count == 0 {
-            None
+        let resources = if entry_count == 0 {
+            Vec::new()
         } else {
             let array_name = cpp_identifier(fields[2]).ok_or_else(|| {
                 format!(
-                    "animation info {} has actors but no animation array",
+                    "animation info {} has entries but no animation array",
                     &captures[1]
                 )
             })?;
-            arrays
-                .get(array_name)
-                .ok_or_else(|| {
-                    format!(
-                        "animation info {} references unknown array {array_name}",
-                        &captures[1]
-                    )
-                })?
-                .clone()
-                .ok_or_else(|| {
-                    format!(
-                        "animation info {} has actors but its first model is null",
-                        &captures[1]
-                    )
-                })
-                .map(Some)?
+            let array = arrays.get(array_name).ok_or_else(|| {
+                format!(
+                    "animation info {} references unknown array {array_name}",
+                    &captures[1]
+                )
+            })?;
+            if entry_count > array.len() {
+                return Err(format!(
+                    "animation info {} requests {entry_count} entries from {array_name}, which has {}",
+                    &captures[1],
+                    array.len()
+                ));
+            }
+            array[..entry_count].to_vec()
         };
+        if actor_count > 0
+            && resources
+                .first()
+                .and_then(|resource| resource.model_name.as_deref())
+                .is_none()
+        {
+            return Err(format!(
+                "animation info {} has actors but its first model is null",
+                &captures[1]
+            ));
+        }
         if infos
-            .insert(captures[1].to_string(), primary_model)
+            .insert(
+                captures[1].to_string(),
+                ParsedAnimationInfo {
+                    actor_count,
+                    resources,
+                },
+            )
             .is_some()
         {
             return Err(format!("duplicate animation info {}", &captures[1]));
@@ -291,9 +377,287 @@ fn extract_anim_info_primary_models(
     Ok(infos)
 }
 
+fn referenced_map_obj_data(
+    text: &str,
+    reachable_data: &BTreeSet<String>,
+    field_index: usize,
+    label: &str,
+) -> Result<BTreeSet<String>, String> {
+    let declaration = Regex::new(r"static\s+TMapObjData\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\{")
+        .expect("valid TMapObjData regex");
+    let identifier = Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*$").expect("valid C++ identifier regex");
+    let mut referenced = BTreeSet::new();
+    for captures in declaration.captures_iter(text) {
+        if !reachable_data.contains(&captures[1]) {
+            continue;
+        }
+        let whole = captures
+            .get(0)
+            .ok_or_else(|| "missing reachable map-object declaration match".to_string())?;
+        let body = braced_body(text, whole.end() - 1)
+            .ok_or_else(|| format!("unterminated map-object data {}", &captures[1]))?;
+        let fields = split_cpp_initializer_fields(body);
+        if fields.len() < 15 {
+            return Err(format!(
+                "map-object data {} has {} fields; expected at least 15",
+                &captures[1],
+                fields.len()
+            ));
+        }
+        if let Some(variable) = cpp_identifier(fields[field_index]) {
+            if !identifier.is_match(variable) {
+                return Err(format!(
+                    "map-object data {} has a non-identifier {label} dependency {variable:?}",
+                    &captures[1]
+                ));
+            }
+            referenced.insert(variable.to_string());
+        }
+    }
+    Ok(referenced)
+}
+
+fn extract_hold_models(
+    text: &str,
+    reachable: &BTreeSet<String>,
+) -> Result<BTreeMap<String, String>, String> {
+    let declaration = Regex::new(r"static\s+TMapObjHoldData\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\{")
+        .expect("valid TMapObjHoldData regex");
+    let mut models = BTreeMap::new();
+    for captures in declaration.captures_iter(text) {
+        if !reachable.contains(&captures[1]) {
+            continue;
+        }
+        let whole = captures
+            .get(0)
+            .ok_or_else(|| "missing hold-data declaration match".to_string())?;
+        let body = braced_body(text, whole.end() - 1)
+            .ok_or_else(|| format!("unterminated hold data {}", &captures[1]))?;
+        let fields = split_cpp_initializer_fields(body);
+        if fields.len() < 2 {
+            return Err(format!(
+                "hold data {} has {} fields; expected at least 2",
+                &captures[1],
+                fields.len()
+            ));
+        }
+        let model_path = parse_cpp_string(fields[0])
+            .ok_or_else(|| format!("hold data {} has no model path", &captures[1]))?;
+        if models.insert(captures[1].to_string(), model_path).is_some() {
+            return Err(format!("duplicate hold data {}", &captures[1]));
+        }
+    }
+    Ok(models)
+}
+
+fn extract_move_bcks(
+    text: &str,
+    reachable: &BTreeSet<String>,
+) -> Result<BTreeMap<String, String>, String> {
+    let declaration = Regex::new(r"static\s+TMapObjMoveData\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\{")
+        .expect("valid TMapObjMoveData regex");
+    let mut bcks = BTreeMap::new();
+    for captures in declaration.captures_iter(text) {
+        if !reachable.contains(&captures[1]) {
+            continue;
+        }
+        let whole = captures
+            .get(0)
+            .ok_or_else(|| "missing move-data declaration match".to_string())?;
+        let body = braced_body(text, whole.end() - 1)
+            .ok_or_else(|| format!("unterminated move data {}", &captures[1]))?;
+        let fields = split_cpp_initializer_fields(body);
+        let bck_path = fields
+            .first()
+            .and_then(|field| parse_cpp_string(field))
+            .ok_or_else(|| format!("move data {} has no BCK path", &captures[1]))?;
+        if bcks.insert(captures[1].to_string(), bck_path).is_some() {
+            return Err(format!("duplicate move data {}", &captures[1]));
+        }
+    }
+    Ok(bcks)
+}
+
+fn referenced_collision_infos(
+    text: &str,
+    reachable_data: &BTreeSet<String>,
+) -> Result<BTreeSet<String>, String> {
+    let declaration = Regex::new(r"static\s+TMapObjData\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\{")
+        .expect("valid TMapObjData regex");
+    let mut infos = BTreeSet::new();
+    for captures in declaration.captures_iter(text) {
+        if !reachable_data.contains(&captures[1]) {
+            continue;
+        }
+        let whole = captures
+            .get(0)
+            .ok_or_else(|| "missing reachable map-object declaration match".to_string())?;
+        let body = braced_body(text, whole.end() - 1)
+            .ok_or_else(|| format!("unterminated map-object data {}", &captures[1]))?;
+        let fields = split_cpp_initializer_fields(body);
+        if fields.len() < 15 {
+            return Err(format!(
+                "map-object data {} has {} fields; expected at least 15",
+                &captures[1],
+                fields.len()
+            ));
+        }
+        if let Some(info) = cpp_identifier(fields[6]) {
+            infos.insert(info.to_string());
+        }
+    }
+    Ok(infos)
+}
+
+fn referenced_collision_arrays(
+    text: &str,
+    reachable_infos: &BTreeSet<String>,
+) -> Result<BTreeSet<String>, String> {
+    let declaration =
+        Regex::new(r"static\s+const\s+TMapObjCollisionInfo\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\{")
+            .expect("valid TMapObjCollisionInfo regex");
+    let mut arrays = BTreeSet::new();
+    for captures in declaration.captures_iter(text) {
+        if !reachable_infos.contains(&captures[1]) {
+            continue;
+        }
+        let whole = captures
+            .get(0)
+            .ok_or_else(|| "missing collision-info declaration match".to_string())?;
+        let body = braced_body(text, whole.end() - 1)
+            .ok_or_else(|| format!("unterminated collision info {}", &captures[1]))?;
+        let fields = split_cpp_initializer_fields(body);
+        if fields.len() < 3 {
+            return Err(format!(
+                "collision info {} has {} fields; expected 3",
+                &captures[1],
+                fields.len()
+            ));
+        }
+        let array = cpp_identifier(fields[2]).ok_or_else(|| {
+            format!(
+                "collision info {} has no collision-data array",
+                &captures[1]
+            )
+        })?;
+        arrays.insert(array.to_string());
+    }
+    Ok(arrays)
+}
+
+fn extract_collision_arrays(
+    text: &str,
+    reachable_arrays: &BTreeSet<String>,
+) -> Result<BTreeMap<String, Vec<MapObjCollisionResourceDefinition>>, String> {
+    let declaration = Regex::new(
+        r"static\s+const\s+TMapObjCollisionData\s+([A-Za-z_][A-Za-z0-9_]*)\s*\[\s*\]\s*=\s*\{",
+    )
+    .expect("valid TMapObjCollisionData regex");
+    let entry_re = Regex::new(r"\{([^{}]*)\}").expect("valid collision-data entry regex");
+    let mut arrays = BTreeMap::new();
+    for captures in declaration.captures_iter(text) {
+        if !reachable_arrays.contains(&captures[1]) {
+            continue;
+        }
+        let whole = captures
+            .get(0)
+            .ok_or_else(|| "missing collision-array declaration match".to_string())?;
+        let body = braced_body(text, whole.end() - 1)
+            .ok_or_else(|| format!("unterminated collision array {}", &captures[1]))?;
+        let mut resources = Vec::new();
+        for entry in entry_re.captures_iter(body) {
+            let fields = split_cpp_initializer_fields(&entry[1]);
+            if fields.len() < 2 {
+                return Err(format!(
+                    "collision array {} has an entry with fewer than 2 fields",
+                    &captures[1]
+                ));
+            }
+            let resource_name = parse_cpp_string(fields[0]).unwrap_or_default();
+            let flags = parse_cpp_u32(fields[1])
+                .ok_or_else(|| format!("collision array {} has non-numeric flags", &captures[1]))?;
+            let flags = u16::try_from(flags)
+                .map_err(|_| format!("collision array {} flags exceed u16", &captures[1]))?;
+            resources.push(MapObjCollisionResourceDefinition {
+                resource_name,
+                flags,
+                collision_kind: (flags & 3) as u8,
+                max_vertices: None,
+            });
+        }
+        if arrays.insert(captures[1].to_string(), resources).is_some() {
+            return Err(format!("duplicate collision array {}", &captures[1]));
+        }
+    }
+    Ok(arrays)
+}
+
+fn extract_collision_infos(
+    text: &str,
+    arrays: &BTreeMap<String, Vec<MapObjCollisionResourceDefinition>>,
+    reachable_infos: &BTreeSet<String>,
+) -> Result<BTreeMap<String, Vec<MapObjCollisionResourceDefinition>>, String> {
+    let declaration =
+        Regex::new(r"static\s+const\s+TMapObjCollisionInfo\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\{")
+            .expect("valid TMapObjCollisionInfo regex");
+    let mut infos = BTreeMap::new();
+    for captures in declaration.captures_iter(text) {
+        if !reachable_infos.contains(&captures[1]) {
+            continue;
+        }
+        let whole = captures
+            .get(0)
+            .ok_or_else(|| "missing collision-info declaration match".to_string())?;
+        let body = braced_body(text, whole.end() - 1)
+            .ok_or_else(|| format!("unterminated collision info {}", &captures[1]))?;
+        let fields = split_cpp_initializer_fields(body);
+        if fields.len() < 3 {
+            return Err(format!(
+                "collision info {} has {} fields; expected 3",
+                &captures[1],
+                fields.len()
+            ));
+        }
+        let count = parse_cpp_u32(fields[0])
+            .ok_or_else(|| format!("collision info {} has non-numeric count", &captures[1]))?
+            as usize;
+        let array_name = cpp_identifier(fields[2]).ok_or_else(|| {
+            format!(
+                "collision info {} has no collision-data array",
+                &captures[1]
+            )
+        })?;
+        let array = arrays.get(array_name).ok_or_else(|| {
+            format!(
+                "collision info {} references unknown array {array_name}",
+                &captures[1]
+            )
+        })?;
+        if count > array.len() {
+            return Err(format!(
+                "collision info {} requests {count} entries from {array_name}, which has {}",
+                &captures[1],
+                array.len()
+            ));
+        }
+        infos.insert(
+            captures[1].to_string(),
+            array[..count]
+                .iter()
+                .filter(|resource| !resource.resource_name.is_empty())
+                .cloned()
+                .collect(),
+        );
+    }
+    Ok(infos)
+}
+
 fn extract_map_obj_data(
     text: &str,
-    infos: &BTreeMap<String, Option<String>>,
+    infos: &BTreeMap<String, ParsedAnimationInfo>,
+    collision_infos: &BTreeMap<String, Vec<MapObjCollisionResourceDefinition>>,
+    hold_models: &BTreeMap<String, String>,
+    move_bcks: &BTreeMap<String, String>,
     reachable: &BTreeSet<String>,
     loader_policy: MapObjModelLoaderPolicy,
 ) -> Result<BTreeMap<String, ParsedMapObjData>, String> {
@@ -330,20 +694,71 @@ fn extract_map_obj_data(
                 &captures[1]
             )
         })?;
-        let primary_model = match cpp_identifier(fields[4]) {
-            Some(info_name) => infos.get(info_name).cloned().ok_or_else(|| {
+        let required_manager_name = parse_cpp_string(fields[2]);
+        let animation_info = cpp_identifier(fields[4]);
+        let (primary_model, animation_resources) = match animation_info {
+            Some(info_name) => {
+                let info = infos.get(info_name).ok_or_else(|| {
+                    format!(
+                        "map-object data {} references unknown animation info {info_name}",
+                        &captures[1]
+                    )
+                })?;
+                let primary_model = (info.actor_count > 0)
+                    .then(|| {
+                        info.resources
+                            .first()
+                            .and_then(|resource| resource.model_name.clone())
+                    })
+                    .flatten();
+                (primary_model, info.resources.clone())
+            }
+            None => (
+                resource_name.as_ref().map(|name| format!("{name}.bmd")),
+                Vec::new(),
+            ),
+        };
+        let collision_resources = match cpp_identifier(fields[6]) {
+            Some(info_name) => collision_infos.get(info_name).cloned().ok_or_else(|| {
                 format!(
-                    "map-object data {} references unknown animation info {info_name}",
+                    "map-object data {} references unknown collision info {info_name}",
                     &captures[1]
                 )
             })?,
-            None => resource_name.as_ref().map(|name| format!("{name}.bmd")),
+            None => Vec::new(),
+        };
+        let hold_model_path = match cpp_identifier(fields[10]) {
+            Some(hold_name) => Some(hold_models.get(hold_name).cloned().ok_or_else(|| {
+                format!(
+                    "map-object data {} references unknown hold data {hold_name}",
+                    &captures[1]
+                )
+            })?),
+            None => None,
+        };
+        let move_bck_path = match cpp_identifier(fields[11]) {
+            Some(move_name) => Some(move_bcks.get(move_name).cloned().ok_or_else(|| {
+                format!(
+                    "map-object data {} references unknown move data {move_name}",
+                    &captures[1]
+                )
+            })?),
+            None => None,
         };
         let record = ParsedMapObjData {
             resource_name,
             actor_type,
+            object_flags: map_obj_flags,
+            required_manager_name,
+            has_hold_dependency: hold_model_path.is_some(),
+            has_move_dependency: move_bck_path.is_some(),
+            uses_resource_name_model_fallback: animation_info.is_none(),
             primary_model,
+            animation_resources,
+            hold_model_path,
+            move_bck_path,
             load_flags: loader_policy.effective_load_flags(map_obj_flags),
+            collision_resources,
             is_terminal: actor_type == 0,
         };
         if data.insert(captures[1].to_string(), record).is_some() {
@@ -409,16 +824,16 @@ fn referenced_anim_arrays(
                 fields.len()
             ));
         }
-        let actor_count = parse_cpp_u32(fields[1]).ok_or_else(|| {
+        let entry_count = parse_cpp_u32(fields[0]).ok_or_else(|| {
             format!(
-                "animation info {} has a non-numeric actor count",
+                "animation info {} has a non-numeric entry count",
                 &captures[1]
             )
         })?;
-        if actor_count != 0 {
+        if entry_count != 0 {
             let array = cpp_identifier(fields[2]).ok_or_else(|| {
                 format!(
-                    "animation info {} has actors but no animation array",
+                    "animation info {} has entries but no animation array",
                     &captures[1]
                 )
             })?;
@@ -478,25 +893,33 @@ mod tests {
             0, 0, nullptr,
         };
         static const TMapObjAnimData wood_anim_data[] = {
-            { "kibako.bmd", nullptr, 0, nullptr, nullptr },
+            { "kibako.bmd", "wood_wait", 0, "wood_extra", "/scene/mapObj/wood_wait.bas" },
+            { "kibako_break.bmd", "wood_break", 5, nullptr, nullptr },
+            { "ignored_tail.bmd", "ignored_tail", 0, nullptr, nullptr },
         };
         static const TMapObjAnimDataInfo wood_anim_info = {
-            1, 1, wood_anim_data,
+            2, 2, wood_anim_data,
+        };
+        static TMapObjHoldData fruit_hold_data = {
+            "/scene/mapObj/fruit_offset.bmd", "fruit_center",
+        };
+        static TMapObjMoveData fruit_move_data = {
+            "/scene/mapObj/fruit_move.bck",
         };
         static TMapObjData stray_data = {
             "Stray", 0x40000001, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
             nullptr, nullptr, nullptr, nullptr, 0.0f, 0x00000000, 0,
         };
         static TMapObjData fruit_data = {
-            "FruitPapaya", 0x40000002, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-            nullptr, nullptr, nullptr, nullptr, 0.0f, 0x00008000, 0,
+            "FruitPapaya", 0x40000002, "fruit manager", nullptr, nullptr, nullptr, nullptr, nullptr,
+            nullptr, nullptr, &fruit_hold_data, &fruit_move_data, 0.0f, 0x00008000, 0,
         };
         static TMapObjData wood_data = {
-            "WoodBox", 0x40000003, nullptr, nullptr, &wood_anim_info, nullptr, nullptr, nullptr,
+            "WoodBox", 0x40000003, "wood manager", nullptr, &wood_anim_info, nullptr, nullptr, nullptr,
             nullptr, nullptr, nullptr, nullptr, 0.0f, 0x00000000, 0,
         };
         static TMapObjData controller_data = {
-            "Controller", 0x40000004, nullptr, nullptr, &no_data_anim_info, nullptr, nullptr,
+            "Controller", 0x40000004, "controller manager", nullptr, &no_data_anim_info, nullptr, nullptr,
             nullptr, nullptr, nullptr, nullptr, nullptr, 0.0f, 0x00000000, 0,
         };
         static TMapObjData end_data = {
@@ -520,16 +943,79 @@ mod tests {
         );
         assert_eq!(resources[0].primary_model.as_deref(), Some("kibako.bmd"));
         assert_eq!(resources[0].actor_type, 0x4000_0003);
+        assert_eq!(resources[0].object_flags, 0);
+        assert_eq!(resources[0].required_manager_name, "wood manager");
+        assert!(!resources[0].uses_resource_name_model_fallback);
         assert_eq!(resources[0].load_flags, 0x1022_0000);
+        assert_eq!(
+            resources[0].animation_resources,
+            vec![
+                MapObjAnimationResourceDefinition {
+                    model_name: Some("kibako.bmd".to_string()),
+                    animation_name: Some("wood_wait".to_string()),
+                    animation_channel: 0,
+                    extra_name: Some("wood_extra".to_string()),
+                    bas_path: Some("/scene/mapObj/wood_wait.bas".to_string()),
+                },
+                MapObjAnimationResourceDefinition {
+                    model_name: Some("kibako_break.bmd".to_string()),
+                    animation_name: Some("wood_break".to_string()),
+                    animation_channel: 5,
+                    extra_name: None,
+                    bas_path: None,
+                },
+            ]
+        );
+        assert_eq!(resources[0].hold_model_path, None);
+        assert_eq!(resources[0].move_bck_path, None);
         assert_eq!(
             resources[1].primary_model.as_deref(),
             Some("FruitPapaya.bmd")
         );
+        assert_eq!(resources[1].object_flags, 0x0000_8000);
+        assert_eq!(resources[1].required_manager_name, "fruit manager");
+        assert!(resources[1].has_hold_dependency);
+        assert!(resources[1].has_move_dependency);
+        assert!(resources[1].uses_resource_name_model_fallback);
         assert_eq!(resources[1].load_flags, 0x1122_0000);
+        assert!(resources[1].animation_resources.is_empty());
+        assert_eq!(
+            resources[1].hold_model_path.as_deref(),
+            Some("/scene/mapObj/fruit_offset.bmd")
+        );
+        assert_eq!(
+            resources[1].move_bck_path.as_deref(),
+            Some("/scene/mapObj/fruit_move.bck")
+        );
         assert_eq!(resources[2].primary_model, None);
+        assert_eq!(resources[2].required_manager_name, "controller manager");
+        assert!(!resources[2].has_hold_dependency);
+        assert!(!resources[2].has_move_dependency);
+        assert!(resources[2].animation_resources.is_empty());
         assert!(!resources
             .iter()
             .any(|resource| resource.resource_name == "Stray"));
+    }
+
+    #[test]
+    fn null_animation_fallback_does_not_hide_hold_or_move_dependencies() {
+        let resources = extract_map_obj_resources(FIXTURE, "src/MoveBG/MapObjInit.cpp").unwrap();
+        let fruit = resources
+            .iter()
+            .find(|resource| resource.resource_name == "FruitPapaya")
+            .unwrap();
+        assert!(fruit.uses_resource_name_model_fallback);
+        assert_eq!(fruit.primary_model.as_deref(), Some("FruitPapaya.bmd"));
+        assert!(fruit.has_hold_dependency);
+        assert!(fruit.has_move_dependency);
+        assert_eq!(
+            fruit.hold_model_path.as_deref(),
+            Some("/scene/mapObj/fruit_offset.bmd")
+        );
+        assert_eq!(
+            fruit.move_bck_path.as_deref(),
+            Some("/scene/mapObj/fruit_move.bck")
+        );
     }
 
     #[test]
@@ -560,13 +1046,23 @@ mod tests {
     fn rejects_malformed_reachable_map_obj_declarations() {
         let text = FIXTURE.replace(
             r#"static TMapObjData fruit_data = {
-            "FruitPapaya", 0x40000002, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-            nullptr, nullptr, nullptr, nullptr, 0.0f, 0x00008000, 0,
+            "FruitPapaya", 0x40000002, "fruit manager", nullptr, nullptr, nullptr, nullptr, nullptr,
+            nullptr, nullptr, &fruit_hold_data, &fruit_move_data, 0.0f, 0x00008000, 0,
         };"#,
             r#"static TMapObjData fruit_data = { "FruitPapaya" };"#,
         );
         let error = extract_map_obj_resources(&text, "fixture.cpp").unwrap_err();
         assert!(error.contains("fruit_data has 1 fields"), "{error}");
+    }
+
+    #[test]
+    fn rejects_a_reachable_resource_without_its_runtime_manager_name() {
+        let text = FIXTURE.replacen("\"wood manager\"", "nullptr", 1);
+        let error = extract_map_obj_resources(&text, "fixture.cpp").unwrap_err();
+        assert!(
+            error.contains("wood_data has no required TLiveManager name"),
+            "{error}"
+        );
     }
 
     #[test]

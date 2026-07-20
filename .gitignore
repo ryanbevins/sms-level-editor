@@ -1,4 +1,5 @@
 /target/
+/apps/sms-editor/target/
 
 # Local editor projects, extracted retail data, and generated mod output.
 smsmod.toml

@@ -56,7 +56,7 @@ pub(super) fn load_actor_particle_effects(document: &StageDocument) -> BTreeMap<
         .iter()
         .filter(|asset| asset.kind == StageAssetKind::Particle)
     {
-        resolve_actor_particle_asset(&requested_resources, asset, &mut effects);
+        resolve_actor_particle_asset(document, &requested_resources, asset, &mut effects);
     }
     if effects.len() == requested_resources.len() {
         return effects;
@@ -84,7 +84,7 @@ pub(super) fn load_actor_particle_effects(document: &StageDocument) -> BTreeMap<
             path: path.clone(),
             kind: StageAssetKind::Particle,
         };
-        resolve_actor_particle_asset(&requested_resources, &asset, &mut effects);
+        resolve_actor_particle_asset(document, &requested_resources, &asset, &mut effects);
     }
     for archive in files.iter().filter(|path| {
         path.extension()
@@ -100,7 +100,7 @@ pub(super) fn load_actor_particle_effects(document: &StageDocument) -> BTreeMap<
             .iter()
             .filter(|asset| asset.kind == StageAssetKind::Particle)
         {
-            resolve_actor_particle_asset(&requested_resources, asset, &mut effects);
+            resolve_actor_particle_asset(document, &requested_resources, asset, &mut effects);
         }
         if effects.len() == requested_resources.len() {
             break;
@@ -144,6 +144,7 @@ fn collect_particle_resource_candidates(
 }
 
 fn resolve_actor_particle_asset(
+    document: &StageDocument,
     requested: &BTreeMap<u16, String>,
     asset: &StageAsset,
     effects: &mut BTreeMap<u16, JpaEffect>,
@@ -169,7 +170,7 @@ fn resolve_actor_particle_asset(
         if !matches {
             continue;
         }
-        let Ok(bytes) = read_stage_asset_bytes(&asset.path) else {
+        let Ok(bytes) = document.read_asset_bytes(&asset.path) else {
             continue;
         };
         if let Ok(effect) = JpaEffect::parse(&bytes) {
@@ -299,7 +300,7 @@ pub(super) fn push_level_transform_particle_previews(
         let Some(group) = particle_pair_group(&normalized) else {
             continue;
         };
-        let Ok(bytes) = read_stage_asset_bytes(&asset.path) else {
+        let Ok(bytes) = document.read_asset_bytes(&asset.path) else {
             continue;
         };
         let Ok(effect) = JpaEffect::parse(&bytes) else {
