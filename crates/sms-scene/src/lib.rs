@@ -44,9 +44,9 @@ pub(crate) use object_parameters::validate_object_parameter_links;
 pub use object_parameters::{
     apply_all_object_parameters, apply_dirty_object_parameter_edits, apply_object_parameter_edits,
     editable_object_parameters, editable_parameters_for_object, seed_scene_object_parameters,
-    sync_scene_object_parameter_aliases, EditableSceneParameter, ObjectParameterChoice,
-    ObjectParameterIndexedChoice, ObjectParameterInfo, ObjectParameterKind, ParameterApplyMode,
-    OBJECT_PARAMETER_CHARACTER_NAME, OBJECT_PARAMETER_NAME,
+    sync_scene_object_parameter_aliases, EditableSceneParameter, ObjectParameterBitFlag,
+    ObjectParameterChoice, ObjectParameterIndexedChoice, ObjectParameterInfo, ObjectParameterKind,
+    ParameterApplyMode, OBJECT_PARAMETER_CHARACTER_NAME, OBJECT_PARAMETER_NAME,
 };
 pub use stage_archive::{
     SourceFreeStageArchive, StageCompression, StageObjectPlacement, StageOrigin, StageResource,

@@ -1,6 +1,49 @@
 use super::*;
 
 #[test]
+fn monte_palette_entries_use_friendly_pianta_names() {
+    let object = ObjectDefinition {
+        factory_name: "NPCMonteMH".to_string(),
+        class_name: "TMonteMH".to_string(),
+        category: "NPC".to_string(),
+        source: sms_schema::SchemaSource::MarNameRefGen,
+        display_name: None,
+        preview_model: None,
+        hidden: false,
+        unsafe_to_edit: false,
+    };
+    assert_eq!(
+        crate::ui_panels::object_palette_display_name(&object),
+        "Pianta - Male (Variant H)"
+    );
+
+    let mut female = object;
+    female.factory_name = "NPCMonteW".to_string();
+    assert_eq!(
+        crate::ui_panels::object_palette_display_name(&female),
+        "Pianta - Female"
+    );
+}
+
+#[test]
+fn nozzle_box_palette_entry_uses_a_readable_name() {
+    let object = ObjectDefinition {
+        factory_name: "NozzleBox".to_string(),
+        class_name: "TNozzleBox".to_string(),
+        category: "MapObj".to_string(),
+        source: sms_schema::SchemaSource::MarNameRefGen,
+        display_name: None,
+        preview_model: None,
+        hidden: false,
+        unsafe_to_edit: false,
+    };
+    assert_eq!(
+        crate::ui_panels::object_palette_display_name(&object),
+        "Nozzle Box"
+    );
+}
+
+#[test]
 fn editor_layout_defaults_to_the_unreal_style_workspace() {
     let app = SmsEditorApp::default();
 

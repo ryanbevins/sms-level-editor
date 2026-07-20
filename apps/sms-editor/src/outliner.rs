@@ -4,6 +4,8 @@ use eframe::egui;
 use sms_formats::{JDramaRecord, JDramaRecordPayload};
 use sms_scene::{PlacementBinding, SceneObject, StageDocument, StageResourceDocument};
 
+use crate::game_text::{bilingual_object_name, bilingual_record_name};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum OutlinerNodeKind {
     Stage,
@@ -243,7 +245,7 @@ impl<'a> OutlinerBuilder<'a> {
         };
         self.building.remove(&object.id);
 
-        let label = object_display_name(object);
+        let label = bilingual_object_name(object);
         let class_name = object.class_name.as_deref().unwrap_or("Unknown class");
         let detail = if label.eq_ignore_ascii_case(&object.factory_name) {
             class_name.to_string()
@@ -355,22 +357,8 @@ fn squared_distance(left: &SceneObject, right: &SceneObject) -> f32 {
         .sum()
 }
 
-fn object_display_name(object: &SceneObject) -> String {
-    object
-        .raw_param("name")
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .unwrap_or(object.factory_name.as_str())
-        .to_string()
-}
-
 fn display_record_name(record: &JDramaRecord) -> String {
-    let name = record.name.trim();
-    if name.is_empty() {
-        record.type_name.clone()
-    } else {
-        name.to_string()
-    }
+    bilingual_record_name(&record.name, &record.type_name)
 }
 
 fn normalized_raw_path(path: &[u8]) -> String {

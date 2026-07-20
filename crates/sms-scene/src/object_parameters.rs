@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use sms_formats::{
     jdrama_key_code, JDramaField, JDramaFieldValue, JDramaRecord, JDramaRecordPayload,
 };
+use sms_schema::ObjectRegistry;
 
 use crate::{
     jdrama_record_at, PlacementBinding, Result, SceneError, SceneObject, SceneParameter,
@@ -29,6 +30,13 @@ pub enum ObjectParameterKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectParameterChoice {
     pub raw_value: String,
+    pub label: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectParameterBitFlag {
+    pub bit: u8,
     pub label: String,
     pub description: String,
 }
@@ -60,6 +68,8 @@ impl ObjectParameterIndexedChoice {
 pub struct ObjectParameterInfo {
     /// A human-readable inspector label for a canonical serialized field.
     pub display_name: Option<String>,
+    /// Independently toggleable bits whose unknown bits must be preserved.
+    pub bit_flags: Vec<ObjectParameterBitFlag>,
     pub description: String,
     pub choices: Vec<ObjectParameterChoice>,
     /// One semantic choice whose serialized value is a user-authored integer index.
@@ -186,6 +196,7 @@ impl StageDocument {
             descriptor.read_only_reason =
                 parameter_read_only_reason(Some(placement), &descriptor.key, &descriptor.raw_value);
         }
+        enrich_monte_parameter_info(&mut descriptors, object, self.registry.as_ref());
         Ok(descriptors)
     }
 }
@@ -420,10 +431,194 @@ fn object_parameter_info(record_type: &str, key: &str) -> Option<ObjectParameter
         label: label.to_string(),
         description: description.to_string(),
     };
+    let bit_flag = |bit: u8, label: &str, description: &str| ObjectParameterBitFlag {
+        bit,
+        label: label.to_string(),
+        description: description.to_string(),
+    };
+    let plain = |display_name: &str, description: &str| ObjectParameterInfo {
+        display_name: Some(display_name.to_string()),
+        bit_flags: Vec::new(),
+        description: description.to_string(),
+        choices: Vec::new(),
+        indexed_choice: None,
+        integer_range: None,
+    };
+
+    if record_type.starts_with("NPCMonte") {
+        let info = match key {
+            OBJECT_PARAMETER_NAME => plain(
+                "Runtime name",
+                "TNameRef identity used by scripts and runtime lookups. Respawn the actor to change it safely.",
+            ),
+            OBJECT_PARAMETER_CHARACTER_NAME => plain(
+                "Character registration",
+                "Stage character-data registration that supplies this Pianta's model and animations.",
+            ),
+            "body_color_index" => plain(
+                "Skin palette",
+                "Palette index applied to the root-model body materials. Available indices come from the decomp-extracted TNpcInitInfo color tables for this exact Pianta variant.",
+            ),
+            "cloth_color_index" => plain(
+                "Clothing palette",
+                "Palette index applied to the root-model clothing materials. Available indices come from the decomp-extracted TNpcInitInfo color tables for this exact Pianta variant.",
+            ),
+            "pollution_amount" => ObjectParameterInfo {
+                integer_range: Some([0, 255]),
+                ..plain(
+                    "Pollution amount",
+                    "Initial pollution tint/intensity. Retail converts this byte-scale value to a 0-1 ratio for pollution-capable NPCs.",
+                )
+            },
+            "parts_color_index_0" => plain(
+                "Accessory palette 1",
+                "Palette index used by accessories assigned to color channel 1 in the decomp-derived part definitions.",
+            ),
+            "parts_color_index_1" => plain(
+                "Accessory palette 2",
+                "Palette index used by accessories assigned to color channel 2 in the decomp-derived part definitions.",
+            ),
+            "parts_color_index_2" => plain(
+                "Accessory palette 3",
+                "Palette index used by accessories assigned to color channel 3 in the decomp-derived part definitions.",
+            ),
+            "parts_mask" => plain(
+                "Accessories",
+                "Bitmask of optional Pianta parts. The inspector resolves each bit to the exact models and attachment joints extracted from TNpcInitInfo.",
+            ),
+            "movement_type" => plain(
+                "Behavior preset",
+                "Retail Monte behavior and waiting-animation preset. Graph-linked Piantas move between nodes; stationary Piantas use the named waiting pose. Out-of-range values fall back to preset 0.",
+            ),
+            "action_flags" => ObjectParameterInfo {
+                bit_flags: vec![bit_flag(
+                    0,
+                    "Can throw Mario",
+                    "Retail creates TNpcThrow only when bit 0 is set. Other serialized bits are preserved even though setIndividualDifference_ does not interpret them.",
+                )],
+                ..plain(
+                    "Throw options",
+                    "Only bit 0 enables the Pianta throw controller in the retail loader. Unknown bits remain intact.",
+                )
+            },
+            "motion_min" => plain(
+                "Throw speed",
+                "Launch speed passed to SMS_ThrowMario when this Pianta's throw controller is enabled.",
+            ),
+            "motion_max" => plain(
+                "Throw angle",
+                "Launch angle in degrees. Retail treats 0 or less as forward, 90 or more as straight up, and interpolates between them.",
+            ),
+            "coin_flag" => ObjectParameterInfo {
+                choices: vec![
+                    choice(
+                        "100",
+                        "No reward",
+                        "Retail does not construct TNpcCoin for event ID 100.",
+                    ),
+                    choice(
+                        "200",
+                        "Red coin",
+                        "Creates a red coin reward through TItemManager.",
+                    ),
+                    choice(
+                        "2000",
+                        "1-Up mushroom",
+                        "Creates mushroom1up through TMapObjBaseManager.",
+                    ),
+                ],
+                indexed_choice: Some(ObjectParameterIndexedChoice {
+                    label: "Blue coin".to_string(),
+                    index_label: "Slot".to_string(),
+                    description: "Persistent per-area blue-coin slot. Retail accepts exactly 0 through 49, and each slot should be unique within the area.".to_string(),
+                    default_index: 0,
+                    index_range: [0, 49],
+                    retail_index_range: Some([0, 49]),
+                    reserved_indices: Vec::new(),
+                }),
+                ..plain(
+                    "Reward",
+                    "Reward produced by the NPC coin controller: blue-coin slots 0-49, red coin 200, 1-Up 2000, or no reward for other values such as the retail default 100.",
+                )
+            },
+            _ => return None,
+        };
+        return Some(info);
+    }
+
+    if record_type == "NozzleBox" {
+        let info = match key {
+            OBJECT_PARAMETER_NAME => plain(
+                "Runtime name",
+                "TNameRef identity used by scripts and runtime lookups.",
+            ),
+            OBJECT_PARAMETER_CHARACTER_NAME => plain(
+                "Character registration",
+                "Character-data registration used to initialize the Nozzle Box actor and its shared resources.",
+            ),
+            "resource_name" => plain(
+                "Resource family",
+                "Must remain NozzleBox. TNozzleBox::load uses this TMapObjBase resource family for the intact, broken, and translucent models.",
+            ),
+            "item_selector" => ObjectParameterInfo {
+                choices: vec![
+                    choice(
+                        "normal_nozzle_item",
+                        "Hover Nozzle",
+                        "Spawns the blue Hover Nozzle pickup (runtime nozzle type 4).",
+                    ),
+                    choice(
+                        "rocket_nozzle_item",
+                        "Rocket Nozzle",
+                        "Spawns the red Rocket Nozzle pickup (runtime nozzle type 1).",
+                    ),
+                    choice(
+                        "back_nozzle_item",
+                        "Turbo Nozzle",
+                        "Spawns the gray-blue Turbo Nozzle pickup (runtime nozzle type 5).",
+                    ),
+                ],
+                ..plain(
+                    "Nozzle type",
+                    "Pickup created inside the box. Changing this also changes the retail TEV color applied to every box model state.",
+                )
+            },
+            "validity_name" => ObjectParameterInfo {
+                choices: vec![
+                    choice(
+                        "invalid",
+                        "Locked until acquired",
+                        "Starts translucent and unbreakable for Rocket and Turbo boxes, then activates when Mario obtains that nozzle type elsewhere. Retail uses the literal string invalid.",
+                    ),
+                    choice(
+                        "valid",
+                        "Available immediately",
+                        "Starts solid and breakable. Retail recognizes only the exact string valid as enabled.",
+                    ),
+                ],
+                ..plain(
+                    "Initial availability",
+                    "Initial box state read by TNozzleBox::load. Hover boxes are always made available during loadAfter; this setting affects Rocket and Turbo boxes.",
+                )
+            },
+            "break_height" => plain(
+                "Forward ejection strength",
+                "Serialized forward launch setting for the released pickup. Retail multiplies this value by 0.02 before applying it as horizontal velocity; the retail value 100 becomes speed 2.",
+            ),
+            "respawn_height" => plain(
+                "Upward ejection speed",
+                "Vertical velocity added when the pickup is released. Any negative value selects the retail default of 20; zero or positive values are used directly.",
+            ),
+            _ => return None,
+        };
+        return Some(info);
+    }
+
     if key == "coin_id" {
         let info = match record_type {
             "SamboFlower" => ObjectParameterInfo {
                 display_name: Some("Flower coin".to_string()),
+                bit_flags: Vec::new(),
                 description: "TSamboFlower checks only the sign of this value: any non-negative value registers its regular flower coin, while a negative value disables it. The flower_group_id field selects the linked flower group.".to_string(),
                 choices: vec![
                     choice("-1", "Disabled", "Does not register a coin for this flower."),
@@ -433,21 +628,22 @@ fn object_parameter_info(record_type: &str, key: &str) -> Option<ObjectParameter
                 integer_range: None,
             },
             "MameGesso" => ObjectParameterInfo {
-                display_name: Some("Unused coin value".to_string()),
-                description: "TMameGesso::load calls TSpineEnemy::load directly instead of TSmallEnemy::load, so this serialized tail value is not assigned to the actor's coin selector by the retail runtime.".to_string(),
-                choices: Vec::new(),
-                indexed_choice: None,
-                integer_range: None,
+                bit_flags: Vec::new(),
+                ..plain(
+                    "Unused coin value",
+                    "TMameGesso::load calls TSpineEnemy::load directly instead of TSmallEnemy::load, so this serialized tail value is not assigned to the actor's coin selector by the retail runtime.",
+                )
             },
             "BossManta" => ObjectParameterInfo {
-                display_name: Some("Unused coin value".to_string()),
-                description: "TBossManta does not use TSmallEnemy's coin loader, so the retail runtime does not interpret this serialized tail value as a coin-drop selector.".to_string(),
-                choices: Vec::new(),
-                indexed_choice: None,
-                integer_range: None,
+                bit_flags: Vec::new(),
+                ..plain(
+                    "Unused coin value",
+                    "TBossManta does not use TSmallEnemy's coin loader, so the retail runtime does not interpret this serialized tail value as a coin-drop selector.",
+                )
             },
             _ => ObjectParameterInfo {
                 display_name: Some("Coin drop".to_string()),
+                bit_flags: Vec::new(),
                 description: "Coin dropped by this TSmallEnemy-derived actor. Decomp behavior maps 0-49 to persistent blue-coin slots, 100 to an invisible TCoinEmpty placeholder, 101 to a fully disabled drop, 200 to a red coin, and -1 to the regular yellow-coin fallback. Blue slots must be unique within an area. Expanded slot values can be authored, but values outside 0-49 require a compatible expanded runtime.".to_string(),
                 choices: vec![
                     choice("-1", "Yellow coin", "TItemManager rejects -1 as a special coin ID, so TSmallEnemy falls back to one regular yellow coin."),
@@ -475,6 +671,7 @@ fn object_parameter_info(record_type: &str, key: &str) -> Option<ObjectParameter
     let info = match key {
         OBJECT_PARAMETER_NAME => ObjectParameterInfo {
             display_name: None,
+            bit_flags: Vec::new(),
             description: "Unique TNameRef key used by scripted Shine reveal calls. Editor-authored standalone Shines receive a generated unique name.".to_string(),
             choices: Vec::new(),
             indexed_choice: None,
@@ -482,6 +679,7 @@ fn object_parameter_info(record_type: &str, key: &str) -> Option<ObjectParameter
         },
         OBJECT_PARAMETER_CHARACTER_NAME => ObjectParameterInfo {
             display_name: None,
+            bit_flags: Vec::new(),
             description: "Character registration used by Sunshine to initialize the Shine actor and its resources.".to_string(),
             choices: Vec::new(),
             indexed_choice: None,
@@ -489,6 +687,7 @@ fn object_parameter_info(record_type: &str, key: &str) -> Option<ObjectParameter
         },
         "resource_name" => ObjectParameterInfo {
             display_name: None,
+            bit_flags: Vec::new(),
             description: "Stage-local resource stem. The normal Shine actor loads shine.bmd or shine_empty.bmd from this imported resource family.".to_string(),
             choices: Vec::new(),
             indexed_choice: None,
@@ -496,6 +695,7 @@ fn object_parameter_info(record_type: &str, key: &str) -> Option<ObjectParameter
         },
         "collection_type" => ObjectParameterInfo {
             display_name: None,
+            bit_flags: Vec::new(),
             description: "Initial runtime state read by TShine::loadBeforeInit. Normal is immediately collectible; Quickly starts the built-in delayed appearance sequence; Scripted/Demo stays dormant until another runtime object or event reveals it.".to_string(),
             choices: vec![
                 choice("normal", "Normal - visible immediately", "Spawns active and collectible as soon as the stage loads."),
@@ -507,6 +707,7 @@ fn object_parameter_info(record_type: &str, key: &str) -> Option<ObjectParameter
         },
         "shine_id" => ObjectParameterInfo {
             display_name: None,
+            bit_flags: Vec::new(),
             description: "Persistent global Shine save-flag ID. Independent slots are 0 through 119; reusing an ID shares collected state. -1 becomes 120 in TShine and is then folded to slot 0 by TFlagManager.".to_string(),
             choices: Vec::new(),
             indexed_choice: None,
@@ -514,6 +715,7 @@ fn object_parameter_info(record_type: &str, key: &str) -> Option<ObjectParameter
         },
         "in_stage" => ObjectParameterInfo {
             display_name: None,
+            bit_flags: Vec::new(),
             description: "Selects the collection cutscene camera. Sunshine stores -1 as outside and 0 as inside; other positive values are normalized to outside.".to_string(),
             choices: vec![
                 choice("-1", "Outside collection camera", "Uses the outdoor Shine collection camera."),
@@ -525,6 +727,252 @@ fn object_parameter_info(record_type: &str, key: &str) -> Option<ObjectParameter
         _ => return None,
     };
     Some(info)
+}
+
+fn enrich_monte_parameter_info(
+    parameters: &mut [EditableSceneParameter],
+    object: &SceneObject,
+    registry: Option<&ObjectRegistry>,
+) {
+    if !object.factory_name.starts_with("NPCMonte") {
+        return;
+    }
+    let Some(registry) = registry else {
+        return;
+    };
+
+    for parameter in parameters {
+        let Some(info) = parameter.info.as_mut() else {
+            continue;
+        };
+        match parameter.key.as_str() {
+            "movement_type" => {
+                if let Some(presets) = registry.npc_action_presets_for(&object.factory_name) {
+                    info.choices = presets
+                        .action_flags
+                        .iter()
+                        .enumerate()
+                        .map(|(index, flags)| ObjectParameterChoice {
+                            raw_value: index.to_string(),
+                            label: format!(
+                                "{index}: {}",
+                                monte_behavior_preset_name(index, *flags)
+                            ),
+                            description: monte_behavior_preset_description(index, *flags),
+                        })
+                        .collect();
+                }
+            }
+            "parts_mask" => {
+                if let Some(actor) = registry.find_npc_actor(&object.factory_name) {
+                    info.bit_flags = actor
+                        .parts
+                        .iter()
+                        .map(|part| ObjectParameterBitFlag {
+                            bit: part.bit_index,
+                            label: npc_part_label(part),
+                            description: npc_part_description(part),
+                        })
+                        .collect();
+                }
+            }
+            "body_color_index" => {
+                let count = registry
+                    .npc_material_colors_for(&object.factory_name)
+                    .filter(|definition| definition.color_index_channel == 0)
+                    .map(|definition| npc_color_count(&definition.change))
+                    .max()
+                    .unwrap_or(0);
+                install_npc_palette_choice(info, count);
+            }
+            "cloth_color_index" => {
+                let count = registry
+                    .npc_material_colors_for(&object.factory_name)
+                    .filter(|definition| definition.color_index_channel == 1)
+                    .map(|definition| npc_color_count(&definition.change))
+                    .max()
+                    .unwrap_or(0);
+                install_npc_palette_choice(info, count);
+            }
+            key if key.starts_with("parts_color_index_") => {
+                let channel = key
+                    .strip_prefix("parts_color_index_")
+                    .and_then(|value| value.parse::<u8>().ok());
+                let count = channel
+                    .and_then(|channel| {
+                        registry.find_npc_actor(&object.factory_name).map(|actor| {
+                            actor
+                                .parts
+                                .iter()
+                                .filter(|part| part.color_index_channel == channel)
+                                .flat_map(|part| part.color_changes.iter())
+                                .map(npc_color_count)
+                                .max()
+                                .unwrap_or(0)
+                        })
+                    })
+                    .unwrap_or(0);
+                install_npc_palette_choice(info, count);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn install_npc_palette_choice(info: &mut ObjectParameterInfo, count: usize) {
+    let Ok(last_index) = i64::try_from(count.saturating_sub(1)) else {
+        return;
+    };
+    if count == 0 {
+        return;
+    }
+    info.choices.push(ObjectParameterChoice {
+        raw_value: "255".to_string(),
+        label: "Unused (255)".to_string(),
+        description: "Retail placements use 255 for an unused color channel. Select a real palette before enabling an accessory that consumes this channel.".to_string(),
+    });
+    info.indexed_choice = Some(ObjectParameterIndexedChoice {
+        label: "Palette".to_string(),
+        index_label: "Index".to_string(),
+        description: format!(
+            "Decomp-derived palette index for this exact Pianta variant (0-{last_index})."
+        ),
+        default_index: 0,
+        index_range: [0, last_index],
+        retail_index_range: Some([0, last_index]),
+        reserved_indices: Vec::new(),
+    });
+}
+
+fn npc_color_count(change: &sms_schema::NpcColorChangeDefinition) -> usize {
+    change.colors0.len().max(change.colors1.len())
+}
+
+fn monte_behavior_preset_name(index: usize, flags: u32) -> String {
+    let base = match flags {
+        0x0000 => "Default (walk + normal wait)",
+        0x0001 => "Sitting",
+        0x0002 => "Wait A",
+        0x0004 => "Dancing",
+        0x0008 => "Run + normal wait",
+        0x000A => "Run + Wait A",
+        0x0010 => "Wait B",
+        0x0018 => "Run + Wait B",
+        0x0020 => "Talking / gesturing",
+        0x0021 => "Sitting + talking",
+        0x0028 => "Run + talking / gesturing",
+        0x0040 => "Angry loop",
+        0x0080 => "Continuous walk",
+        0x0088 => "Continuous run",
+        0x0400 => "Hold arrow sign",
+        0x1080 => "Continuous walk (retail special)",
+        0x4088 => "Burning + continuous run",
+        _ => return format!("Action flags 0x{flags:04X}"),
+    };
+
+    let first_matching_index = match flags {
+        0x0000 => 0,
+        0x0002 => 2,
+        0x0010 => 3,
+        0x0020 => 4,
+        0x0080 => 6,
+        _ => index,
+    };
+    if index == first_matching_index {
+        base.to_string()
+    } else {
+        format!("{base} (retail variant)")
+    }
+}
+
+fn monte_behavior_preset_description(index: usize, flags: u32) -> String {
+    let behavior = match flags {
+        0x0000 => "Uses the normal wait animation. With a graph, walks between nodes and pauses at them.",
+        0x0001 => "Uses seated wait, talk, wet, and mad animations and does not turn to face Mario.",
+        0x0002 => "Uses mom_wait_a while stationary or paused at a graph node.",
+        0x0004 => "Uses the looping dance animation while stationary or paused.",
+        0x0008 => "Uses run speed and animation between graph nodes, then pauses with the normal wait.",
+        0x000A => "Runs between graph nodes and uses mom_wait_a while paused.",
+        0x0010 => "Uses mom_wait_b while stationary or paused at a graph node.",
+        0x0018 => "Runs between graph nodes and uses mom_wait_b while paused.",
+        0x0020 => "Uses the talk/gesture animation while stationary or paused at a graph node.",
+        0x0021 => "Uses the seated talk animation and does not turn to face Mario.",
+        0x0028 => "Runs between graph nodes and uses the talk/gesture animation while paused.",
+        0x0040 => "Uses the looping mad animation while stationary or paused at a graph node.",
+        0x0080 => "Walks continuously: at a graph node, immediately chooses the next node instead of entering a timed wait.",
+        0x0088 => "Runs continuously and immediately chooses the next graph node instead of entering a timed wait.",
+        0x0400 => "Installs the retail hold-arrow animation override and prevents normal turning behavior.",
+        0x1080 => "Walks continuously. Retail also sets action bit 0x1000; the US decomp has no Monte-specific behavior attached to that bit.",
+        0x4088 => "Runs continuously with smoke/fire effects and boosted speed. The Pianta cannot talk and reacts only to water until extinguished.",
+        _ => "No verified friendly behavior name is available for this action-flag combination.",
+    };
+    format!("{behavior} Retail table entry {index}; action flags 0x{flags:04X}.")
+}
+
+fn npc_part_label(part: &sms_schema::NpcPartDefinition) -> String {
+    let model = part
+        .models
+        .first()
+        .map(|model| model.model_name.as_str())
+        .unwrap_or("part");
+    let stem = model.strip_suffix(".bmd").unwrap_or(model);
+    let stem = stem.strip_suffix("_model").unwrap_or(stem);
+    match stem.to_ascii_lowercase().as_str() {
+        "hata" => "Hat A".to_string(),
+        "hatb" => "Hat B".to_string(),
+        "hatd" => "Hat D".to_string(),
+        "hate" => "Hat E".to_string(),
+        "hatf" => "Hat F".to_string(),
+        "hatg" => "Hat G".to_string(),
+        "higea" => "Mustache".to_string(),
+        "glassesa" => "Glasses A".to_string(),
+        "glassesb" => "Glasses B".to_string(),
+        "eria" => "Collar".to_string(),
+        "tieb" => "Tie".to_string(),
+        "nimotsu" => "Baggage".to_string(),
+        "uklele" => "Ukulele".to_string(),
+        "udewar" => "Right bracelet".to_string(),
+        "udewal" => "Left bracelet".to_string(),
+        "arrowr" => "Right arrow".to_string(),
+        "arrowl" => "Left arrow".to_string(),
+        _ => humanize_npc_resource_name(stem),
+    }
+}
+
+fn npc_part_description(part: &sms_schema::NpcPartDefinition) -> String {
+    let models = part
+        .models
+        .iter()
+        .map(|model| match model.joint_name.as_deref() {
+            Some(joint) => format!("{} on {joint}", model.model_name),
+            None => format!("{} on the root joint", model.model_name),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "TNpcInitInfo part bit {}. Decomp-derived model attachment: {models}.",
+        part.bit_index
+    )
+}
+
+fn humanize_npc_resource_name(name: &str) -> String {
+    let mut output = String::new();
+    for character in name.chars() {
+        if character.is_ascii_uppercase()
+            && output
+                .chars()
+                .last()
+                .is_some_and(|previous| previous.is_ascii_lowercase())
+        {
+            output.push(' ');
+        }
+        output.push(character);
+    }
+    let mut output = output.replace('_', " ");
+    if let Some(first) = output.get_mut(0..1) {
+        first.make_ascii_uppercase();
+    }
+    output
 }
 fn parameter_read_only_reason(
     placement: Option<&PlacementBinding>,
@@ -541,7 +989,7 @@ fn parameter_read_only_reason(
         _ if key.starts_with("translucent_group_") && key.ends_with("_joint_count") => {
             "Controls the serialized field layout and cannot be changed independently."
         }
-        "item_selector" => "Selects a runtime-managed resource; respawn the object to change.",
+        "item_selector" | "validity_name" => return None,
         "resource_name" => "Owns imported resources; respawn the object to change.",
         OBJECT_PARAMETER_CHARACTER_NAME => {
             "Owns a character registration; respawn the object to change."
@@ -782,14 +1230,19 @@ fn display_record_path(path: &[usize]) -> String {
 #[cfg(test)]
 mod editability_tests {
     use super::{
-        editable_object_parameters, parameter_read_only_reason, seed_scene_object_parameters,
-        validate_object_parameter_links,
+        apply_dirty_object_parameter_edits, editable_object_parameters,
+        enrich_monte_parameter_info, monte_behavior_preset_name, parameter_read_only_reason,
+        seed_scene_object_parameters, validate_object_parameter_links,
     };
     use crate::{
         AuthoredPlacement, AuthoredPlacementDependency, PlacementAddress, PlacementBinding,
         SceneObject,
     };
     use sms_formats::{JDramaField, JDramaFieldValue, JDramaRecord, JDramaRecordPayload};
+    use sms_schema::{
+        NpcActionPresetDefinition, NpcActorDefinition, NpcColorChangeDefinition,
+        NpcMaterialColorDefinition, NpcPartDefinition, NpcPartModelDefinition, ObjectRegistry,
+    };
 
     fn record(name: &str) -> JDramaRecord {
         JDramaRecord {
@@ -833,6 +1286,174 @@ mod editability_tests {
                 }],
             },
         }
+    }
+
+    #[test]
+    fn monte_parameters_use_readable_schema_backed_controls() {
+        let mut parameters = editable_object_parameters(&JDramaRecord {
+            type_name: "NPCMonteMA".to_string(),
+            name: "monte".to_string(),
+            payload: JDramaRecordPayload::Actor {
+                transform: sms_formats::JDramaTransform {
+                    translation: [0.0; 3],
+                    rotation: [0.0; 3],
+                    scale: [1.0; 3],
+                },
+                character_name: "monte".to_string(),
+                light_map: sms_formats::JDramaLightMap::default(),
+                fields: vec![
+                    JDramaField {
+                        name: "body_color_index".to_string(),
+                        value: JDramaFieldValue::I32(0),
+                    },
+                    JDramaField {
+                        name: "parts_mask".to_string(),
+                        value: JDramaFieldValue::I32(0),
+                    },
+                    JDramaField {
+                        name: "movement_type".to_string(),
+                        value: JDramaFieldValue::I32(0),
+                    },
+                    JDramaField {
+                        name: "action_flags".to_string(),
+                        value: JDramaFieldValue::I32(0),
+                    },
+                    JDramaField {
+                        name: "coin_flag".to_string(),
+                        value: JDramaFieldValue::I32(100),
+                    },
+                ],
+            },
+        })
+        .unwrap();
+        let change = NpcColorChangeDefinition {
+            mode: 1,
+            material_name: "skin".to_string(),
+            colors0: vec![[0, 0, 0, 255], [255, 255, 255, 255]],
+            colors1: Vec::new(),
+        };
+        let registry = ObjectRegistry {
+            npc_action_presets: vec![NpcActionPresetDefinition {
+                actor_family: "Monte".to_string(),
+                action_flags: vec![0, 8, 0x4088],
+                source_file: "src/NPC/NpcInitActionData.cpp".to_string(),
+            }],
+            npc_actors: vec![NpcActorDefinition {
+                actor_key: "MonteMA".to_string(),
+                source_file: "src/NPC/NpcInitData.cpp".to_string(),
+                parts: vec![NpcPartDefinition {
+                    bit_index: 2,
+                    color_index_channel: 0,
+                    models: vec![NpcPartModelDefinition {
+                        joint_name: Some("head".to_string()),
+                        model_name: "glassesA_model.bmd".to_string(),
+                    }],
+                    color_changes: vec![change.clone()],
+                    uses_pollution: false,
+                    uses_shared_materials: false,
+                }],
+            }],
+            npc_material_colors: vec![NpcMaterialColorDefinition {
+                actor_key: "MonteMA".to_string(),
+                model_index: 0,
+                color_index_channel: 0,
+                change,
+                source_file: "src/NPC/NpcInitData.cpp".to_string(),
+            }],
+            ..ObjectRegistry::default()
+        };
+        let object = SceneObject::new("monte", "NPCMonteMA");
+        enrich_monte_parameter_info(&mut parameters, &object, Some(&registry));
+
+        let info = |key: &str| {
+            parameters
+                .iter()
+                .find(|parameter| parameter.key == key)
+                .unwrap()
+                .info
+                .as_ref()
+                .unwrap()
+        };
+        assert_eq!(
+            info("body_color_index").display_name.as_deref(),
+            Some("Skin palette")
+        );
+        assert_eq!(
+            info("body_color_index")
+                .indexed_choice
+                .as_ref()
+                .unwrap()
+                .index_range,
+            [0, 1]
+        );
+        assert_eq!(info("parts_mask").bit_flags[0].label, "Glasses A");
+        assert!(info("parts_mask").bit_flags[0]
+            .description
+            .contains("glassesA_model.bmd"));
+        assert_eq!(
+            info("movement_type").choices[0].label,
+            "0: Default (walk + normal wait)"
+        );
+        assert_eq!(
+            info("movement_type").choices[1].label,
+            "1: Run + normal wait"
+        );
+        assert_eq!(
+            info("movement_type").choices[2].label,
+            "2: Burning + continuous run"
+        );
+        assert_eq!(info("action_flags").bit_flags[0].label, "Can throw Mario");
+        assert_eq!(
+            info("coin_flag")
+                .choices
+                .iter()
+                .map(|choice| choice.raw_value.as_str())
+                .collect::<Vec<_>>(),
+            ["100", "200", "2000"]
+        );
+    }
+
+    #[test]
+    fn us_retail_monte_behavior_table_has_source_grounded_names() {
+        let flags = [
+            0x0000, 0x0001, 0x0002, 0x0010, 0x0020, 0x0021, 0x0080, 0x0088, 0x0040, 0x0000, 0x0000,
+            0x0004, 0x1080, 0x0000, 0x0002, 0x0010, 0x0020, 0x0008, 0x000A, 0x0018, 0x0028, 0x0080,
+            0x0000, 0x0400, 0x4088,
+        ];
+        let expected = [
+            "Default (walk + normal wait)",
+            "Sitting",
+            "Wait A",
+            "Wait B",
+            "Talking / gesturing",
+            "Sitting + talking",
+            "Continuous walk",
+            "Continuous run",
+            "Angry loop",
+            "Default (walk + normal wait) (retail variant)",
+            "Default (walk + normal wait) (retail variant)",
+            "Dancing",
+            "Continuous walk (retail special)",
+            "Default (walk + normal wait) (retail variant)",
+            "Wait A (retail variant)",
+            "Wait B (retail variant)",
+            "Talking / gesturing (retail variant)",
+            "Run + normal wait",
+            "Run + Wait A",
+            "Run + Wait B",
+            "Run + talking / gesturing",
+            "Continuous walk (retail variant)",
+            "Default (walk + normal wait) (retail variant)",
+            "Hold arrow sign",
+            "Burning + continuous run",
+        ];
+
+        let names = flags
+            .into_iter()
+            .enumerate()
+            .map(|(index, flags)| monte_behavior_preset_name(index, flags))
+            .collect::<Vec<_>>();
+        assert_eq!(names, expected);
     }
 
     #[test]
@@ -1039,6 +1660,129 @@ mod editability_tests {
     }
 
     #[test]
+    fn nozzle_box_parameters_use_retail_names_choices_and_editable_tail_values() {
+        let mut record = JDramaRecord {
+            type_name: "NozzleBox".to_string(),
+            name: "nozzle box".to_string(),
+            payload: JDramaRecordPayload::Actor {
+                transform: sms_formats::JDramaTransform {
+                    translation: [0.0; 3],
+                    rotation: [0.0; 3],
+                    scale: [1.0; 3],
+                },
+                character_name: "NozzleBox Character".to_string(),
+                light_map: sms_formats::JDramaLightMap::default(),
+                fields: vec![
+                    JDramaField {
+                        name: "resource_name".to_string(),
+                        value: JDramaFieldValue::String("NozzleBox".to_string()),
+                    },
+                    JDramaField {
+                        name: "item_selector".to_string(),
+                        value: JDramaFieldValue::String("rocket_nozzle_item".to_string()),
+                    },
+                    JDramaField {
+                        name: "validity_name".to_string(),
+                        value: JDramaFieldValue::String("invalid".to_string()),
+                    },
+                    JDramaField {
+                        name: "break_height".to_string(),
+                        value: JDramaFieldValue::F32(100.0),
+                    },
+                    JDramaField {
+                        name: "respawn_height".to_string(),
+                        value: JDramaFieldValue::F32(-1.0),
+                    },
+                ],
+            },
+        };
+        let parameters = editable_object_parameters(&record).unwrap();
+        let parameter = |key: &str| {
+            parameters
+                .iter()
+                .find(|parameter| parameter.key == key)
+                .unwrap()
+        };
+
+        assert_eq!(
+            parameter("item_selector")
+                .info
+                .as_ref()
+                .unwrap()
+                .display_name
+                .as_deref(),
+            Some("Nozzle type")
+        );
+        assert_eq!(
+            parameter("item_selector")
+                .info
+                .as_ref()
+                .unwrap()
+                .choices
+                .iter()
+                .map(|choice| choice.label.as_str())
+                .collect::<Vec<_>>(),
+            ["Hover Nozzle", "Rocket Nozzle", "Turbo Nozzle"]
+        );
+        assert_eq!(
+            parameter("validity_name")
+                .info
+                .as_ref()
+                .unwrap()
+                .display_name
+                .as_deref(),
+            Some("Initial availability")
+        );
+        assert_eq!(
+            parameter("break_height")
+                .info
+                .as_ref()
+                .unwrap()
+                .display_name
+                .as_deref(),
+            Some("Forward ejection strength")
+        );
+        assert_eq!(
+            parameter("respawn_height")
+                .info
+                .as_ref()
+                .unwrap()
+                .display_name
+                .as_deref(),
+            Some("Upward ejection speed")
+        );
+        assert!(parameter("item_selector").read_only_reason.is_none());
+        assert!(parameter("validity_name").read_only_reason.is_none());
+        assert!(parameter("resource_name").read_only_reason.is_some());
+
+        let mut object = SceneObject::new("nozzle-box", "NozzleBox");
+        seed_scene_object_parameters(&mut object, &record).unwrap();
+        object.set_raw_param("item_selector", "back_nozzle_item");
+        object.set_raw_param("validity_name", "valid");
+        object.set_raw_param("break_height", "150");
+        object.set_raw_param("respawn_height", "30");
+        apply_dirty_object_parameter_edits(&mut record, &object).unwrap();
+
+        let JDramaRecordPayload::Actor { fields, .. } = &record.payload else {
+            unreachable!();
+        };
+        assert_eq!(
+            fields[0].value,
+            JDramaFieldValue::String("NozzleBox".to_string())
+        );
+        assert_eq!(
+            fields[1].value,
+            JDramaFieldValue::String("back_nozzle_item".to_string())
+        );
+        assert_eq!(
+            fields[2].value,
+            JDramaFieldValue::String("valid".to_string())
+        );
+        assert_eq!(fields[3].value, JDramaFieldValue::F32(150.0));
+        assert_eq!(fields[4].value, JDramaFieldValue::F32(30.0));
+    }
+
+    #[test]
     fn closure_driving_fields_are_read_only_but_ordinary_fields_are_editable() {
         let record = JDramaRecord {
             type_name: "Fixture".to_string(),
@@ -1060,13 +1804,7 @@ mod editability_tests {
             },
         };
         let descriptors = editable_object_parameters(&record).unwrap();
-        for key in [
-            "name",
-            "resource_name",
-            "graph_name",
-            "target_actor_name",
-            "item_selector",
-        ] {
+        for key in ["name", "resource_name", "graph_name", "target_actor_name"] {
             let descriptor = descriptors
                 .iter()
                 .find(|descriptor| descriptor.key == key)
@@ -1079,12 +1817,14 @@ mod editability_tests {
                 "{key} should be linked read-only"
             );
         }
-        assert!(descriptors
-            .iter()
-            .find(|descriptor| descriptor.key == "ordinary")
-            .unwrap()
-            .read_only_reason
-            .is_none());
+        for key in ["item_selector", "ordinary"] {
+            assert!(descriptors
+                .iter()
+                .find(|descriptor| descriptor.key == key)
+                .unwrap()
+                .read_only_reason
+                .is_none());
+        }
 
         let character_reason = parameter_read_only_reason(None, "character_name", "value")
             .expect("character_name should be linked read-only");
@@ -1180,13 +1920,7 @@ mod editability_tests {
             }],
         });
 
-        for key in [
-            "name",
-            "resource_name",
-            "character_name",
-            "graph_name",
-            "item_selector",
-        ] {
+        for key in ["name", "resource_name", "character_name", "graph_name"] {
             let original = object.raw_param(key).unwrap().to_string();
             object.insert_source_raw_param(key, format!("{original}_changed"));
             let error = validate_object_parameter_links(&prototype, &object, &binding)

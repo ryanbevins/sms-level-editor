@@ -34,6 +34,7 @@ use sms_schema::{ObjectDefinition, ObjectRegistry, ParticleBindingTarget, Schema
 mod camera;
 mod direct_boot;
 mod document_commands;
+mod game_text;
 mod gpu_viewport;
 mod managed_build;
 mod model_assets;
@@ -47,6 +48,7 @@ mod stage_creation;
 mod ui_panels;
 mod viewport_ui;
 
+use game_text::*;
 use model_assets::*;
 use outliner::*;
 use project::*;
@@ -3572,10 +3574,7 @@ fn object_matches_focus(object: &SceneObject, needle: &str) -> bool {
 }
 
 fn object_display_name(object: &SceneObject) -> String {
-    object
-        .raw_param("name")
-        .map(str::to_owned)
-        .unwrap_or_else(|| object.factory_name.clone())
+    bilingual_object_name(object)
 }
 
 fn labeled_text(ui: &mut egui::Ui, label: &str, value: &mut String) {

@@ -1134,6 +1134,15 @@ fn resolve_resources(
             )?;
         }
     }
+    for resource_folder in registry.npc_resource_folders_for(&candidate.factory_name) {
+        add_stage_folder(
+            &mut out,
+            sources,
+            &candidate.source_stage,
+            &resource_folder.folder,
+            &format!("NPC {} runtime resource folder", candidate.factory_name),
+        )?;
+    }
     for dependency in &candidate.dependencies {
         let Some(manager) = find_enemy_manager(registry, &dependency.record.type_name) else {
             continue;
@@ -1737,9 +1746,18 @@ fn add_preview_resources(
     registry: &ObjectRegistry,
 ) {
     let mut model_names = BTreeSet::new();
+    let mut npc_part_model_names = BTreeSet::new();
     let mut collision_names = BTreeSet::new();
     if let Some(binding) = registry.primary_object_resource(&candidate.factory_name) {
         model_names.insert(binding.model_name.to_ascii_lowercase());
+    }
+    if let Some(actor) = registry.find_npc_actor(&candidate.factory_name) {
+        npc_part_model_names.extend(actor.parts.iter().flat_map(|part| {
+            part.models
+                .iter()
+                .map(|model| model.model_name.to_ascii_lowercase())
+        }));
+        model_names.extend(npc_part_model_names.iter().cloned());
     }
     if let Some(actor) = find_enemy_actor(registry, &candidate.factory_name) {
         if let Some(name) = &actor.primary_model {
@@ -1785,6 +1803,40 @@ fn add_preview_resources(
             path_matches_one_of(path, &collision_names)
         });
     }
+    // NPC parts are loaded from the same common archive directory as external
+    // textures used to replace dummy textures in the body model. Preserve the
+    // complete, data-driven texture set for every selected part directory so a
+    // transplanted NPC keeps both its selectable accessories and clothing.
+    let npc_part_directories = out
+        .iter()
+        .filter(|resource| path_matches_one_of(&resource.raw_resource_path, &npc_part_model_names))
+        .filter_map(|resource| {
+            let path = normalized_path(&resource.raw_resource_path);
+            let (directory, _) = path.rsplit_once('/')?;
+            Some((
+                virtual_archive_path(&resource.source_asset_path).to_ascii_lowercase(),
+                directory.to_string(),
+            ))
+        })
+        .collect::<BTreeSet<_>>();
+    for source in sources {
+        if source.source_stage != candidate.source_stage {
+            continue;
+        }
+        for resource in &source.resources {
+            let path = normalized_path(&resource.raw_resource_path);
+            let Some((directory, file_name)) = path.rsplit_once('/') else {
+                continue;
+            };
+            let directory_key = (
+                virtual_archive_path(&resource.source_asset_path).to_ascii_lowercase(),
+                directory.to_string(),
+            );
+            if file_name.ends_with(".bti") && npc_part_directories.contains(&directory_key) {
+                out.insert(resource.clone());
+            }
+        }
+    }
     let primary_models: Vec<_> = out
         .iter()
         .filter(|resource| normalized_path(&resource.raw_resource_path).ends_with(".bmd"))
@@ -1819,7 +1871,7 @@ fn add_preview_resources(
                     continue;
                 };
                 if candidate_directory == directory
-                    && candidate_stem == stem
+                    && (candidate_stem == stem || candidate_stem == format!("{stem}_wait"))
                     && matches!(
                         candidate_extension,
                         "bck" | "btk" | "brk" | "btp" | "bpk" | "blk" | "bva" | "bas" | "bmt"
@@ -2056,8 +2108,10 @@ mod tests {
     use sms_schema::{
         ActorParticleBinding, EnemyActorDefinition, EnemyManagerDefinition,
         MapObjAnimationResourceDefinition, MapObjCollisionResourceDefinition,
-        MapObjModelOverrideDefinition, MapObjResourceDefinition, ObjectResourceBinding,
-        ObjectResourceRole, ParticleBindingTarget, ParticleResourceDefinition, SchemaSource,
+        MapObjModelOverrideDefinition, MapObjResourceDefinition, NpcActorDefinition,
+        NpcPartDefinition, NpcPartModelDefinition, NpcResourceFolderDefinition,
+        ObjectResourceBinding, ObjectResourceRole, ParticleBindingTarget,
+        ParticleResourceDefinition, SchemaSource,
     };
 
     fn field(name: &str, value: JDramaFieldValue) -> JDramaField {
@@ -3501,6 +3555,85 @@ mod tests {
     }
 
     #[test]
+    fn npc_preview_resources_include_parts_companions_and_common_textures() {
+        let registry = ObjectRegistry {
+            objects: vec![object("NPCMonteM", "TMonteM")],
+            object_resources: vec![ObjectResourceBinding {
+                factory_name: "NPCMonteM".into(),
+                model_index: 0,
+                role: ObjectResourceRole::Primary,
+                model_name: "mom_model.bmd".into(),
+                resource_base: Some("/scene/monteM".into()),
+                load_flags: 0,
+                source_file: "fixture.cpp".into(),
+            }],
+            npc_actors: vec![NpcActorDefinition {
+                actor_key: "MonteM".into(),
+                source_file: "fixture.cpp".into(),
+                parts: vec![NpcPartDefinition {
+                    bit_index: 0,
+                    color_index_channel: 0,
+                    models: vec![NpcPartModelDefinition {
+                        joint_name: Some("kubi".into()),
+                        model_name: "hatA_model.bmd".into(),
+                    }],
+                    color_changes: Vec::new(),
+                    uses_pollution: false,
+                    uses_shared_materials: false,
+                }],
+            }],
+            npc_resource_folders: vec![NpcResourceFolderDefinition {
+                factory_name: "NPCMonteM".into(),
+                folder: "/scene/monteMCommon".into(),
+                source_file: "fixture.cpp".into(),
+            }],
+            ..ObjectRegistry::default()
+        };
+        let candidate = Candidate {
+            factory_name: "NPCMonteM".into(),
+            group_index: 4,
+            record: actor("NPCMonteM", "monte", 0),
+            dependencies: Vec::new(),
+            character_records: Vec::new(),
+            character_resource_records: Vec::new(),
+            graph_names: BTreeSet::new(),
+            source_stage: "stage".into(),
+            sort_key: "stage".into(),
+            raw_resource_path: b"map/scene.bin".to_vec(),
+            source_asset_path: "stage.szs!/map/scene.bin".into(),
+            record_path: vec![0],
+        };
+        let mut source = source("stage", document(Vec::new()));
+        source.resources = resources(
+            "stage.szs",
+            &[
+                "montem/mom_model.bmd",
+                "montemcommon/hata_model.bmd",
+                "montemcommon/hata_model_wait.bck",
+                "montemcommon/i_mom_mino_rgba.bti",
+                "montemcommon/mom_wait.bck",
+                "montemcommon/bas/mom_walk.bas",
+                "montemcommon/readme.txt",
+            ],
+        );
+        let selected = resolve_resources(&candidate, &[&source], &registry)
+            .expect("complete NPC runtime resource closure");
+
+        assert_eq!(
+            raw_paths(&selected),
+            vec![
+                "montem/mom_model.bmd",
+                "montemcommon/bas/mom_walk.bas",
+                "montemcommon/hata_model.bmd",
+                "montemcommon/hata_model_wait.bck",
+                "montemcommon/i_mom_mino_rgba.bti",
+                "montemcommon/mom_wait.bck",
+                "montemcommon/readme.txt",
+            ]
+        );
+    }
+
+    #[test]
     #[ignore = "requires SMS_BASE_ROOT with extracted retail stages and the neighboring SMS decomp"]
     fn retail_catalog_enables_representative_objects_and_manager_backed_enemies() {
         let base_root = std::env::var_os("SMS_BASE_ROOT")
@@ -3539,6 +3672,29 @@ mod tests {
             .required_graph_names
             .iter()
             .all(|name| runtime_reference(name).is_some())));
+        let monte = build
+            .catalog
+            .find("NPCMonteM")
+            .expect("NPCMonteM retail template");
+        let monte_resources = monte
+            .resources
+            .iter()
+            .map(|resource| normalized_path(&resource.raw_resource_path))
+            .collect::<BTreeSet<_>>();
+        for path in [
+            "montem/mom_model.bmd",
+            "montemcommon/hata_model.bmd",
+            "montemcommon/higea_model.bmd",
+            "montemcommon/glassesa_model.bmd",
+            "montemcommon/i_mom_mino_rgba.bti",
+            "montemcommon/mom_wait.bck",
+            "montemcommon/bas/mom_walk.bas",
+        ] {
+            assert!(
+                monte_resources.contains(path),
+                "NPCMonteM template omitted {path}"
+            );
+        }
         let shine = build.catalog.find("Shine").expect("Shine retail template");
         assert!(shine.table_dependencies.iter().any(|dependency| {
             semantic_type_name(&dependency.record.type_name) == "CameraMapInfo"

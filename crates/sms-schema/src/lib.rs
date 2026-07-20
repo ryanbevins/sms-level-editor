@@ -83,6 +83,7 @@ pub enum SchemaExtractor {
     NpcResources,
     NpcInitData,
     NpcRootColors,
+    NpcActionPresets,
     StageNames,
     CollisionSurfaces,
     CollisionLimits,
@@ -109,6 +110,7 @@ impl std::fmt::Display for SchemaExtractor {
             Self::NpcResources => "NPC model resource",
             Self::NpcInitData => "NPC initialization",
             Self::NpcRootColors => "NPC root color",
+            Self::NpcActionPresets => "NPC action preset",
             Self::StageNames => "stage name",
             Self::CollisionSurfaces => "collision surface",
             Self::CollisionLimits => "collision runtime limit",
@@ -151,9 +153,15 @@ pub struct ObjectRegistry {
     pub actor_particle_bindings: Vec<ActorParticleBinding>,
     #[serde(default)]
     pub npc_actors: Vec<NpcActorDefinition>,
+    /// Stage-local resource directories opened directly by NPC manager animation loaders.
+    #[serde(default)]
+    pub npc_resource_folders: Vec<NpcResourceFolderDefinition>,
     /// Root-model color programs selected by NPC instance body/cloth indices.
     #[serde(default)]
     pub npc_material_colors: Vec<NpcMaterialColorDefinition>,
+    /// Action-flag lookup tables selected by the NPC instance preset index.
+    #[serde(default)]
+    pub npc_action_presets: Vec<NpcActionPresetDefinition>,
     #[serde(default)]
     pub enemy_managers: Vec<EnemyManagerDefinition>,
     /// Stage-local animation folders opened directly by enemy manager
@@ -196,6 +204,15 @@ impl ObjectRegistry {
             .iter()
             .filter(|definition| actor_key.starts_with(&definition.actor_key))
             .max_by_key(|definition| definition.actor_key.len())
+    }
+
+    pub fn npc_resource_folders_for<'a>(
+        &'a self,
+        factory_name: &'a str,
+    ) -> impl Iterator<Item = &'a NpcResourceFolderDefinition> + 'a {
+        self.npc_resource_folders
+            .iter()
+            .filter(move |definition| definition.factory_name == factory_name)
     }
 
     pub fn find_enemy_manager(&self, factory_name: &str) -> Option<&EnemyManagerDefinition> {
@@ -289,6 +306,14 @@ impl ObjectRegistry {
         self.npc_material_colors.iter().filter(move |definition| {
             actor_key.is_some_and(|actor_key| definition.actor_key == actor_key)
         })
+    }
+
+    pub fn npc_action_presets_for(&self, factory_name: &str) -> Option<&NpcActionPresetDefinition> {
+        let actor_key = factory_name.strip_prefix("NPC")?;
+        self.npc_action_presets
+            .iter()
+            .filter(|definition| actor_key.starts_with(&definition.actor_family))
+            .max_by_key(|definition| definition.actor_family.len())
     }
 
     pub fn apply_overlay(&mut self, overlay: SchemaOverlay) {
@@ -608,6 +633,14 @@ pub struct NpcActorDefinition {
     pub parts: Vec<NpcPartDefinition>,
 }
 
+/// A complete archive directory passed to an NPC manager's animation-data loader.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NpcResourceFolderDefinition {
+    pub factory_name: String,
+    pub folder: String,
+    pub source_file: String,
+}
+
 /// A root NPC model color change selected from `TNpcInitInfo::unk34`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NpcMaterialColorDefinition {
@@ -617,6 +650,14 @@ pub struct NpcMaterialColorDefinition {
     /// Index into the instance color tuple (`0` body, `1` cloth in retail).
     pub color_index_channel: u8,
     pub change: NpcColorChangeDefinition,
+    pub source_file: String,
+}
+
+/// The exact `sBaseActionFlagTable` consumed by one NPC family.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NpcActionPresetDefinition {
+    pub actor_family: String,
+    pub action_flags: Vec<u32>,
     pub source_file: String,
 }
 
@@ -1588,6 +1629,15 @@ impl SchemaGenerator {
             registry.npc_material_colors.len(),
             "TNpcInitInfo root-model color bindings",
         )?;
+        let action_path = "src/NPC/NpcInitActionData.cpp";
+        registry.npc_action_presets =
+            extract_npc_action_presets(sources.required(action_path)?.text(), action_path);
+        ensure_extracted(
+            SchemaExtractor::NpcActionPresets,
+            self.repo_root.join(action_path),
+            registry.npc_action_presets.len(),
+            "NPC family action-flag lookup tables",
+        )?;
         Ok(())
     }
 
@@ -1616,6 +1666,10 @@ impl SchemaGenerator {
                 .into_iter()
                 .collect::<BTreeMap<_, _>>();
         let resource_bases = extract_npc_manager_resource_bases(manager_text);
+        let manager_animation_folders =
+            extract_enemy_manager_animation_folders(manager_text, manager_path)
+                .into_iter()
+                .collect::<BTreeMap<_, _>>();
 
         let mut inheritance = BTreeMap::new();
         for file in sources.files_under_any(&["src/NPC/", "include/NPC/"]) {
@@ -1643,6 +1697,18 @@ impl SchemaGenerator {
             };
             let resource_base =
                 inherited_string_value(manager_class, &resource_bases, &inheritance);
+            let animation_folders =
+                inherited_actor_models(manager_class, &manager_animation_folders, &inheritance)
+                    .unwrap_or_default();
+            registry
+                .npc_resource_folders
+                .extend(animation_folders.into_iter().map(|(folder, source_file)| {
+                    NpcResourceFolderDefinition {
+                        factory_name: factory_name.clone(),
+                        folder,
+                        source_file,
+                    }
+                }));
             registry
                 .object_resources
                 .extend(models.into_iter().enumerate().map(|(model_index, model)| {
@@ -1806,6 +1872,42 @@ fn extract_npc_material_color_definitions(
         }
     }
 
+    definitions
+}
+
+fn extract_npc_action_presets(text: &str, source_file: &str) -> Vec<NpcActionPresetDefinition> {
+    let method_re =
+        Regex::new(r"void\s+TBaseNPC::set([A-Za-z_][A-Za-z0-9_]*)ActionFlag_\s*\(\s*\)\s*\{")
+            .expect("valid NPC action-preset method regex");
+    let table_re = Regex::new(r"static\s+const\s+u32\s+sBaseActionFlagTable\s*\[\s*\]\s*=\s*\{")
+        .expect("valid NPC action-preset table regex");
+    let mut definitions = Vec::new();
+
+    for captures in method_re.captures_iter(text) {
+        let Some(method_match) = captures.get(0) else {
+            continue;
+        };
+        let Some(method_body) = braced_body(text, method_match.end() - 1) else {
+            continue;
+        };
+        let Some(table_match) = table_re.find(method_body) else {
+            continue;
+        };
+        let Some(table_body) = braced_body(method_body, table_match.end() - 1) else {
+            continue;
+        };
+        let action_flags = split_cpp_initializer_fields(table_body)
+            .into_iter()
+            .filter_map(parse_cpp_u32)
+            .collect::<Vec<_>>();
+        if !action_flags.is_empty() {
+            definitions.push(NpcActionPresetDefinition {
+                actor_family: captures[1].to_string(),
+                action_flags,
+                source_file: source_file.to_string(),
+            });
+        }
+    }
     definitions
 }
 
@@ -2375,18 +2477,27 @@ fn extract_enemy_manager_animation_folders(
     text: &str,
     source_file: &str,
 ) -> Vec<(String, Vec<(String, String)>)> {
+    let constants = extract_cpp_string_constants(text);
     let method_re = Regex::new(r"void\s+([A-Za-z_][A-Za-z0-9_]*)::createAnmData\s*\([^)]*\)\s*\{")
         .expect("valid enemy manager animation method regex");
-    let folder_re = Regex::new(r#"(?:->|\.)init\s*\(\s*"(/scene/[^"]+)"\s*,\s*nullptr"#)
-        .expect("valid enemy manager animation folder regex");
+    let init_re = Regex::new(
+        r#"(?:->|\.)init\s*\(\s*([^,]+)\s*,\s*(?:\([^)]*\)\s*)?(?:NULL|nullptr|0)\s*\)"#,
+    )
+    .expect("valid manager animation init regex");
     method_re
         .captures_iter(text)
         .filter_map(|method| {
             let whole = method.get(0)?;
             let body = braced_body(text, whole.end() - 1)?;
-            let folders = folder_re
+            let folders = init_re
                 .captures_iter(body)
-                .map(|folder| (folder[1].to_string(), source_file.to_string()))
+                .filter_map(|init| {
+                    let argument = init[1].trim();
+                    parse_cpp_string(argument)
+                        .or_else(|| constants.get(argument).cloned())
+                        .filter(|folder| folder.starts_with("/scene/"))
+                        .map(|folder| (folder, source_file.to_string()))
+                })
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect();
@@ -3854,6 +3965,15 @@ fn dedup_registry(registry: &mut ObjectRegistry) -> Result<()> {
     registry
         .npc_actors
         .dedup_by(|a, b| a.actor_key == b.actor_key);
+    registry.npc_resource_folders.sort_by(|a, b| {
+        a.factory_name
+            .cmp(&b.factory_name)
+            .then_with(|| a.folder.cmp(&b.folder))
+            .then_with(|| a.source_file.cmp(&b.source_file))
+    });
+    registry
+        .npc_resource_folders
+        .dedup_by(|a, b| a.factory_name == b.factory_name && a.folder == b.folder);
     registry.npc_material_colors.sort_by(|a, b| {
         a.actor_key
             .cmp(&b.actor_key)
@@ -3862,6 +3982,12 @@ fn dedup_registry(registry: &mut ObjectRegistry) -> Result<()> {
             .then_with(|| a.change.material_name.cmp(&b.change.material_name))
     });
     registry.npc_material_colors.dedup();
+    registry
+        .npc_action_presets
+        .sort_by(|a, b| a.actor_family.cmp(&b.actor_family));
+    registry
+        .npc_action_presets
+        .dedup_by(|a, b| a.actor_family == b.actor_family);
 
     registry.runtime_map_obj_dependencies.sort_by(|a, b| {
         a.factory_name
@@ -3963,6 +4089,25 @@ fn validate_registry(registry: &ObjectRegistry) -> Result<()> {
         .iter()
         .map(|object| (object.factory_name.as_str(), object))
         .collect::<BTreeMap<_, _>>();
+    for folder in &registry.npc_resource_folders {
+        if folder.folder.is_empty() || folder.source_file.is_empty() {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!(
+                    "NPC {} has a runtime resource folder without a path or provenance",
+                    folder.factory_name
+                ),
+            });
+        }
+        if !objects.contains_key(folder.factory_name.as_str()) {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!(
+                    "NPC resource folder {} has no registered factory {}",
+                    folder.folder, folder.factory_name
+                ),
+            });
+        }
+    }
+
     let map_obj_resource_names = registry
         .map_obj_resources
         .iter()
@@ -4280,6 +4425,16 @@ fn validate_registry(registry: &ObjectRegistry) -> Result<()> {
                     "NPC {} has root color metadata without material/provenance",
                     color.actor_key
                 ),
+            });
+        }
+    }
+    for presets in &registry.npc_action_presets {
+        if presets.actor_family.is_empty()
+            || presets.action_flags.is_empty()
+            || presets.source_file.is_empty()
+        {
+            return Err(SchemaError::RegistryInvariant {
+                detail: "NPC action presets have an empty family, table, or provenance".to_string(),
             });
         }
     }
@@ -4709,9 +4864,11 @@ mod tests {
     #[test]
     fn extracts_direct_manager_animation_folders_and_preserves_empty_overrides() {
         let text = r#"
+            const char* cFixtureAnimationFolder = "/scene/fixtureanm";
+
             void TFixtureManager::createAnmData() {
                 MActorAnmData* data = new MActorAnmData;
-                data->init("/scene/fixtureanm", nullptr);
+                data->init(cFixtureAnimationFolder, (const char**)NULL);
                 unk20 = data;
             }
 
@@ -5180,6 +5337,41 @@ mod tests {
         assert!(actor.parts[0].uses_shared_materials);
         assert_eq!(actor.parts[1].bit_index, 2);
         assert_eq!(actor.parts[1].models[0].joint_name, None);
+    }
+
+    #[test]
+    fn extracts_npc_action_presets_and_matches_the_factory_family() {
+        let text = r#"
+            void TBaseNPC::setMonteActionFlag_()
+            {
+                static const u32 sBaseActionFlagTable[] = {
+                    0, 1, 2, 0x10, 0x4088,
+                };
+            }
+            void TBaseNPC::setMareActionFlag_()
+            {
+                static const u32 sBaseActionFlagTable[] = { 0, 4, 0x20 };
+            }
+        "#;
+        let presets = extract_npc_action_presets(text, "src/NPC/NpcInitActionData.cpp");
+        assert_eq!(presets.len(), 2);
+        assert_eq!(presets[0].actor_family, "Monte");
+        assert_eq!(presets[0].action_flags, [0, 1, 2, 0x10, 0x4088]);
+        assert_eq!(presets[1].actor_family, "Mare");
+        assert_eq!(presets[1].action_flags, [0, 4, 0x20]);
+
+        let registry = ObjectRegistry {
+            npc_action_presets: presets,
+            ..ObjectRegistry::default()
+        };
+        assert_eq!(
+            registry
+                .npc_action_presets_for("NPCMonteMH")
+                .unwrap()
+                .action_flags[4],
+            0x4088
+        );
+        assert!(registry.npc_action_presets_for("npcMonteMH").is_none());
     }
 
     #[test]
@@ -6238,6 +6430,14 @@ mod tests {
                 static const TNpcInitInfo sExample_InitData = {
                     nullptr, {}, { { &sBody } }, 1.0f, 2.0f, 3.0f, 4.0f,
                 };
+            "#,
+        );
+        fixture.write(
+            "src/NPC/NpcInitActionData.cpp",
+            r#"
+                void TBaseNPC::setMonteActionFlag_() {
+                    static const u32 sBaseActionFlagTable[] = { 0, 1, 8, 0x4088 };
+                }
             "#,
         );
         fixture

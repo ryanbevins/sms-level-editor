@@ -855,6 +855,9 @@ impl SmsEditorApp {
                             || object.factory_name.to_ascii_lowercase().contains(&filter)
                             || object.class_name.to_ascii_lowercase().contains(&filter)
                             || object.category.to_ascii_lowercase().contains(&filter)
+                            || object_palette_display_name(object)
+                                .to_ascii_lowercase()
+                                .contains(&filter)
                     })
                     .cloned()
                     .collect()
@@ -875,6 +878,7 @@ impl SmsEditorApp {
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             for (object, placeable) in entries {
+                let palette_name = object_palette_display_name(&object);
                 ui.horizontal(|ui| {
                     let selected = self.palette_factory.as_deref() == Some(&object.factory_name);
                     let current_stage_clone = self.document.as_ref().is_some_and(|document| {
@@ -935,7 +939,7 @@ impl SmsEditorApp {
                         ));
                     }
                     let response = ui
-                        .selectable_label(selected, &object.factory_name)
+                        .selectable_label(selected, &palette_name)
                         .on_hover_text(placement_help.as_str());
                     if placeable {
                         response.dnd_set_drag_payload(ObjectPaletteDragPayload {
@@ -953,7 +957,14 @@ impl SmsEditorApp {
                         spawn_now = Some(object.factory_name.clone());
                     }
                 });
-                ui.small(format!("{}  {}", object.category, object.class_name));
+                if palette_name == object.factory_name {
+                    ui.small(format!("{}  {}", object.category, object.class_name));
+                } else {
+                    ui.small(format!(
+                        "{}  |  {}  {}",
+                        object.factory_name, object.category, object.class_name
+                    ));
+                }
                 ui.separator();
             }
         });
@@ -1055,7 +1066,8 @@ impl SmsEditorApp {
                                         == Some(instance.placement.instance_id),
                                     format!(
                                         "{}  ({})",
-                                        instance.placement.name, instance.placement.instance_id
+                                        bilingual_game_text(&instance.placement.name),
+                                        instance.placement.instance_id
                                     ),
                                 )
                                 .clicked()
@@ -1123,7 +1135,7 @@ impl SmsEditorApp {
         }
         let selected = self.selected_object().cloned();
         if let Some(object) = selected {
-            ui.heading(&object.factory_name);
+            ui.heading(bilingual_object_name(&object));
             ui.label(format!("Id: {}", object.id));
             ui.label(format!(
                 "Class: {}",
@@ -1181,13 +1193,8 @@ impl SmsEditorApp {
                                 && candidate.factory_name == reference.required_factory_name
                         })
                         .map(|candidate| {
-                            let label = candidate
-                                .raw_param("name")
-                                .filter(|name| !name.is_empty())
-                                .map_or_else(
-                                    || candidate.id.clone(),
-                                    |name| format!("{name} ({})", candidate.id),
-                                );
+                            let label =
+                                format!("{} ({})", bilingual_object_name(candidate), candidate.id);
                             (candidate.id.clone(), label)
                         })
                         .collect::<Vec<_>>();
@@ -1270,6 +1277,11 @@ impl SmsEditorApp {
                                     .unwrap_or(parameter.key.as_str());
                                 ui.add_enabled(editable, egui::Label::new(display_name))
                                     .on_hover_text(parameter_hover);
+                                let english_value = object_parameter_english_translation(
+                                    &object,
+                                    &parameter.key,
+                                    &parameter.raw_value,
+                                );
                                 let ObjectParameterControlResponse {
                                     edit,
                                     raw_value,
@@ -1291,8 +1303,17 @@ impl SmsEditorApp {
                                             Some(egui::Color32::from_rgb(255, 116, 104)),
                                         )
                                     } else {
-                                        (format!("{:?} \u{24d8}", parameter.kind), None)
+                                        (
+                                            english_value.as_deref().map_or_else(
+                                                || format!("{:?} \u{24d8}", parameter.kind),
+                                                |english| format!("{english} \u{24d8}"),
+                                            ),
+                                            None,
+                                        )
                                     };
+                                if let Some(english) = english_value {
+                                    status_help.push(format!("English: {english}"));
+                                }
                                 if let Some(info) = parameter.info.as_ref() {
                                     status_help.push(info.description.clone());
                                 }
@@ -1351,13 +1372,14 @@ impl SmsEditorApp {
                             "Derived preview aliases and legacy raw values are read-only. Edit the canonical typed parameter above.",
                         );
                         for (key, parameter) in diagnostics {
+                            let display = bilingual_object_parameter_value(&object, key, parameter.raw());
                             if let Some(decoded) = parameter.decoded() {
                                 ui.monospace(format!(
                                     "{key}: {} ({decoded:?})",
-                                    parameter.raw()
+                                    display
                                 ));
                             } else {
-                                ui.monospace(format!("{key}: {}", parameter.raw()));
+                                ui.monospace(format!("{key}: {display}"));
                             }
                         }
                     });
@@ -1395,6 +1417,7 @@ impl SmsEditorApp {
                 );
                 for (index, light) in lighting.lights.iter_mut().enumerate() {
                     let name = light.name.as_deref().unwrap_or("Unnamed light");
+                    let name = bilingual_game_text(name);
                     egui::CollapsingHeader::new(format!("Light {} - {name}", index + 1))
                         .id_salt(("stage-light", index))
                         .show(ui, |ui| {
@@ -1406,6 +1429,7 @@ impl SmsEditorApp {
                 }
                 for (index, ambient) in lighting.ambients.iter_mut().enumerate() {
                     let name = ambient.name.as_deref().unwrap_or("Unnamed ambient");
+                    let name = bilingual_game_text(name);
                     egui::CollapsingHeader::new(format!("Ambient {} - {name}", index + 1))
                         .id_salt(("stage-ambient", index))
                         .show(ui, |ui| {
@@ -1456,6 +1480,37 @@ impl SmsEditorApp {
     }
 }
 
+pub(super) fn object_palette_display_name(object: &ObjectDefinition) -> String {
+    if let Some(display_name) = object
+        .display_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        return display_name.to_string();
+    }
+
+    if object.factory_name == "NozzleBox" {
+        return "Nozzle Box".to_string();
+    }
+
+    let Some(variant) = object.factory_name.strip_prefix("NPCMonte") else {
+        return object.factory_name.clone();
+    };
+    let (gender, suffix) = if let Some(suffix) = variant.strip_prefix('M') {
+        ("Male", suffix)
+    } else if let Some(suffix) = variant.strip_prefix('W') {
+        ("Female", suffix)
+    } else {
+        return object.factory_name.clone();
+    };
+    if suffix.is_empty() {
+        format!("Pianta - {gender}")
+    } else {
+        format!("Pianta - {gender} (Variant {suffix})")
+    }
+}
+
 struct ObjectParameterControlResponse {
     edit: VectorDragResponse,
     raw_value: Option<String>,
@@ -1466,6 +1521,13 @@ fn object_parameter_control(
     ui: &mut egui::Ui,
     parameter: &EditableSceneParameter,
 ) -> ObjectParameterControlResponse {
+    if parameter
+        .info
+        .as_ref()
+        .is_some_and(|info| !info.bit_flags.is_empty())
+    {
+        return object_parameter_bit_flags_control(ui, parameter);
+    }
     if let Some(info) = parameter
         .info
         .as_ref()
@@ -1755,6 +1817,74 @@ fn object_parameter_control(
                 error,
             }
         }
+    }
+}
+
+fn object_parameter_bit_flags_control(
+    ui: &mut egui::Ui,
+    parameter: &EditableSceneParameter,
+) -> ObjectParameterControlResponse {
+    let info = parameter
+        .info
+        .as_ref()
+        .expect("bit-flag controls require parameter metadata");
+    let parsed = parameter.raw_value.trim().parse::<i32>();
+    let mut error = parsed
+        .as_ref()
+        .err()
+        .map(|error| format!("Expected i32 bitmask: {error}"));
+    let original = parsed.unwrap_or_default();
+    let mut bits = original.max(0) as u32;
+    let mut known_mask = 0_u32;
+    let mut changed = false;
+
+    ui.vertical(|ui| {
+        for flag in &info.bit_flags {
+            let Some(mask) = 1_u32.checked_shl(u32::from(flag.bit)) else {
+                continue;
+            };
+            known_mask |= mask;
+            let mut enabled = bits & mask != 0;
+            let response = ui
+                .checkbox(&mut enabled, &flag.label)
+                .on_hover_text(&flag.description);
+            if response.changed() {
+                changed = true;
+                if enabled {
+                    bits |= mask;
+                } else {
+                    bits &= !mask;
+                }
+            }
+        }
+
+        let unknown = bits & !known_mask;
+        if unknown != 0 {
+            ui.label(
+                egui::RichText::new(format!("Other bits preserved: 0x{unknown:08X}"))
+                    .small()
+                    .weak(),
+            )
+            .on_hover_text(
+                "These bits are not interpreted by the current decomp-derived metadata and are retained unchanged.",
+            );
+        } else if original < 0 {
+            ui.label(egui::RichText::new("No accessories (retail -1 sentinel)").small().weak());
+        }
+    });
+
+    let raw_value = changed.then(|| bits.to_string());
+    if raw_value.is_some() {
+        error = None;
+    }
+    ObjectParameterControlResponse {
+        edit: VectorDragResponse {
+            changed,
+            started: changed,
+            stopped: changed,
+        },
+        raw_value,
+        error,
     }
 }
 
