@@ -26,6 +26,47 @@ pub enum ObjectParameterKind {
     String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectParameterChoice {
+    pub raw_value: String,
+    pub label: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectParameterIndexedChoice {
+    pub label: String,
+    pub index_label: String,
+    pub description: String,
+    pub default_index: i64,
+    pub index_range: [i64; 2],
+    pub retail_index_range: Option<[i64; 2]>,
+    pub reserved_indices: Vec<i64>,
+}
+
+impl ObjectParameterIndexedChoice {
+    pub fn accepts_index(&self, index: i64) -> bool {
+        (self.index_range[0]..=self.index_range[1]).contains(&index)
+            && !self.reserved_indices.contains(&index)
+    }
+
+    pub fn is_retail_index(&self, index: i64) -> bool {
+        self.retail_index_range
+            .is_none_or(|range| (range[0]..=range[1]).contains(&index))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectParameterInfo {
+    /// A human-readable inspector label for a canonical serialized field.
+    pub display_name: Option<String>,
+    pub description: String,
+    pub choices: Vec<ObjectParameterChoice>,
+    /// One semantic choice whose serialized value is a user-authored integer index.
+    pub indexed_choice: Option<ObjectParameterIndexedChoice>,
+    pub integer_range: Option<[i64; 2]>,
+}
+
 /// One typed JDrama value in serialization order, including linked read-only fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EditableSceneParameter {
@@ -35,6 +76,8 @@ pub struct EditableSceneParameter {
     /// Why this canonical field cannot be edited without rebuilding its
     /// authored runtime dependency closure.
     pub read_only_reason: Option<String>,
+    /// Runtime behavior and constrained values derived from the owning class.
+    pub info: Option<ObjectParameterInfo>,
 }
 
 /// Selects whether only in-memory edits or every stored canonical value is applied.
@@ -51,6 +94,7 @@ pub fn editable_object_parameters(record: &JDramaRecord) -> Result<Vec<EditableS
     push_descriptor(
         &mut descriptors,
         &mut keys,
+        &record.type_name,
         OBJECT_PARAMETER_NAME,
         ObjectParameterKind::String,
         record.name.clone(),
@@ -65,6 +109,7 @@ pub fn editable_object_parameters(record: &JDramaRecord) -> Result<Vec<EditableS
         push_descriptor(
             &mut descriptors,
             &mut keys,
+            &record.type_name,
             OBJECT_PARAMETER_CHARACTER_NAME,
             ObjectParameterKind::String,
             character_name.clone(),
@@ -336,6 +381,7 @@ fn append_field_descriptors(
         push_descriptor(
             descriptors,
             keys,
+            &record.type_name,
             &field.name,
             kind,
             canonical_field_value(&field.value),
@@ -347,6 +393,7 @@ fn append_field_descriptors(
 fn push_descriptor(
     descriptors: &mut Vec<EditableSceneParameter>,
     keys: &mut BTreeSet<String>,
+    record_type: &str,
     key: &str,
     kind: ObjectParameterKind,
     raw_value: String,
@@ -361,10 +408,124 @@ fn push_descriptor(
         kind,
         raw_value,
         read_only_reason: parameter_read_only_reason(None, key, ""),
+        info: object_parameter_info(record_type, key),
     });
     Ok(())
 }
 
+fn object_parameter_info(record_type: &str, key: &str) -> Option<ObjectParameterInfo> {
+    let record_type = record_type.rsplit("::").next().unwrap_or(record_type);
+    let choice = |raw_value: &str, label: &str, description: &str| ObjectParameterChoice {
+        raw_value: raw_value.to_string(),
+        label: label.to_string(),
+        description: description.to_string(),
+    };
+    if key == "coin_id" {
+        let info = match record_type {
+            "SamboFlower" => ObjectParameterInfo {
+                display_name: Some("Flower coin".to_string()),
+                description: "TSamboFlower checks only the sign of this value: any non-negative value registers its regular flower coin, while a negative value disables it. The flower_group_id field selects the linked flower group.".to_string(),
+                choices: vec![
+                    choice("-1", "Disabled", "Does not register a coin for this flower."),
+                    choice("100", "Enabled", "Registers the flower's regular yellow coin. Sunshine's retail stages use 100 for enabled flowers."),
+                ],
+                indexed_choice: None,
+                integer_range: None,
+            },
+            "MameGesso" => ObjectParameterInfo {
+                display_name: Some("Unused coin value".to_string()),
+                description: "TMameGesso::load calls TSpineEnemy::load directly instead of TSmallEnemy::load, so this serialized tail value is not assigned to the actor's coin selector by the retail runtime.".to_string(),
+                choices: Vec::new(),
+                indexed_choice: None,
+                integer_range: None,
+            },
+            "BossManta" => ObjectParameterInfo {
+                display_name: Some("Unused coin value".to_string()),
+                description: "TBossManta does not use TSmallEnemy's coin loader, so the retail runtime does not interpret this serialized tail value as a coin-drop selector.".to_string(),
+                choices: Vec::new(),
+                indexed_choice: None,
+                integer_range: None,
+            },
+            _ => ObjectParameterInfo {
+                display_name: Some("Coin drop".to_string()),
+                description: "Coin dropped by this TSmallEnemy-derived actor. Decomp behavior maps 0-49 to persistent blue-coin slots, 100 to an invisible TCoinEmpty placeholder, 101 to a fully disabled drop, 200 to a red coin, and -1 to the regular yellow-coin fallback. Blue slots must be unique within an area. Expanded slot values can be authored, but values outside 0-49 require a compatible expanded runtime.".to_string(),
+                choices: vec![
+                    choice("-1", "Yellow coin", "TItemManager rejects -1 as a special coin ID, so TSmallEnemy falls back to one regular yellow coin."),
+                    choice("100", "No visible coin - empty actor", "Uses TCoinEmpty. The placeholder consumes the enemy's fallback drop but never appears."),
+                    choice("101", "No coin drop - disabled", "TSmallEnemy treats 101 specially: it creates no coin actor and does not enable the regular-coin fallback."),
+                    choice("200", "Red coin", "Registers and drops a red coin."),
+                ],
+                indexed_choice: Some(ObjectParameterIndexedChoice {
+                    label: "Blue coin".to_string(),
+                    index_label: "Slot".to_string(),
+                    description: "Persistent per-area blue-coin save slot. Retail Sunshine implements slots 0-49. Other non-reserved values are retained for compatible expanded runtimes.".to_string(),
+                    default_index: 0,
+                    index_range: [0, i32::MAX as i64],
+                    retail_index_range: Some([0, 49]),
+                    reserved_indices: vec![100, 101, 200],
+                }),
+                integer_range: None,
+            },
+        };
+        return Some(info);
+    }
+    if record_type != "Shine" {
+        return None;
+    }
+    let info = match key {
+        OBJECT_PARAMETER_NAME => ObjectParameterInfo {
+            display_name: None,
+            description: "Unique TNameRef key used by scripted Shine reveal calls. Editor-authored standalone Shines receive a generated unique name.".to_string(),
+            choices: Vec::new(),
+            indexed_choice: None,
+            integer_range: None,
+        },
+        OBJECT_PARAMETER_CHARACTER_NAME => ObjectParameterInfo {
+            display_name: None,
+            description: "Character registration used by Sunshine to initialize the Shine actor and its resources.".to_string(),
+            choices: Vec::new(),
+            indexed_choice: None,
+            integer_range: None,
+        },
+        "resource_name" => ObjectParameterInfo {
+            display_name: None,
+            description: "Stage-local resource stem. The normal Shine actor loads shine.bmd or shine_empty.bmd from this imported resource family.".to_string(),
+            choices: Vec::new(),
+            indexed_choice: None,
+            integer_range: None,
+        },
+        "collection_type" => ObjectParameterInfo {
+            display_name: None,
+            description: "Initial runtime state read by TShine::loadBeforeInit. Normal is immediately collectible; Quickly starts the built-in delayed appearance sequence; Scripted/Demo stays dormant until another runtime object or event reveals it.".to_string(),
+            choices: vec![
+                choice("normal", "Normal - visible immediately", "Spawns active and collectible as soon as the stage loads."),
+                choice("quickly", "Quick appearance", "Waits 240 frames, then starts Sunshine's built-in quick appearance camera sequence. The editor imports its required retail camera record automatically."),
+                choice("demo", "Scripted / demo", "Starts dormant. It will not appear unless another actor or event calls a Shine appearance function."),
+            ],
+            indexed_choice: None,
+            integer_range: None,
+        },
+        "shine_id" => ObjectParameterInfo {
+            display_name: None,
+            description: "Persistent global Shine save-flag ID. Independent slots are 0 through 119; reusing an ID shares collected state. -1 becomes 120 in TShine and is then folded to slot 0 by TFlagManager.".to_string(),
+            choices: Vec::new(),
+            indexed_choice: None,
+            integer_range: Some([-1, 119]),
+        },
+        "in_stage" => ObjectParameterInfo {
+            display_name: None,
+            description: "Selects the collection cutscene camera. Sunshine stores -1 as outside and 0 as inside; other positive values are normalized to outside.".to_string(),
+            choices: vec![
+                choice("-1", "Outside collection camera", "Uses the outdoor Shine collection camera."),
+                choice("0", "Inside collection camera", "Uses the indoor Shine collection camera."),
+            ],
+            indexed_choice: None,
+            integer_range: Some([-1, 0]),
+        },
+        _ => return None,
+    };
+    Some(info)
+}
 fn parameter_read_only_reason(
     placement: Option<&PlacementBinding>,
     key: &str,
@@ -652,6 +813,229 @@ mod editability_tests {
                 })
                 .collect(),
         })
+    }
+
+    fn actor_with_coin_id(record_type: &str, coin_id: i32) -> JDramaRecord {
+        JDramaRecord {
+            type_name: record_type.to_string(),
+            name: format!("{record_type} fixture"),
+            payload: JDramaRecordPayload::Actor {
+                transform: sms_formats::JDramaTransform {
+                    translation: [0.0; 3],
+                    rotation: [0.0; 3],
+                    scale: [1.0; 3],
+                },
+                character_name: "fixture character".to_string(),
+                light_map: sms_formats::JDramaLightMap::default(),
+                fields: vec![JDramaField {
+                    name: "coin_id".to_string(),
+                    value: JDramaFieldValue::I32(coin_id),
+                }],
+            },
+        }
+    }
+
+    #[test]
+    fn small_enemy_coin_ids_use_decomp_derived_drop_choices_for_every_actor() {
+        for record_type in [
+            "MarioModokiTelesa",
+            "LoopTelesa",
+            "BoxTelesa",
+            "SeeTelesa",
+            "HamuKuri",
+            "HaneHamuKuri",
+            "HaneHamuKuri2",
+            "Gesso",
+            "HanaSambo",
+            "SamboHead",
+            "DebuTelesa",
+            "Yumbo",
+            "TabePuku",
+            "LandGesso",
+            "PoiHana",
+            "PoiHanaRed",
+            "SleepPoiHana",
+            "FireWanwan",
+            "AmiNoko",
+            "Kumokun",
+            "FireHamuKuri",
+            "DoroHaneKuri",
+            "TamaNoko",
+            "BossDangoHamuKuri",
+            "Rocket",
+            "ElecNokonoko",
+            "MoePukuLaunchPad",
+            "TobiPukuLaunchPad",
+            "StayPakkun",
+        ] {
+            let parameters = editable_object_parameters(&actor_with_coin_id(record_type, 101))
+                .expect("coin-bearing actor should expose typed parameters");
+            let coin = parameters
+                .iter()
+                .find(|parameter| parameter.key == "coin_id")
+                .expect("coin_id descriptor");
+            let info = coin.info.as_ref().expect("coin_id metadata");
+            assert_eq!(
+                info.display_name.as_deref(),
+                Some("Coin drop"),
+                "{record_type}"
+            );
+            assert_eq!(info.choices.len(), 4, "{record_type}");
+            for expected in [-1, 100, 101, 200] {
+                assert!(
+                    info.choices
+                        .iter()
+                        .any(|choice| choice.raw_value == expected.to_string()),
+                    "{record_type} should offer {expected}"
+                );
+            }
+            let blue = info
+                .indexed_choice
+                .as_ref()
+                .expect("blue coin should be one indexed choice");
+            assert_eq!(blue.label, "Blue coin", "{record_type}");
+            assert_eq!(blue.index_label, "Slot", "{record_type}");
+            assert_eq!(blue.index_range, [0, i32::MAX as i64], "{record_type}");
+            assert_eq!(blue.retail_index_range, Some([0, 49]), "{record_type}");
+            for supported in [0, 49, 50, 99, 102, i32::MAX as i64] {
+                assert!(
+                    blue.accepts_index(supported),
+                    "{record_type} should retain blue slot {supported}"
+                );
+            }
+            for reserved in [-1, 100, 101, 200] {
+                assert!(
+                    !blue.accepts_index(reserved),
+                    "{record_type} should reserve {reserved}"
+                );
+            }
+            assert!(blue.is_retail_index(49), "{record_type}");
+            assert!(!blue.is_retail_index(50), "{record_type}");
+            assert_eq!(
+                info.choices
+                    .iter()
+                    .find(|choice| choice.raw_value == "101")
+                    .map(|choice| choice.label.as_str()),
+                Some("No coin drop - disabled"),
+                "{record_type}"
+            );
+            assert!(
+                info.description.contains("TItemManager") || info.description.contains("Decomp")
+            );
+            assert!(info.description.contains("unique"));
+        }
+    }
+
+    #[test]
+    fn coin_id_metadata_preserves_class_specific_runtime_semantics() {
+        let sambo = editable_object_parameters(&actor_with_coin_id("SamboFlower", 100)).unwrap();
+        let sambo_info = sambo
+            .iter()
+            .find(|parameter| parameter.key == "coin_id")
+            .and_then(|parameter| parameter.info.as_ref())
+            .unwrap();
+        assert_eq!(sambo_info.display_name.as_deref(), Some("Flower coin"));
+        assert_eq!(
+            sambo_info
+                .choices
+                .iter()
+                .map(|choice| choice.raw_value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["-1", "100"]
+        );
+        assert!(sambo_info.description.contains("sign"));
+        assert!(sambo_info.indexed_choice.is_none());
+
+        for record_type in ["MameGesso", "BossManta"] {
+            let parameters =
+                editable_object_parameters(&actor_with_coin_id(record_type, 100)).unwrap();
+            let info = parameters
+                .iter()
+                .find(|parameter| parameter.key == "coin_id")
+                .and_then(|parameter| parameter.info.as_ref())
+                .unwrap();
+            assert_eq!(
+                info.display_name.as_deref(),
+                Some("Unused coin value"),
+                "{record_type}"
+            );
+            assert!(info.choices.is_empty(), "{record_type}");
+            assert!(info.indexed_choice.is_none(), "{record_type}");
+            assert!(info.description.contains("not"), "{record_type}");
+        }
+    }
+
+    #[test]
+    fn shine_parameters_explain_runtime_modes_and_safe_ranges() {
+        let record = JDramaRecord {
+            type_name: "Shine".to_string(),
+            name: "retail shine".to_string(),
+            payload: JDramaRecordPayload::Actor {
+                transform: sms_formats::JDramaTransform {
+                    translation: [0.0; 3],
+                    rotation: [0.0; 3],
+                    scale: [1.0; 3],
+                },
+                character_name: "??????".to_string(),
+                light_map: sms_formats::JDramaLightMap::default(),
+                fields: vec![
+                    JDramaField {
+                        name: "collection_type".to_string(),
+                        value: JDramaFieldValue::String("demo".to_string()),
+                    },
+                    JDramaField {
+                        name: "shine_id".to_string(),
+                        value: JDramaFieldValue::I32(104),
+                    },
+                    JDramaField {
+                        name: "in_stage".to_string(),
+                        value: JDramaFieldValue::I32(1),
+                    },
+                ],
+            },
+        };
+
+        let parameters = editable_object_parameters(&record).unwrap();
+        let collection = parameters
+            .iter()
+            .find(|parameter| parameter.key == "collection_type")
+            .unwrap();
+        let collection_info = collection.info.as_ref().unwrap();
+        assert_eq!(
+            collection_info
+                .choices
+                .iter()
+                .map(|choice| choice.raw_value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["normal", "quickly", "demo"]
+        );
+        assert!(collection_info.description.contains("dormant"));
+
+        let shine_id = parameters
+            .iter()
+            .find(|parameter| parameter.key == "shine_id")
+            .unwrap();
+        assert_eq!(
+            shine_id.info.as_ref().unwrap().integer_range,
+            Some([-1, 119])
+        );
+
+        let in_stage = parameters
+            .iter()
+            .find(|parameter| parameter.key == "in_stage")
+            .unwrap();
+        assert_eq!(in_stage.info.as_ref().unwrap().integer_range, Some([-1, 0]));
+        assert_eq!(
+            in_stage
+                .info
+                .as_ref()
+                .unwrap()
+                .choices
+                .iter()
+                .map(|choice| choice.raw_value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["-1", "0"]
+        );
     }
 
     #[test]

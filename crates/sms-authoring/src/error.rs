@@ -79,6 +79,8 @@ pub enum DiagnosticCode {
     CollisionDuplicateRemoved,
     CollisionVertexWelded,
     CollisionUnusedVertexRemoved,
+    CoordinateSpaceMigrated,
+    CollisionWindingNormalized,
     CollisionSimplified,
 }
 

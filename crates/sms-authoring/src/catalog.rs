@@ -10,10 +10,11 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::import::normalize_legacy_render_collision_winding;
 use crate::{
-    import_model, AuthoringError, CollisionDocument, ColorSet, Diagnostic, ModelAssetDocument,
-    ModelImportOptions, ModelMaterial, ModelMesh, ModelNode, ModelPrimitive, ModelTexture,
-    TexCoordSet, MODEL_ASSET_FORMAT_VERSION,
+    import_model, AuthoringError, CollisionDocument, ColorSet, Diagnostic, DiagnosticCode,
+    ModelAssetDocument, ModelCoordinateSpace, ModelImportOptions, ModelMaterial, ModelMesh,
+    ModelNode, ModelPrimitive, ModelTexture, TexCoordSet, MODEL_ASSET_FORMAT_VERSION,
 };
 
 pub const MODEL_ASSET_MANIFEST_VERSION: u32 = 1;
@@ -813,6 +814,7 @@ impl ModelAssetCatalog {
 
         let mut document = ModelAssetDocument {
             format_version: manifest.document_format_version,
+            coordinate_space: manifest.coordinate_space,
             name: manifest.name.clone(),
             scene_roots: manifest.scene_roots.clone(),
             nodes: manifest.nodes.clone(),
@@ -823,7 +825,22 @@ impl ModelAssetCatalog {
             diagnostics: manifest.diagnostics.clone(),
             acknowledged_diagnostics: manifest.acknowledged_diagnostics.clone(),
         };
+        if document.migrate_legacy_reflected_z_coordinate_space() {
+            document.diagnostics.push(Diagnostic::info(
+                DiagnosticCode::CoordinateSpaceMigrated,
+                "migrated legacy reflected-Z model coordinates to the canonical glTF-compatible basis",
+                None,
+            ));
+        }
+        document.validate()?;
         document.repair_legacy_conservative_materials();
+        if normalize_legacy_render_collision_winding(&mut document)? {
+            document.diagnostics.push(Diagnostic::info(
+                DiagnosticCode::CollisionWindingNormalized,
+                "repaired legacy render-derived collision whose walkable terrain faced downward",
+                None,
+            ));
+        }
         document.validate()?;
         Ok(document)
     }
@@ -1108,6 +1125,8 @@ struct ModelAssetManifest {
     asset_kind: CatalogAssetKind,
     asset_id: AssetId,
     document_format_version: u32,
+    #[serde(default)]
+    coordinate_space: ModelCoordinateSpace,
     name: String,
     scene_roots: Vec<u32>,
     nodes: Vec<ModelNode>,
@@ -1203,6 +1222,7 @@ impl ModelAssetManifest {
                 asset_kind: CatalogAssetKind::Model,
                 asset_id,
                 document_format_version: document.format_version,
+                coordinate_space: document.coordinate_space,
                 name: document.name.clone(),
                 scene_roots: document.scene_roots.clone(),
                 nodes: document.nodes.clone(),

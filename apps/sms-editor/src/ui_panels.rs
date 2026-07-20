@@ -1160,8 +1160,17 @@ impl SmsEditorApp {
                             for parameter in parameters {
                                 canonical_keys.insert(parameter.key.clone());
                                 let editable = parameter.read_only_reason.is_none();
-                                ui.add_enabled(editable, egui::Label::new(parameter.key.as_str()))
-                                    .on_hover_text(format!("{:?}", parameter.kind));
+                                let parameter_hover = parameter.info.as_ref().map_or_else(
+                                    || format!("{:?}", parameter.kind),
+                                    |info| format!("{:?}\n\n{}", parameter.kind, info.description),
+                                );
+                                let display_name = parameter
+                                    .info
+                                    .as_ref()
+                                    .and_then(|info| info.display_name.as_deref())
+                                    .unwrap_or(parameter.key.as_str());
+                                ui.add_enabled(editable, egui::Label::new(display_name))
+                                    .on_hover_text(parameter_hover);
                                 let ObjectParameterControlResponse {
                                     edit,
                                     raw_value,
@@ -1171,16 +1180,30 @@ impl SmsEditorApp {
                                         object_parameter_control(ui, &parameter)
                                     })
                                     .inner;
-                                if let Some(reason) = parameter.read_only_reason.as_deref() {
-                                    ui.add_enabled(
-                                        false,
-                                        egui::Label::new(format!("Read-only: {reason}")),
-                                    )
-                                    .on_hover_text(reason);
-                                } else if let Some(error) = error {
-                                    ui.colored_label(egui::Color32::from_rgb(255, 116, 104), error);
-                                } else {
-                                    ui.small(format!("{:?}", parameter.kind));
+                                let mut status_help = Vec::new();
+                                let (status, status_color) =
+                                    if let Some(reason) = parameter.read_only_reason.as_deref() {
+                                        status_help.push(format!("Read-only: {reason}"));
+                                        ("Read-only \u{24d8}".to_string(), None)
+                                    } else if let Some(error) = error {
+                                        status_help.push(error);
+                                        (
+                                            "Invalid value \u{24d8}".to_string(),
+                                            Some(egui::Color32::from_rgb(255, 116, 104)),
+                                        )
+                                    } else {
+                                        (format!("{:?} \u{24d8}", parameter.kind), None)
+                                    };
+                                if let Some(info) = parameter.info.as_ref() {
+                                    status_help.push(info.description.clone());
+                                }
+                                let status = status_color.map_or_else(
+                                    || egui::RichText::new(&status).small().weak(),
+                                    |color| egui::RichText::new(&status).small().color(color),
+                                );
+                                let response = ui.label(status);
+                                if !status_help.is_empty() {
+                                    response.on_hover_text(status_help.join("\n\n"));
                                 }
                                 ui.end_row();
 
@@ -1344,6 +1367,136 @@ fn object_parameter_control(
     ui: &mut egui::Ui,
     parameter: &EditableSceneParameter,
 ) -> ObjectParameterControlResponse {
+    if let Some(info) = parameter
+        .info
+        .as_ref()
+        .filter(|info| !info.choices.is_empty() || info.indexed_choice.is_some())
+    {
+        const INDEXED_CHOICE_TOKEN: &str = "\0indexed-choice";
+
+        let parsed_index = parameter.raw_value.trim().parse::<i64>().ok();
+        let indexed_selected = info
+            .indexed_choice
+            .as_ref()
+            .is_some_and(|indexed| parsed_index.is_some_and(|value| indexed.accepts_index(value)));
+        let mut selected = if indexed_selected {
+            INDEXED_CHOICE_TOKEN.to_string()
+        } else {
+            parameter.raw_value.clone()
+        };
+        let selected_text = if indexed_selected {
+            info.indexed_choice
+                .as_ref()
+                .map(|indexed| indexed.label.as_str())
+                .unwrap_or(parameter.raw_value.as_str())
+        } else {
+            info.choices
+                .iter()
+                .find(|choice| choice.raw_value == selected)
+                .map(|choice| choice.label.as_str())
+                .unwrap_or(parameter.raw_value.as_str())
+        };
+        let mut edit = VectorDragResponse::default();
+        let mut raw_value = None;
+        let mut error = None;
+
+        ui.horizontal(|ui| {
+            let mut selection_changed = false;
+            egui::ComboBox::from_id_salt(("object-parameter-choice", parameter.key.as_str()))
+                .selected_text(selected_text)
+                .width(150.0)
+                .show_ui(ui, |ui| {
+                    for choice in &info.choices {
+                        let response = ui
+                            .selectable_value(
+                                &mut selected,
+                                choice.raw_value.clone(),
+                                &choice.label,
+                            )
+                            .on_hover_text(&choice.description);
+                        selection_changed |= response.changed();
+                    }
+                    if let Some(indexed) = info.indexed_choice.as_ref() {
+                        let response = ui
+                            .selectable_value(
+                                &mut selected,
+                                INDEXED_CHOICE_TOKEN.to_string(),
+                                &indexed.label,
+                            )
+                            .on_hover_text(&indexed.description);
+                        selection_changed |= response.changed();
+                    }
+                });
+
+            if selection_changed {
+                edit.changed = true;
+                edit.started = true;
+                edit.stopped = true;
+                raw_value = Some(if selected == INDEXED_CHOICE_TOKEN {
+                    info.indexed_choice
+                        .as_ref()
+                        .map(|indexed| indexed.default_index.to_string())
+                        .unwrap_or_default()
+                } else {
+                    selected.clone()
+                });
+            }
+
+            if selected == INDEXED_CHOICE_TOKEN {
+                let indexed = info
+                    .indexed_choice
+                    .as_ref()
+                    .expect("indexed selection requires indexed metadata");
+                ui.label(format!("{}:", indexed.index_label));
+                let mut index = if indexed_selected {
+                    parsed_index.unwrap_or(indexed.default_index)
+                } else {
+                    indexed.default_index
+                };
+                let response = ui
+                    .add(
+                        egui::DragValue::new(&mut index)
+                            .speed(1.0)
+                            .range(indexed.index_range[0]..=indexed.index_range[1]),
+                    )
+                    .on_hover_text(&indexed.description);
+                let index_edit = object_parameter_widget_response(&response);
+                edit.merge(index_edit);
+                if index_edit.changed {
+                    if indexed.reserved_indices.contains(&index) {
+                        let reserved_for = info
+                            .choices
+                            .iter()
+                            .find(|choice| choice.raw_value == index.to_string())
+                            .map(|choice| choice.label.as_str())
+                            .unwrap_or("another coin type");
+                        error = Some(format!(
+                            "Blue coin slot {index} is reserved for {reserved_for}. Choose another slot."
+                        ));
+                        raw_value = None;
+                    } else {
+                        raw_value = Some(index.to_string());
+                    }
+                }
+                if !indexed.is_retail_index(index) {
+                    ui.label(
+                        egui::RichText::new("Expanded")
+                            .small()
+                            .color(egui::Color32::from_rgb(235, 190, 92)),
+                    )
+                    .on_hover_text(
+                        "This slot is retained by the editor but requires a compatible expanded runtime; retail Sunshine only implements blue-coin slots 0-49.",
+                    );
+                }
+            }
+        });
+
+        return ObjectParameterControlResponse {
+            edit,
+            raw_value,
+            error,
+        };
+    }
     match parameter.kind {
         ObjectParameterKind::U32 => {
             let parsed = parameter.raw_value.trim().parse::<u32>();
@@ -1371,7 +1524,13 @@ fn object_parameter_control(
                 .err()
                 .map(|error| format!("Expected i32: {error}"));
             let mut value = parsed.unwrap_or_default();
-            let response = ui.add(egui::DragValue::new(&mut value).speed(1.0));
+            let mut drag = egui::DragValue::new(&mut value).speed(1.0);
+            if let Some([minimum, maximum]) =
+                parameter.info.as_ref().and_then(|info| info.integer_range)
+            {
+                drag = drag.range(minimum..=maximum);
+            }
+            let response = ui.add(drag);
             let edit = object_parameter_widget_response(&response);
             let raw_value = edit.changed.then(|| value.to_string());
             if raw_value.is_some() {

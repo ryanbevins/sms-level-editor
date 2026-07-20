@@ -2371,7 +2371,7 @@ impl SmsEditorApp {
                 "Correct winding",
             );
         });
-        ui.small("Default: glTF Y-up, 100 Sunshine units per meter, reflected Z basis.");
+        ui.small("Default: glTF/Blender Y-up identity basis, 100 Sunshine units per meter.");
         ui.label("Axis basis (rows)");
         for row in 0..3 {
             ui.horizontal(|ui| {

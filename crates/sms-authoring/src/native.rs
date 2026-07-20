@@ -1,4 +1,8 @@
-use crate::{AuthoringError, AuthoringResult, ModelAssetDocument, MODEL_ASSET_FORMAT_VERSION};
+use crate::import::normalize_legacy_render_collision_winding;
+use crate::{
+    AuthoringError, AuthoringResult, Diagnostic, DiagnosticCode, ModelAssetDocument,
+    MODEL_ASSET_FORMAT_VERSION,
+};
 use encoding_rs::SHIFT_JIS;
 
 const MAX_NATIVE_ASSET_BYTES: usize = 512 * 1024 * 1024;
@@ -29,7 +33,22 @@ impl ModelAssetDocument {
             )));
         }
         let mut document: Self = serde_json::from_value(value)?;
+        if document.migrate_legacy_reflected_z_coordinate_space() {
+            document.diagnostics.push(Diagnostic::info(
+                DiagnosticCode::CoordinateSpaceMigrated,
+                "migrated legacy reflected-Z model coordinates to the canonical glTF-compatible basis",
+                None,
+            ));
+        }
+        document.validate()?;
         document.repair_legacy_conservative_materials();
+        if normalize_legacy_render_collision_winding(&mut document)? {
+            document.diagnostics.push(Diagnostic::info(
+                DiagnosticCode::CollisionWindingNormalized,
+                "repaired legacy render-derived collision whose walkable terrain faced downward",
+                None,
+            ));
+        }
         document.validate()?;
         Ok(document)
     }

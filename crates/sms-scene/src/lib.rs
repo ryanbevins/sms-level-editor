@@ -37,14 +37,16 @@ pub use blank_stage::{
 };
 pub use object_authoring::{
     ObjectAuthoringCatalog, ObjectAuthoringCatalogBuild, ObjectAuthoringCatalogWarning,
-    ObjectAuthoringDependency, ObjectAuthoringResource, ObjectAuthoringTemplate,
+    ObjectAuthoringDependency, ObjectAuthoringResource, ObjectAuthoringTableDependency,
+    ObjectAuthoringTemplate, SHINE_QUICK_CAMERA_NAME,
 };
 pub(crate) use object_parameters::validate_object_parameter_links;
 pub use object_parameters::{
     apply_all_object_parameters, apply_dirty_object_parameter_edits, apply_object_parameter_edits,
     editable_object_parameters, editable_parameters_for_object, seed_scene_object_parameters,
-    sync_scene_object_parameter_aliases, EditableSceneParameter, ObjectParameterKind,
-    ParameterApplyMode, OBJECT_PARAMETER_CHARACTER_NAME, OBJECT_PARAMETER_NAME,
+    sync_scene_object_parameter_aliases, EditableSceneParameter, ObjectParameterChoice,
+    ObjectParameterIndexedChoice, ObjectParameterInfo, ObjectParameterKind, ParameterApplyMode,
+    OBJECT_PARAMETER_CHARACTER_NAME, OBJECT_PARAMETER_NAME,
 };
 pub use stage_archive::{
     SourceFreeStageArchive, StageCompression, StageObjectPlacement, StageOrigin, StageResource,
@@ -980,6 +982,8 @@ pub struct EditorSceneOverlay {
     pub lighting: Option<StageLighting>,
 }
 
+pub const OBJECT_AUTHORING_DEFAULTS_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SceneObject {
     pub id: String,
@@ -1004,6 +1008,17 @@ pub struct SceneObject {
     /// retain clone capacity requirements without regenerating the registry.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub manager_capacity_dependencies: Vec<String>,
+    /// Version of editor-owned safe defaults applied to an authored record.
+    ///
+    /// Retail/imported objects remain zero. Missing values in older project
+    /// overlays also deserialize as zero so narrowly scoped migrations can
+    /// distinguish legacy authored objects from deliberate current settings.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub authoring_defaults_version: u32,
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1083,6 +1098,7 @@ impl SceneObject {
             raw_params: BTreeMap::new(),
             asset_hints: Vec::new(),
             manager_capacity_dependencies: Vec::new(),
+            authoring_defaults_version: 0,
         }
     }
 
@@ -2863,6 +2879,98 @@ mod tests {
             .iter()
             .any(|issue| issue.code == "empty-object-id"
                 && issue.severity == ValidationSeverity::Error));
+    }
+
+    fn authored_shine_for_validation(
+        id: &str,
+        collection_type: &str,
+        shine_id: i32,
+        in_stage: i32,
+    ) -> SceneObject {
+        let prototype = JDramaRecord {
+            type_name: "Shine".to_string(),
+            name: format!("SMS Editor Shine {id}"),
+            payload: JDramaRecordPayload::Actor {
+                transform: sms_formats::JDramaTransform {
+                    translation: [0.0; 3],
+                    rotation: [0.0; 3],
+                    scale: [1.0; 3],
+                },
+                character_name: "??????".to_string(),
+                light_map: sms_formats::JDramaLightMap::default(),
+                fields: vec![
+                    JDramaField {
+                        name: "collection_type".to_string(),
+                        value: JDramaFieldValue::String(collection_type.to_string()),
+                    },
+                    JDramaField {
+                        name: "shine_id".to_string(),
+                        value: JDramaFieldValue::I32(shine_id),
+                    },
+                    JDramaField {
+                        name: "in_stage".to_string(),
+                        value: JDramaFieldValue::I32(in_stage),
+                    },
+                ],
+            },
+        };
+        let mut object = SceneObject::new(id, "Shine");
+        seed_scene_object_parameters(&mut object, &prototype).unwrap();
+        object.placement = Some(PlacementBinding::Authored(AuthoredPlacement {
+            raw_resource_path: b"map/scene.bin".to_vec(),
+            target_group_index: 4,
+            prototype,
+            dependencies: Vec::new(),
+        }));
+        object
+    }
+
+    #[test]
+    fn validates_authored_shine_runtime_modes_flags_and_camera_values() {
+        let mut doc = empty_document("fixture0");
+        doc.objects
+            .push(authored_shine_for_validation("shine-a", "demo", 12, 1));
+        doc.objects
+            .push(authored_shine_for_validation("shine-b", "normal", 12, -1));
+        doc.objects
+            .push(authored_shine_for_validation("shine-c", "normal", 120, 0));
+
+        let issues = doc.validate();
+        for code in [
+            "shine-requires-external-trigger",
+            "invalid-shine-camera-mode",
+            "invalid-shine-id",
+            "duplicate-authored-shine-id",
+        ] {
+            assert!(
+                issues.iter().any(|issue| issue.code == code),
+                "missing validation issue {code}: {issues:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn authored_normal_shine_with_unique_flag_has_no_shine_warning() {
+        let mut doc = empty_document("fixture0");
+        doc.objects
+            .push(authored_shine_for_validation("shine-a", "normal", 12, -1));
+
+        assert!(doc
+            .validate()
+            .iter()
+            .all(|issue| !issue.code.contains("shine")));
+    }
+
+    #[test]
+    fn authored_quick_shine_without_retail_camera_is_a_validation_error() {
+        let mut doc = empty_document("fixture0");
+        doc.objects
+            .push(authored_shine_for_validation("shine-a", "quickly", 12, -1));
+
+        assert!(doc.validate().iter().any(|issue| {
+            issue.code == "missing-shine-quick-camera"
+                && issue.severity == ValidationSeverity::Error
+        }));
     }
 
     #[test]

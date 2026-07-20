@@ -4,8 +4,8 @@ use std::path::Path;
 use base64::Engine;
 use sms_authoring::{
     import_model, AuthoringError, CollisionDocument, CollisionGroup,
-    CollisionSimplificationOptions, CollisionSource, CollisionSurface, DiagnosticCode,
-    ModelAssetDocument, ModelImportOptions,
+    CollisionSimplificationOptions, CollisionSource, CollisionSurface, CoordinateConversion,
+    DiagnosticCode, ModelAssetDocument, ModelImportOptions,
 };
 
 fn triangle_buffer() -> Vec<u8> {
@@ -79,22 +79,32 @@ fn write_triangle(directory: &Path, node_name: &str) -> std::path::PathBuf {
 }
 
 #[test]
+fn default_conversion_preserves_blender_gltf_axes_and_winding() {
+    let conversion = CoordinateConversion::default();
+    assert_eq!(
+        conversion.basis,
+        [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    );
+    assert!(!conversion.reverse_winding);
+}
+
+#[test]
 fn imports_external_triangle_and_round_trips_native_asset() {
     let directory = tempfile::tempdir().unwrap();
     let path = write_triangle(directory.path(), "root");
     let imported = import_model(&path, &ModelImportOptions::default()).unwrap();
     let primitive = &imported.asset.meshes[0].primitives[0];
     assert_eq!(primitive.positions[1], [100.0, 0.0, 0.0]);
-    assert_eq!(primitive.indices, [0, 2, 1]);
+    assert_eq!(primitive.indices, [0, 1, 2]);
     assert_eq!(
         imported.asset.nodes[0].local_transform[3],
-        [100.0, 200.0, -300.0, 1.0]
+        [100.0, 200.0, 300.0, 1.0]
     );
     assert_eq!(
         imported.asset.converted_bounds().unwrap().unwrap(),
         sms_authoring::ModelBounds {
-            min: [100.0, 200.0, -300.0],
-            max: [200.0, 300.0, -300.0],
+            min: [100.0, 200.0, 300.0],
+            max: [200.0, 300.0, 300.0],
         }
     );
     assert!(imported
@@ -103,7 +113,7 @@ fn imports_external_triangle_and_round_trips_native_asset() {
         .any(|diagnostic| diagnostic.code == DiagnosticCode::GeneratedNormals));
 
     let collision = imported.asset.collision.as_ref().unwrap();
-    assert_eq!(collision.vertices[0], [100.0, 200.0, -300.0]);
+    assert_eq!(collision.vertices[0], [100.0, 200.0, 300.0]);
     let encoded_col = collision.to_col_bytes().unwrap();
     let parsed_col = sms_formats::ColFile::parse(&encoded_col).unwrap();
     assert_eq!(parsed_col.groups()[0].triangles.len(), 1);
@@ -121,6 +131,50 @@ fn imports_external_triangle_and_round_trips_native_asset() {
     assert_eq!(stage.order.color_channel, 4);
     assert_eq!(stage.color_args, [10, 15, 15, 15]);
     assert_eq!(stage.alpha_args, [5, 7, 7, 7]);
+}
+
+#[test]
+fn render_collision_normalizes_a_predominantly_inverted_terrain_shell() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut bytes = Vec::new();
+    for value in [0.0f32, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0] {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    for index in [0u16, 1, 2] {
+        bytes.extend_from_slice(&index.to_le_bytes());
+    }
+    fs::write(directory.path().join("terrain.bin"), bytes).unwrap();
+    let json = r#"{
+  "asset": {"version": "2.0"},
+  "buffers": [{"uri": "terrain.bin", "byteLength": 42}],
+  "bufferViews": [
+    {"buffer": 0, "byteOffset": 0, "byteLength": 36},
+    {"buffer": 0, "byteOffset": 36, "byteLength": 6}
+  ],
+  "accessors": [
+    {"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3", "max": [1,0,1], "min": [0,0,0]},
+    {"bufferView": 1, "componentType": 5123, "count": 3, "type": "SCALAR"}
+  ],
+  "meshes": [{"name":"terrain", "primitives": [{"attributes": {"POSITION": 0}, "indices": 1, "mode": 4}]}],
+  "nodes": [{"name":"ground", "mesh":0}],
+  "scenes": [{"nodes":[0]}],
+  "scene": 0
+}"#;
+    let path = directory.path().join("terrain.gltf");
+    fs::write(&path, json).unwrap();
+
+    let imported = import_model(path, &ModelImportOptions::default()).unwrap();
+    assert!(imported
+        .diagnostics
+        .iter()
+        .any(|diagnostic| { diagnostic.code == DiagnosticCode::CollisionWindingNormalized }));
+    let collision = imported.asset.collision.unwrap();
+    let triangle = collision.groups[0].triangles[0];
+    let [a, b, c] = triangle.map(|index| collision.vertices[index as usize]);
+    let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+    let normal_y = ab[2] * ac[0] - ab[0] * ac[2];
+    assert!(normal_y > 0.0, "normalized COL terrain must face upward");
 }
 
 #[test]

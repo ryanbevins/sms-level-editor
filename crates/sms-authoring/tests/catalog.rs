@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use sms_authoring::{
     import_model, AssetReference, CatalogError, CatalogFilter, CatalogIssueKind, CollisionDocument,
     CollisionGroup, CollisionSurface, ColorSet, ModelAssetCatalog, ModelAssetDocument,
-    ModelImportOptions, ModelMesh, ModelNode, ModelPrimitive, ModelTexture, NodePurpose,
-    TexCoordSet,
+    ModelCoordinateSpace, ModelImportOptions, ModelMesh, ModelNode, ModelPrimitive, ModelTexture,
+    NodePurpose, TexCoordSet,
 };
 
 fn test_document(name: &str) -> ModelAssetDocument {
@@ -98,6 +98,58 @@ fn managed_manifest_round_trips_without_inline_geometry_or_textures() {
 }
 
 #[test]
+fn catalog_load_migrates_missing_legacy_coordinate_space_without_source_gltf() {
+    let mut legacy = test_document("Legacy reflected Z");
+    legacy.coordinate_space = ModelCoordinateSpace::LegacyReflectedZ;
+    legacy.nodes[0].local_transform[3][2] = 30.0;
+    legacy.meshes[0].primitives[0].positions[2][2] = 20.0;
+    legacy.collision.as_mut().unwrap().vertices[2][2] = 100.0;
+
+    let project = tempfile::tempdir().unwrap();
+    let catalog = ModelAssetCatalog::open_project(project.path()).unwrap();
+    let entry = catalog.create_asset("LegacyReflectedZ", &legacy).unwrap();
+    let manifest_path = project.path().join("Content/LegacyReflectedZ.smsmodel");
+    let manifest = fs::read_to_string(&manifest_path).unwrap();
+    let legacy_manifest = manifest.replace(
+        concat!(
+            "  \"coordinate_space\": \"legacy_reflected_z\",",
+            "
+"
+        ),
+        "",
+    );
+    assert_ne!(
+        manifest, legacy_manifest,
+        "fixture must remove the new marker"
+    );
+    fs::write(&manifest_path, legacy_manifest).unwrap();
+
+    let migrated = catalog.load_asset(entry.id).unwrap();
+    assert_eq!(
+        migrated.coordinate_space,
+        ModelCoordinateSpace::GltfCompatible
+    );
+    assert_eq!(migrated.nodes[0].local_transform[3][2], -30.0);
+    assert_eq!(migrated.meshes[0].primitives[0].positions[2][2], -20.0);
+    assert_eq!(migrated.meshes[0].primitives[0].indices, [0, 2, 1]);
+    assert_eq!(migrated.collision.as_ref().unwrap().vertices[2][2], -100.0);
+    assert_eq!(
+        migrated.collision.as_ref().unwrap().groups[0].triangles[0],
+        [0, 2, 1]
+    );
+    assert!(migrated.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == sms_authoring::DiagnosticCode::CoordinateSpaceMigrated
+    }));
+
+    catalog.save_asset(entry.id, &migrated).unwrap();
+    let reopened = catalog.load_asset(entry.id).unwrap();
+    assert_eq!(
+        reopened, migrated,
+        "coordinate migration must apply exactly once"
+    );
+}
+
+#[test]
 fn catalog_load_repairs_the_exact_legacy_invisible_material_program() {
     let source = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/gltf/valid/material-textures/model.gltf");
@@ -118,6 +170,35 @@ fn catalog_load_repairs_the_exact_legacy_invisible_material_program() {
     assert!(gx.color_channels[0].is_some());
     assert!(gx.color_channels[1].is_some());
     assert_eq!(gx.tev_orders[0].unwrap().color_channel, 4);
+}
+
+#[test]
+fn catalog_load_repairs_legacy_render_derived_inverted_collision() {
+    let mut legacy = test_document("Legacy inverted terrain");
+    let primitive = &mut legacy.meshes[0].primitives[0];
+    primitive.positions = vec![[0.0, 0.0, 0.0], [100.0, 0.0, 0.0], [0.0, 0.0, 100.0]];
+    primitive.normals = vec![[0.0, -1.0, 0.0]; 3];
+    primitive.indices = vec![0, 1, 2];
+    let collision = legacy.collision.as_mut().unwrap();
+    collision.vertices = primitive.positions.clone();
+    collision.groups[0].name = "Root/primitive_0".to_string();
+    collision.groups[0].triangles = vec![[0, 1, 2]];
+    legacy.validate().unwrap();
+
+    let project = tempfile::tempdir().unwrap();
+    let catalog = ModelAssetCatalog::open_project(project.path()).unwrap();
+    let entry = catalog
+        .create_asset("LegacyInvertedTerrain", &legacy)
+        .unwrap();
+    let repaired = catalog.load_asset(entry.id).unwrap();
+
+    assert_eq!(
+        repaired.collision.unwrap().groups[0].triangles[0],
+        [0, 2, 1]
+    );
+    assert!(repaired.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == sms_authoring::DiagnosticCode::CollisionWindingNormalized
+    }));
 }
 
 #[test]

@@ -237,6 +237,9 @@ pub struct ObjectAuthoringTemplate {
     /// Exact `ObjChara`/`SmplChara` registrations required before this actor
     /// and its manager records are loaded.
     pub character_records: Vec<JDramaRecord>,
+    /// Named records outside `map/scene.bin` that the actor reaches through
+    /// fixed runtime lookups rather than serialized actor fields.
+    pub table_dependencies: Vec<ObjectAuthoringTableDependency>,
     pub required_graph_names: Vec<String>,
     pub resources: Vec<ObjectAuthoringResource>,
     pub preview_resource_path: Option<Vec<u8>>,
@@ -246,6 +249,12 @@ pub struct ObjectAuthoringTemplate {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ObjectAuthoringDependency {
     pub group_index: u32,
+    pub target: AuthoredPlacementDependencyTarget,
+    pub record: JDramaRecord,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObjectAuthoringTableDependency {
     pub target: AuthoredPlacementDependencyTarget,
     pub record: JDramaRecord,
 }
@@ -269,6 +278,26 @@ struct SourceDocument {
     raw_resource_path: Vec<u8>,
     source_asset_path: PathBuf,
     document: JDramaDocument,
+}
+
+pub const SHINE_QUICK_CAMERA_NAME: &str = "\u{30b7}\u{30e3}\u{30a4}\u{30f3}\u{ff08}\u{3044}\u{304d}\u{306a}\u{308a}\u{51fa}\u{73fe}\u{ff09}\u{30ab}\u{30e1}\u{30e9}";
+
+struct RuntimeTableDependencySpec {
+    record_type: &'static str,
+    record_name: &'static str,
+}
+
+const SHINE_RUNTIME_TABLE_DEPENDENCIES: &[RuntimeTableDependencySpec] =
+    &[RuntimeTableDependencySpec {
+        record_type: "CameraMapInfo",
+        record_name: SHINE_QUICK_CAMERA_NAME,
+    }];
+
+fn runtime_table_dependency_specs(factory_name: &str) -> &'static [RuntimeTableDependencySpec] {
+    match semantic_type_name(factory_name) {
+        "Shine" => SHINE_RUNTIME_TABLE_DEPENDENCIES,
+        _ => &[],
+    }
 }
 
 #[derive(Debug)]
@@ -306,6 +335,65 @@ struct Candidate {
 struct ResolvedCharacterRecords {
     target_records: Vec<JDramaRecord>,
     resource_records: Vec<JDramaRecord>,
+}
+
+fn resolve_runtime_table_dependencies(
+    factory_name: &str,
+    sources: &[&CatalogSource],
+) -> Result<Vec<ObjectAuthoringTableDependency>, String> {
+    fn collect_matches(
+        parent: &JDramaRecord,
+        spec: &RuntimeTableDependencySpec,
+        out: &mut Vec<ObjectAuthoringTableDependency>,
+    ) {
+        let JDramaRecordPayload::Group { children, .. } = &parent.payload else {
+            return;
+        };
+        for child in children {
+            if semantic_type_name(&child.type_name) == spec.record_type
+                && child.name == spec.record_name
+            {
+                out.push(ObjectAuthoringTableDependency {
+                    target: AuthoredPlacementDependencyTarget::NamedGroup {
+                        type_name: parent.type_name.clone(),
+                        name: parent.name.clone(),
+                    },
+                    record: child.clone(),
+                });
+            }
+            collect_matches(child, spec, out);
+        }
+    }
+
+    let specs = runtime_table_dependency_specs(factory_name);
+    let mut resolved = Vec::new();
+    for spec in specs {
+        let mut matches = Vec::new();
+        for source in sources {
+            for document in &source.documents {
+                if normalized_path(&document.raw_resource_path) == "map/tables.bin" {
+                    collect_matches(&document.document.root, spec, &mut matches);
+                }
+            }
+        }
+        let Some(first) = matches.first().cloned() else {
+            return Err(format!(
+                "retail catalog has no {} record named {:?} required by {factory_name}",
+                spec.record_type, spec.record_name
+            ));
+        };
+        if matches
+            .iter()
+            .any(|candidate| candidate.target != first.target || candidate.record != first.record)
+        {
+            return Err(format!(
+                "retail catalog has incompatible {} records named {:?} required by {factory_name}",
+                spec.record_type, spec.record_name
+            ));
+        }
+        resolved.push(first);
+    }
+    Ok(resolved)
 }
 
 fn parse_common_character_document(
@@ -529,6 +617,21 @@ fn build_from_sources_with_common(
                 continue;
             }
         };
+        let table_dependencies =
+            match resolve_runtime_table_dependencies(&candidate.factory_name, &sources) {
+                Ok(dependencies) => dependencies,
+                Err(reason) => {
+                    warnings.push(ObjectAuthoringCatalogWarning {
+                        source_stage: candidate.source_stage.clone(),
+                        source_asset_path: Some(candidate.source_asset_path.clone()),
+                        message: format!(
+                            "Omitted unsafe authoring candidate '{}': {reason}",
+                            candidate.factory_name
+                        ),
+                    });
+                    continue;
+                }
+            };
         let preview_resource_path = preview_resource_path(&candidate, &resources, registry);
         templates.insert(
             factory_name,
@@ -538,6 +641,7 @@ fn build_from_sources_with_common(
                 record: candidate.record,
                 dependencies: candidate.dependencies,
                 character_records: candidate.character_records,
+                table_dependencies,
                 required_graph_names: candidate.graph_names.into_iter().collect(),
                 resources,
                 preview_resource_path,
@@ -2042,6 +2146,89 @@ mod tests {
         }
     }
 
+    fn quick_camera_record() -> JDramaRecord {
+        fields(
+            "CameraMapInfo",
+            SHINE_QUICK_CAMERA_NAME,
+            vec![
+                field(
+                    "position",
+                    JDramaFieldValue::Vec3F32([-3700.0, 900.0, -11000.0]),
+                ),
+                field("pitch_yaw", JDramaFieldValue::Vec2F32([0.0, 122.0])),
+                field("flags", JDramaFieldValue::I32(0)),
+                field("camera_mode", JDramaFieldValue::I32(33)),
+                field("camera_parameter", JDramaFieldValue::I32(-1)),
+                field("demo_length_frames", JDramaFieldValue::I32(900)),
+            ],
+        )
+    }
+
+    fn source_with_shine_and_quick_camera() -> CatalogSource {
+        let mut source = source(
+            "pinnaParco7",
+            document(vec![(5, vec![actor("Shine", "shine", 1)])]),
+        );
+        source.documents.push(SourceDocument {
+            raw_resource_path: b"map/tables.bin".to_vec(),
+            source_asset_path: PathBuf::from("pinnaParco7.szs!/map/tables.bin"),
+            document: JDramaDocument {
+                root: group(
+                    "NameRefGrp",
+                    vec![JDramaRecord {
+                        type_name: "CameraMapToolTable".to_string(),
+                        name: "camera map tool table".to_string(),
+                        payload: JDramaRecordPayload::Group {
+                            fields: Vec::new(),
+                            children: vec![quick_camera_record()],
+                        },
+                    }],
+                ),
+            },
+        });
+        source
+    }
+
+    #[test]
+    fn shine_catalog_owns_the_retail_quick_camera_lookup_record() {
+        let registry = ObjectRegistry {
+            objects: vec![object("Shine", "TShine")],
+            ..ObjectRegistry::default()
+        };
+        let source = source_with_shine_and_quick_camera();
+        let catalog = build_from_sources(&[source], &registry);
+        let template = catalog.find("Shine").unwrap();
+
+        assert_eq!(template.table_dependencies.len(), 1);
+        let dependency = &template.table_dependencies[0];
+        assert_eq!(dependency.record, quick_camera_record());
+        assert!(matches!(
+            &dependency.target,
+            AuthoredPlacementDependencyTarget::NamedGroup { type_name, name }
+                if type_name == "CameraMapToolTable" && name == "camera map tool table"
+        ));
+    }
+
+    #[test]
+    fn shine_catalog_is_omitted_when_the_fixed_quick_camera_lookup_is_missing() {
+        let registry = ObjectRegistry {
+            objects: vec![object("Shine", "TShine")],
+            ..ObjectRegistry::default()
+        };
+        let source = source(
+            "stage",
+            document(vec![(5, vec![actor("Shine", "shine", 1)])]),
+        );
+        let mut warnings = Vec::new();
+        let catalog = build_from_sources_with_common(&[source], &registry, None, &mut warnings);
+
+        assert!(catalog.find("Shine").is_none());
+        assert!(warnings.iter().any(|warning| {
+            warning.message.contains("CameraMapInfo")
+                && warning.message.contains(SHINE_QUICK_CAMERA_NAME)
+        }));
+    }
+
     #[test]
     fn common_character_parser_preserves_a_strict_typed_document() {
         let document = JDramaDocument {
@@ -3279,6 +3466,11 @@ mod tests {
             .required_graph_names
             .iter()
             .all(|name| runtime_reference(name).is_some())));
+        let shine = build.catalog.find("Shine").expect("Shine retail template");
+        assert!(shine.table_dependencies.iter().any(|dependency| {
+            semantic_type_name(&dependency.record.type_name) == "CameraMapInfo"
+                && dependency.record.name == SHINE_QUICK_CAMERA_NAME
+        }));
         let boss_gesso = build
             .catalog
             .find("BossGesso")

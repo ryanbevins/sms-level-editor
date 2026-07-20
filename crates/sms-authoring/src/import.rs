@@ -76,6 +76,7 @@ pub fn import_model(
     )?;
     let mut asset = ModelAssetDocument {
         format_version: crate::MODEL_ASSET_FORMAT_VERSION,
+        coordinate_space: crate::ModelCoordinateSpace::GltfCompatible,
         name,
         scene_roots,
         nodes,
@@ -94,6 +95,7 @@ pub fn import_model(
             CollisionSelection::Renderable,
             &std::collections::BTreeMap::new(),
             surface,
+            true,
         )?),
         CollisionSource::EmbeddedNodes {
             prefix,
@@ -108,6 +110,7 @@ pub fn import_model(
             },
             surfaces_by_node,
             default_surface,
+            false,
         )?),
         CollisionSource::SeparateFile {
             path: collision_path,
@@ -162,6 +165,7 @@ pub fn import_collision(
         selection,
         &options.surfaces_by_node,
         &options.default_surface,
+        false,
     )?;
     if let Some(simplification) = &options.simplification {
         let report = result.collision.simplify(simplification)?;
@@ -808,6 +812,7 @@ fn collision_from_asset(
     selection: CollisionSelection<'_>,
     surfaces_by_node: &std::collections::BTreeMap<String, crate::CollisionSurface>,
     default_surface: &crate::CollisionSurface,
+    normalize_render_terrain_winding: bool,
 ) -> AuthoringResult<CollisionImportResult> {
     let global_transforms = global_transforms(&asset.nodes)?;
     let active_nodes = active_node_mask(asset)?;
@@ -875,14 +880,109 @@ fn collision_from_asset(
             ));
         }
     }
+    let winding_normalized =
+        normalize_render_terrain_winding && normalize_inverted_terrain_shell(&mut collision);
     let cleanup = collision.cleanup_exact()?;
-    let diagnostics = cleanup_diagnostics(cleanup);
+    let mut diagnostics = cleanup_diagnostics(cleanup);
+    if winding_normalized {
+        diagnostics.push(Diagnostic::info(
+            DiagnosticCode::CollisionWindingNormalized,
+            "reversed a predominantly downward-facing render-derived collision shell so walkable terrain faces upward",
+            None,
+        ));
+    }
     Ok(CollisionImportResult {
         collision,
         diagnostics,
         cleanup,
         simplification: None,
     })
+}
+
+/// Migrates catalog assets created before render-derived collision winding was
+/// normalized. Exact group-name parity proves the stored COL was generated
+/// from the asset's active render primitives; embedded and separate collision
+/// therefore retain their explicitly authored orientation.
+pub(crate) fn normalize_legacy_render_collision_winding(
+    asset: &mut ModelAssetDocument,
+) -> AuthoringResult<bool> {
+    let active = active_node_mask(asset)?;
+    let mut expected_groups = BTreeSet::new();
+    for (node_index, node) in asset.nodes.iter().enumerate() {
+        if !active[node_index] || node.purpose != NodePurpose::Render {
+            continue;
+        }
+        let Some(mesh_index) = node.mesh else {
+            continue;
+        };
+        let mesh = asset.meshes.get(mesh_index as usize).ok_or_else(|| {
+            AuthoringError::invalid(format!(
+                "node {} references missing mesh {mesh_index}",
+                node.name
+            ))
+        })?;
+        for primitive_index in 0..mesh.primitives.len() {
+            expected_groups.insert(format!("{}/primitive_{primitive_index}", node.name));
+        }
+    }
+    let Some(collision) = asset.collision.as_mut() else {
+        return Ok(false);
+    };
+    if collision.groups.len() != expected_groups.len()
+        || collision
+            .groups
+            .iter()
+            .any(|group| !expected_groups.contains(&group.name))
+    {
+        return Ok(false);
+    }
+    Ok(normalize_inverted_terrain_shell(collision))
+}
+
+/// Repairs render-derived terrain exported by tools that preserve an inverted
+/// whole-model winding. Sunshine derives floor, roof, and wall classification
+/// directly from COL triangle order, so an inverted shell makes every visible
+/// floor behave as a roof.
+///
+/// The decision is global rather than per triangle or material: this preserves
+/// the relative orientation of floors, walls, and ceilings. Only faces that
+/// Sunshine itself would classify as floor/roof contribute to the decision.
+pub(crate) fn normalize_inverted_terrain_shell(collision: &mut CollisionDocument) -> bool {
+    let mut upward_projected_area = 0.0_f64;
+    let mut downward_projected_area = 0.0_f64;
+    for group in &collision.groups {
+        for triangle in &group.triangles {
+            let [Some(a), Some(b), Some(c)] =
+                triangle.map(|index| collision.vertices.get(index as usize).copied())
+            else {
+                continue;
+            };
+            let face = cross(sub(b, a), sub(c, a));
+            let length_squared = face[0] * face[0] + face[1] * face[1] + face[2] * face[2];
+            if length_squared == 0.0 || face[1] * face[1] <= 0.04 * length_squared {
+                continue;
+            }
+            if face[1] > 0.0 {
+                upward_projected_area += f64::from(face[1]);
+            } else {
+                downward_projected_area += f64::from(-face[1]);
+            }
+        }
+    }
+
+    // Require a meaningful majority so closed or intentionally two-sided
+    // shells with balanced floors and ceilings retain their authored winding.
+    if downward_projected_area <= upward_projected_area * 1.05
+        || downward_projected_area <= f64::EPSILON
+    {
+        return false;
+    }
+    for group in &mut collision.groups {
+        for triangle in &mut group.triangles {
+            triangle.swap(1, 2);
+        }
+    }
+    true
 }
 
 pub(crate) fn active_node_mask(asset: &ModelAssetDocument) -> AuthoringResult<Vec<bool>> {

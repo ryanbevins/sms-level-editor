@@ -818,8 +818,8 @@ fn placed_authored_hierarchy_is_submitted_to_filled_gpu_batches() {
         .converted_bounds()
         .expect("compute converted bounds")
         .expect("fixture has render bounds");
-    assert_eq!(bounds.min, [-100.0, 300.0, -750.0]);
-    assert_eq!(bounds.max, [500.0, 500.0, -400.0]);
+    assert_eq!(bounds.min, [-100.0, 300.0, 400.0]);
+    assert_eq!(bounds.max, [500.0, 500.0, 750.0]);
 
     let asset_id = AssetId::new();
     let authored = build_authored_model_preview(&asset, SMS_SM_J3D_ACT_MODEL_LOAD_FLAGS)
@@ -876,8 +876,8 @@ fn placed_authored_hierarchy_is_submitted_to_filled_gpu_batches() {
             authored_max[axis] = authored_max[axis].max(vertex[axis]);
         }
     }
-    assert_eq!(authored_min, [150.0, 310.0, -780.0]);
-    assert_eq!(authored_max, [750.0, 510.0, -430.0]);
+    assert_eq!(authored_min, [150.0, 310.0, 370.0]);
+    assert_eq!(authored_max, [750.0, 510.0, 720.0]);
 
     let submitted_corner_count = |scene: &GpuSceneData| {
         scene

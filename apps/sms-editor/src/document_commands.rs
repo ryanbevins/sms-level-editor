@@ -387,6 +387,7 @@ fn authored_runtime_readiness_error(
     None
 }
 
+const CATALOG_SCENE_PATH: &[u8] = b"map/scene.bin";
 const CATALOG_TABLES_PATH: &[u8] = b"map/tables.bin";
 const CATALOG_RAL_PATH: &[u8] = b"map/scene.ral";
 
@@ -595,15 +596,42 @@ fn preflight_catalog_resources(
         }
     }
 
-    if !template.character_records.is_empty() {
-        let current = document
-            .effective_resource_clone(CATALOG_TABLES_PATH)
-            .map_err(|error| format!("could not inspect effective map/tables.bin: {error}"))?;
-        let (tables, changed) = merge_character_table(current, &template.character_records)?;
-        if changed {
+    if !template.character_records.is_empty() || !template.table_dependencies.is_empty() {
+        let mut scene = effective_placement_document(document, CATALOG_SCENE_PATH)?;
+        let mut tables = effective_placement_document(document, CATALOG_TABLES_PATH)?;
+        let mut scene_changed = false;
+        let mut tables_changed = false;
+
+        if !template.character_records.is_empty() {
+            let current = tables.take().map(StageResourceDocument::Placement);
+            let (updated, changed) = merge_character_table(current, &template.character_records)?;
+            tables = Some(updated);
+            tables_changed |= changed;
+        }
+        if !template.table_dependencies.is_empty() {
+            let (changed_scene, changed_tables) = merge_runtime_table_dependencies(
+                scene.as_mut(),
+                tables.as_mut(),
+                &template.table_dependencies,
+            )?;
+            scene_changed |= changed_scene;
+            tables_changed |= changed_tables;
+        }
+        if scene_changed {
+            preflight.writes.push(CatalogResourceWrite {
+                raw_resource_path: CATALOG_SCENE_PATH.to_vec(),
+                document: StageResourceDocument::Placement(
+                    scene.expect("a changed scene dependency document exists"),
+                ),
+                upsert: true,
+            });
+        }
+        if tables_changed {
             preflight.writes.push(CatalogResourceWrite {
                 raw_resource_path: CATALOG_TABLES_PATH.to_vec(),
-                document: StageResourceDocument::Placement(tables),
+                document: StageResourceDocument::Placement(
+                    tables.expect("a changed table dependency document exists"),
+                ),
                 upsert: true,
             });
         }
@@ -661,6 +689,188 @@ fn preflight_catalog_resources(
     Ok(preflight)
 }
 
+fn effective_placement_document(
+    document: &StageDocument,
+    raw_resource_path: &[u8],
+) -> Result<Option<sms_formats::JDramaDocument>, String> {
+    match document
+        .effective_resource_clone(raw_resource_path)
+        .map_err(|error| {
+            format!(
+                "could not inspect effective {}: {error}",
+                String::from_utf8_lossy(raw_resource_path)
+            )
+        })? {
+        Some(StageResourceDocument::Placement(document)) => Ok(Some(document)),
+        Some(_) => Err(format!(
+            "effective {} is not placement data",
+            String::from_utf8_lossy(raw_resource_path)
+        )),
+        None => Ok(None),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RuntimeTableResource {
+    Scene,
+    Tables,
+}
+
+fn matching_record_paths(
+    document: &sms_formats::JDramaDocument,
+    mut predicate: impl FnMut(&sms_formats::JDramaRecord) -> bool,
+) -> Vec<Vec<usize>> {
+    fn visit(
+        record: &sms_formats::JDramaRecord,
+        path: &mut Vec<usize>,
+        predicate: &mut impl FnMut(&sms_formats::JDramaRecord) -> bool,
+        out: &mut Vec<Vec<usize>>,
+    ) {
+        if predicate(record) {
+            out.push(path.clone());
+        }
+        if let sms_formats::JDramaRecordPayload::Group { children, .. } = &record.payload {
+            for (index, child) in children.iter().enumerate() {
+                path.push(index);
+                visit(child, path, predicate, out);
+                path.pop();
+            }
+        }
+    }
+    let mut paths = Vec::new();
+    visit(&document.root, &mut Vec::new(), &mut predicate, &mut paths);
+    paths
+}
+
+fn merge_runtime_table_dependencies(
+    scene: Option<&mut sms_formats::JDramaDocument>,
+    tables: Option<&mut sms_formats::JDramaDocument>,
+    dependencies: &[sms_scene::ObjectAuthoringTableDependency],
+) -> Result<(bool, bool), String> {
+    let mut scene = scene;
+    let mut tables = tables;
+    let mut scene_changed = false;
+    let mut tables_changed = false;
+    let mut dependencies = dependencies.to_vec();
+    dependencies.sort_by(|left, right| {
+        left.record
+            .name
+            .cmp(&right.record.name)
+            .then_with(|| left.record.type_name.cmp(&right.record.type_name))
+    });
+
+    for dependency in dependencies {
+        let mut same_name = Vec::new();
+        let mut exact = Vec::new();
+        let mut exact_targets = Vec::new();
+        let mut type_targets = Vec::new();
+        for (resource, document) in [
+            (RuntimeTableResource::Scene, scene.as_deref()),
+            (RuntimeTableResource::Tables, tables.as_deref()),
+        ] {
+            let Some(document) = document else {
+                continue;
+            };
+            same_name.extend(
+                matching_record_paths(document, |record| record.name == dependency.record.name)
+                    .into_iter()
+                    .map(|path| (resource, path)),
+            );
+            exact.extend(
+                matching_record_paths(document, |record| {
+                    record.name == dependency.record.name
+                        && semantic_record_type(&record.type_name)
+                            == semantic_record_type(&dependency.record.type_name)
+                })
+                .into_iter()
+                .map(|path| (resource, path)),
+            );
+            let sms_scene::AuthoredPlacementDependencyTarget::NamedGroup { type_name, name } =
+                &dependency.target
+            else {
+                return Err(format!(
+                    "runtime table dependency {:?} has a non-named target",
+                    dependency.record.name
+                ));
+            };
+            exact_targets.extend(
+                matching_record_paths(document, |record| {
+                    record.name == *name
+                        && semantic_record_type(&record.type_name)
+                            == semantic_record_type(type_name)
+                        && matches!(
+                            record.payload,
+                            sms_formats::JDramaRecordPayload::Group { .. }
+                        )
+                })
+                .into_iter()
+                .map(|path| (resource, path)),
+            );
+            type_targets.extend(
+                matching_record_paths(document, |record| {
+                    semantic_record_type(&record.type_name) == semantic_record_type(type_name)
+                        && matches!(
+                            record.payload,
+                            sms_formats::JDramaRecordPayload::Group { .. }
+                        )
+                })
+                .into_iter()
+                .map(|path| (resource, path)),
+            );
+        }
+
+        if same_name.len() != exact.len() {
+            return Err(format!(
+                "required runtime table record {:?} conflicts with a different semantic type",
+                dependency.record.name
+            ));
+        }
+        match exact.len() {
+            0 => {}
+            1 => continue,
+            count => {
+                return Err(format!(
+                    "required runtime table record {:?} is ambiguous across stage tables ({count} matches)",
+                    dependency.record.name
+                ));
+            }
+        }
+        // Retail stages do not consistently use the same NameRef label for a
+        // table class. Prefer the source label when present, then fall back to
+        // the unique semantic table type so authored/blank-stage aliases are
+        // repaired without guessing between multiple runtime containers.
+        let targets = if exact_targets.is_empty() {
+            &type_targets
+        } else {
+            &exact_targets
+        };
+        let [(resource, target_path)] = targets.as_slice() else {
+            return Err(format!(
+                "required runtime table record {:?} has {} matching target containers",
+                dependency.record.name,
+                targets.len()
+            ));
+        };
+        let document = match resource {
+            RuntimeTableResource::Scene => {
+                scene_changed = true;
+                scene.as_deref_mut().expect("located scene target exists")
+            }
+            RuntimeTableResource::Tables => {
+                tables_changed = true;
+                tables.as_deref_mut().expect("located tables target exists")
+            }
+        };
+        let target = jdrama_record_mut(&mut document.root, target_path)
+            .ok_or_else(|| "runtime table dependency target path became invalid".to_string())?;
+        let sms_formats::JDramaRecordPayload::Group { children, .. } = &mut target.payload else {
+            return Err("runtime table dependency target is not a group".to_string());
+        };
+        children.push(dependency.record);
+    }
+    Ok((scene_changed, tables_changed))
+}
+
 fn parse_catalog_resource(
     resource: &sms_scene::ObjectAuthoringResource,
 ) -> Result<StageResourceDocument, String> {
@@ -683,6 +893,118 @@ fn parse_catalog_resource(
 
 fn semantic_record_type(type_name: &str) -> &str {
     type_name.rsplit("::").next().unwrap_or(type_name)
+}
+
+fn authored_shine_fields_mut(
+    record: &mut sms_formats::JDramaRecord,
+) -> Option<&mut Vec<sms_formats::JDramaField>> {
+    if semantic_record_type(&record.type_name) != "Shine" {
+        return None;
+    }
+    match &mut record.payload {
+        sms_formats::JDramaRecordPayload::Actor { fields, .. }
+        | sms_formats::JDramaRecordPayload::Fields { fields }
+        | sms_formats::JDramaRecordPayload::Group { fields, .. } => Some(fields),
+        sms_formats::JDramaRecordPayload::Empty => None,
+    }
+}
+
+fn set_authored_shine_string_field(
+    record: &mut sms_formats::JDramaRecord,
+    field_name: &str,
+    value: String,
+) -> Result<(), String> {
+    if field_name == "name" {
+        record.name = value;
+        return Ok(());
+    }
+    let fields = authored_shine_fields_mut(record)
+        .ok_or_else(|| "authored Shine has no editable typed fields".to_string())?;
+    let field = fields
+        .iter_mut()
+        .find(|field| field.name == field_name)
+        .ok_or_else(|| format!("authored Shine is missing field '{field_name}'"))?;
+    let sms_formats::JDramaFieldValue::String(current) = &mut field.value else {
+        return Err(format!(
+            "authored Shine field '{field_name}' is not a string"
+        ));
+    };
+    *current = value;
+    Ok(())
+}
+
+fn set_authored_shine_i32_field(
+    record: &mut sms_formats::JDramaRecord,
+    field_name: &str,
+    value: i32,
+) -> Result<(), String> {
+    let fields = authored_shine_fields_mut(record)
+        .ok_or_else(|| "authored Shine has no editable typed fields".to_string())?;
+    let field = fields
+        .iter_mut()
+        .find(|field| field.name == field_name)
+        .ok_or_else(|| format!("authored Shine is missing field '{field_name}'"))?;
+    let sms_formats::JDramaFieldValue::I32(current) = &mut field.value else {
+        return Err(format!("authored Shine field '{field_name}' is not an i32"));
+    };
+    *current = value;
+    Ok(())
+}
+
+fn apply_new_authored_shine_defaults(
+    prototype: &mut sms_formats::JDramaRecord,
+    object_id: &str,
+) -> Result<bool, String> {
+    if semantic_record_type(&prototype.type_name) != "Shine" {
+        return Ok(false);
+    }
+    set_authored_shine_string_field(prototype, "name", format!("SMS Editor Shine {object_id}"))?;
+    set_authored_shine_string_field(prototype, "collection_type", "normal".to_string())?;
+    set_authored_shine_i32_field(prototype, "in_stage", -1)?;
+    Ok(true)
+}
+
+fn migrate_legacy_authored_shine_defaults(object: &mut SceneObject) -> Result<bool, String> {
+    if object.authoring_defaults_version >= sms_scene::OBJECT_AUTHORING_DEFAULTS_VERSION {
+        return Ok(false);
+    }
+    let Some(sms_scene::PlacementBinding::Authored(authored)) = object.placement.as_ref() else {
+        return Ok(false);
+    };
+    if semantic_record_type(&authored.prototype.type_name) != "Shine" {
+        return Ok(false);
+    }
+
+    // Older overlays deserialize their parameter values as clean source values. Read the overlay
+    // first so this narrow migration never resets a user's Shine ID or other custom parameters to
+    // the retail prototype that originally seeded the authored object.
+    let unique_name = format!("SMS Editor Shine {}", object.id);
+    let collection_type = match object.raw_param("collection_type") {
+        Some("demo") | None => "normal".to_string(),
+        Some(value) => value.to_string(),
+    };
+    let in_stage = object
+        .raw_param("in_stage")
+        .and_then(|value| value.parse::<i32>().ok())
+        .filter(|value| matches!(value, -1 | 0))
+        .unwrap_or(-1);
+
+    let Some(sms_scene::PlacementBinding::Authored(authored)) = &mut object.placement else {
+        unreachable!("authored Shine placement was checked above");
+    };
+    set_authored_shine_string_field(&mut authored.prototype, "name", unique_name.clone())?;
+    set_authored_shine_string_field(
+        &mut authored.prototype,
+        "collection_type",
+        collection_type.clone(),
+    )?;
+    set_authored_shine_i32_field(&mut authored.prototype, "in_stage", in_stage)?;
+
+    object.insert_source_raw_param("name", unique_name);
+    object.insert_source_raw_param("collection_type", collection_type);
+    object.insert_source_raw_param("in_stage", in_stage.to_string());
+    object.authoring_defaults_version = sms_scene::OBJECT_AUTHORING_DEFAULTS_VERSION;
+    Ok(true)
 }
 
 fn character_record_equal(
@@ -936,6 +1258,7 @@ fn object_from_catalog_template(
         .collect::<Vec<_>>();
     rewrite_catalog_graph_names(&mut prototype, &mut dependencies, graph_name_rewrites)?;
     reset_catalog_prototype_transform(&mut prototype, translation)?;
+    let uses_versioned_defaults = apply_new_authored_shine_defaults(&mut prototype, &id)?;
     let mut object = SceneObject::new(id, factory_name);
     object.transform = Transform {
         translation,
@@ -943,6 +1266,9 @@ fn object_from_catalog_template(
     };
     sms_scene::seed_scene_object_parameters(&mut object, &prototype)
         .map_err(|error| error.to_string())?;
+    if uses_versioned_defaults {
+        object.authoring_defaults_version = sms_scene::OBJECT_AUTHORING_DEFAULTS_VERSION;
+    }
     object.placement = Some(sms_scene::PlacementBinding::Authored(
         sms_scene::AuthoredPlacement {
             raw_resource_path: b"map/scene.bin".to_vec(),
@@ -952,6 +1278,59 @@ fn object_from_catalog_template(
         },
     ));
     Ok(object)
+}
+
+fn is_shine_object(object: &SceneObject) -> bool {
+    object.factory_name == "Shine"
+        || object.class_name.as_deref() == Some("TShine")
+        || matches!(
+            &object.placement,
+            Some(sms_scene::PlacementBinding::Authored(authored))
+                if semantic_record_type(&authored.prototype.type_name) == "Shine"
+        )
+}
+
+fn effective_shine_flag(shine_id: i32) -> Option<i32> {
+    match shine_id {
+        -1 => Some(0),
+        0..=119 => Some(shine_id),
+        _ => None,
+    }
+}
+
+fn assign_unique_shine_id_for_spawn(
+    object: &mut SceneObject,
+    document: &StageDocument,
+) -> Result<Option<i32>, String> {
+    if !is_shine_object(object) {
+        return Ok(None);
+    }
+    let used_flags = document
+        .objects
+        .iter()
+        .filter(|existing| is_shine_object(existing))
+        .filter_map(|existing| existing.raw_param("shine_id"))
+        .filter_map(|value| value.parse::<i32>().ok())
+        .filter_map(effective_shine_flag)
+        .collect::<BTreeSet<_>>();
+    let current_id = object
+        .raw_param("shine_id")
+        .and_then(|value| value.parse::<i32>().ok());
+    let selected_id = current_id
+        .filter(|value| {
+            effective_shine_flag(*value).is_some_and(|flag| !used_flags.contains(&flag))
+        })
+        .or_else(|| (0..=119).find(|flag| !used_flags.contains(flag)))
+        .ok_or_else(|| {
+            "all 120 independent persistent Shine save-flag slots are already used in this stage"
+                .to_string()
+        })?;
+
+    if let Some(sms_scene::PlacementBinding::Authored(authored)) = &mut object.placement {
+        set_authored_shine_i32_field(&mut authored.prototype, "shine_id", selected_id)?;
+    }
+    object.insert_source_raw_param("shine_id", selected_id.to_string());
+    Ok(Some(selected_id))
 }
 
 fn duplicate_object_for_spawn(
@@ -969,6 +1348,24 @@ fn duplicate_object_for_spawn(
         .placement
         .as_ref()
         .map(sms_scene::PlacementBinding::duplicate_for_new_object);
+    let shine_name = if let Some(sms_scene::PlacementBinding::Authored(authored)) =
+        &mut source.placement
+    {
+        if semantic_record_type(&authored.prototype.type_name) == "Shine" {
+            let unique_name = format!("SMS Editor Shine {}", source.id);
+            set_authored_shine_string_field(&mut authored.prototype, "name", unique_name.clone())
+                .ok()
+                .map(|_| unique_name)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    if let Some(unique_name) = shine_name {
+        source.insert_source_raw_param("name", unique_name);
+        source.authoring_defaults_version = sms_scene::OBJECT_AUTHORING_DEFAULTS_VERSION;
+    }
     source.transform.translation = translation;
     source
 }
@@ -1334,6 +1731,19 @@ impl SmsEditorApp {
     }
 
     pub(super) fn reconcile_loaded_authored_catalog_resources(&mut self) {
+        let mut migrated_shines = Vec::new();
+        if let Some(document) = &mut self.document {
+            for object in &mut document.objects {
+                match migrate_legacy_authored_shine_defaults(object) {
+                    Ok(true) => migrated_shines.push(object.id.clone()),
+                    Ok(false) => {}
+                    Err(error) => self.log.push(format!(
+                        "Could not update legacy authored Shine '{}': {error}",
+                        object.id
+                    )),
+                }
+            }
+        }
         let authored_factories = self
             .document
             .as_ref()
@@ -1366,7 +1776,7 @@ impl SmsEditorApp {
                 "Could not repair authored object runtime resources: {error}"
             ));
         }
-        if repair.resource_writes == 0 {
+        if repair.resource_writes == 0 && migrated_shines.is_empty() {
             return;
         }
         if let (Some(document), Some(registry)) = (&mut self.document, self.registry.clone()) {
@@ -1382,11 +1792,20 @@ impl SmsEditorApp {
         });
         self.flush_document_change();
         self.rebuild_model_preview_from_document();
-        self.log.push(format!(
-            "Repaired {} missing runtime resource(s) for existing authored class(es): {}. Save the project before launching.",
-            repair.resource_writes,
-            repair.repaired_factories.join(", ")
-        ));
+        if repair.resource_writes > 0 {
+            self.log.push(format!(
+                "Repaired {} missing runtime resource(s) for existing authored class(es): {}. Save the project before launching.",
+                repair.resource_writes,
+                repair.repaired_factories.join(", ")
+            ));
+        }
+        if !migrated_shines.is_empty() {
+            self.log.push(format!(
+                "Updated {} legacy authored Shine(s) to safe standalone spawn defaults: {}. Save the project before launching.",
+                migrated_shines.len(),
+                migrated_shines.join(", ")
+            ));
+        }
     }
 
     pub(super) fn spawn_object_at(&mut self, factory_name: String, translation: [f32; 3]) {
@@ -1519,10 +1938,11 @@ impl SmsEditorApp {
                 preflight.writes,
             );
             catalog_log = Some(format!(
-                "Placed '{factory_name}' from retail stage '{}': {} manager/support dependency record(s), {} stage-local character registration(s), {} required graph(s), {} catalog resource(s), {} existing target resource(s) reused, {} bootstrap proxy resource(s) upgraded, {} resource write(s).",
+                "Placed '{factory_name}' from retail stage '{}': {} manager/support dependency record(s), {} stage-local character registration(s), {} fixed runtime table dependency record(s), {} required graph(s), {} catalog resource(s), {} existing target resource(s) reused, {} bootstrap proxy resource(s) upgraded, {} resource write(s).",
                 template.source_stage,
                 template.dependencies.len(),
                 template.character_records.len(),
+                template.table_dependencies.len(),
                 template.required_graph_names.len(),
                 template.resources.len(),
                 reused_resource_count,
@@ -1538,6 +1958,14 @@ impl SmsEditorApp {
         };
 
         object.transform.translation = translation;
+        if let Err(error) = assign_unique_shine_id_for_spawn(
+            &mut object,
+            self.document.as_ref().expect("document was checked above"),
+        ) {
+            self.log
+                .push(format!("Could not place class '{factory_name}': {error}."));
+            return;
+        }
         if let Some(schema) = self
             .registry
             .as_ref()
@@ -1646,8 +2074,18 @@ impl SmsEditorApp {
         let mut translation = source.transform.translation;
         translation[0] += self.snap_translation.max(25.0);
         translation[2] += self.snap_translation.max(25.0);
-        let clone =
+        let mut clone =
             duplicate_object_for_spawn(source, id.clone(), translation, self.registry.as_ref());
+        if let Err(error) = assign_unique_shine_id_for_spawn(
+            &mut clone,
+            self.document
+                .as_ref()
+                .expect("selected object belongs to a document"),
+        ) {
+            self.log
+                .push(format!("Could not duplicate Shine: {error}."));
+            return;
+        }
         self.next_object_serial = next_object_serial;
         let index = self
             .document
@@ -2520,6 +2958,178 @@ mod tests {
         StageResourceDocument::parse_for_path(raw_resource_path, &bytes).unwrap()
     }
 
+    fn shine_catalog_template() -> sms_scene::ObjectAuthoringTemplate {
+        sms_scene::ObjectAuthoringTemplate {
+            factory_name: "Shine".to_string(),
+            group_index: 4,
+            record: JDramaRecord {
+                type_name: "Shine".to_string(),
+                name: "retail event shine".to_string(),
+                payload: JDramaRecordPayload::Actor {
+                    transform: sms_formats::JDramaTransform {
+                        translation: [0.0; 3],
+                        rotation: [0.0; 3],
+                        scale: [1.0; 3],
+                    },
+                    character_name: "??????".to_string(),
+                    light_map: sms_formats::JDramaLightMap::default(),
+                    fields: vec![
+                        JDramaField {
+                            name: "resource_name".to_string(),
+                            value: JDramaFieldValue::String("shine".to_string()),
+                        },
+                        JDramaField {
+                            name: "collection_type".to_string(),
+                            value: JDramaFieldValue::String("demo".to_string()),
+                        },
+                        JDramaField {
+                            name: "shine_id".to_string(),
+                            value: JDramaFieldValue::I32(104),
+                        },
+                        JDramaField {
+                            name: "in_stage".to_string(),
+                            value: JDramaFieldValue::I32(1),
+                        },
+                    ],
+                },
+            },
+            dependencies: Vec::new(),
+            character_records: Vec::new(),
+            table_dependencies: Vec::new(),
+            required_graph_names: Vec::new(),
+            resources: Vec::new(),
+            preview_resource_path: None,
+            source_stage: "fixture0".to_string(),
+        }
+    }
+
+    #[test]
+    fn authored_shines_use_standalone_spawn_defaults_and_unique_names() {
+        let template = shine_catalog_template();
+        let object = object_from_catalog_template(
+            "fixture0-obj-0008".to_string(),
+            "Shine".to_string(),
+            [1.0, 2.0, 3.0],
+            &template,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            object.raw_param("name"),
+            Some("SMS Editor Shine fixture0-obj-0008")
+        );
+        assert_eq!(object.raw_param("collection_type"), Some("normal"));
+        assert_eq!(object.raw_param("shine_id"), Some("104"));
+        assert_eq!(object.raw_param("in_stage"), Some("-1"));
+        assert_eq!(
+            object.authoring_defaults_version,
+            sms_scene::OBJECT_AUTHORING_DEFAULTS_VERSION
+        );
+
+        let duplicate = duplicate_object_for_spawn(
+            object,
+            "fixture0-obj-0009".to_string(),
+            [4.0, 5.0, 6.0],
+            None,
+        );
+        assert_eq!(
+            duplicate.raw_param("name"),
+            Some("SMS Editor Shine fixture0-obj-0009")
+        );
+        assert_eq!(duplicate.raw_param("collection_type"), Some("normal"));
+        assert_eq!(duplicate.raw_param("shine_id"), Some("104"));
+    }
+
+    #[test]
+    fn spawned_shines_keep_an_unused_flag_and_allocate_around_conflicts() {
+        let template = shine_catalog_template();
+        let existing = object_from_catalog_template(
+            "fixture0-obj-0008".to_string(),
+            "Shine".to_string(),
+            [0.0; 3],
+            &template,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let document = command_test_document(vec![existing]);
+
+        let mut new_shine = object_from_catalog_template(
+            "fixture0-obj-0009".to_string(),
+            "Shine".to_string(),
+            [0.0; 3],
+            &template,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            assign_unique_shine_id_for_spawn(&mut new_shine, &document).unwrap(),
+            Some(0)
+        );
+        assert_eq!(new_shine.raw_param("shine_id"), Some("0"));
+
+        let empty_document = command_test_document(Vec::new());
+        let mut first_shine = object_from_catalog_template(
+            "fixture0-obj-0010".to_string(),
+            "Shine".to_string(),
+            [0.0; 3],
+            &template,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            assign_unique_shine_id_for_spawn(&mut first_shine, &empty_document).unwrap(),
+            Some(104)
+        );
+    }
+
+    #[test]
+    fn legacy_authored_demo_shine_migrates_once_without_overwriting_new_choices() {
+        let template = shine_catalog_template();
+        let mut object = SceneObject::new("fixture0-obj-0008", "Shine");
+        sms_scene::seed_scene_object_parameters(&mut object, &template.record).unwrap();
+        object.placement = Some(sms_scene::PlacementBinding::Authored(
+            sms_scene::AuthoredPlacement {
+                raw_resource_path: b"map/scene.bin".to_vec(),
+                target_group_index: template.group_index,
+                prototype: template.record,
+                dependencies: Vec::new(),
+            },
+        ));
+
+        assert!(migrate_legacy_authored_shine_defaults(&mut object).unwrap());
+        assert_eq!(object.raw_param("collection_type"), Some("normal"));
+        assert_eq!(object.raw_param("in_stage"), Some("-1"));
+        assert_eq!(
+            object.raw_param("name"),
+            Some("SMS Editor Shine fixture0-obj-0008")
+        );
+        assert!(!migrate_legacy_authored_shine_defaults(&mut object).unwrap());
+
+        object.set_raw_param("collection_type", "demo");
+        assert!(!migrate_legacy_authored_shine_defaults(&mut object).unwrap());
+        assert_eq!(object.raw_param("collection_type"), Some("demo"));
+
+        let template = shine_catalog_template();
+        let mut customized = SceneObject::new("fixture0-obj-0010", "Shine");
+        sms_scene::seed_scene_object_parameters(&mut customized, &template.record).unwrap();
+        customized.set_raw_param("collection_type", "quickly");
+        customized.set_raw_param("shine_id", "7");
+        customized.set_raw_param("in_stage", "0");
+        customized.placement = Some(sms_scene::PlacementBinding::Authored(
+            sms_scene::AuthoredPlacement {
+                raw_resource_path: b"map/scene.bin".to_vec(),
+                target_group_index: template.group_index,
+                prototype: template.record,
+                dependencies: Vec::new(),
+            },
+        ));
+        assert!(migrate_legacy_authored_shine_defaults(&mut customized).unwrap());
+        assert_eq!(customized.raw_param("collection_type"), Some("quickly"));
+        assert_eq!(customized.raw_param("shine_id"), Some("7"));
+        assert_eq!(customized.raw_param("in_stage"), Some("0"));
+    }
+
     #[test]
     fn spawn_skips_loaded_object_id_collision() {
         let mut template = SceneObject::new("fixture0-obj-0001", "FixtureEnemy");
@@ -2662,6 +3272,7 @@ mod tests {
             raw_params: BTreeMap::new(),
             asset_hints: Vec::new(),
             manager_capacity_dependencies: Vec::new(),
+            authoring_defaults_version: 0,
         });
         assert_eq!(authored_runtime_readiness_error(&document, false), None);
     }
@@ -2776,6 +3387,7 @@ mod tests {
                 record: dependency_record,
             }],
             character_records: Vec::new(),
+            table_dependencies: Vec::new(),
             required_graph_names: Vec::new(),
             resources: Vec::new(),
             preview_resource_path: None,
@@ -2843,6 +3455,202 @@ mod tests {
             duplicate.placement,
             Some(sms_scene::PlacementBinding::CloneOf(_))
         ));
+    }
+
+    #[test]
+    fn runtime_table_dependency_merges_into_a_unique_type_compatible_container() {
+        let camera_name = "\u{30b7}\u{30e3}\u{30a4}\u{30f3}\u{ff08}\u{3044}\u{304d}\u{306a}\u{308a}\u{51fa}\u{73fe}\u{ff09}\u{30ab}\u{30e1}\u{30e9}";
+        let camera = JDramaRecord {
+            type_name: "CameraMapInfo".to_string(),
+            name: camera_name.to_string(),
+            payload: JDramaRecordPayload::Fields {
+                fields: vec![JDramaField {
+                    name: "demo_length_frames".to_string(),
+                    value: JDramaFieldValue::I32(900),
+                }],
+            },
+        };
+        let dependency = sms_scene::ObjectAuthoringTableDependency {
+            target: sms_scene::AuthoredPlacementDependencyTarget::NamedGroup {
+                type_name: "CameraMapToolTable".to_string(),
+                name: "camera map tool table".to_string(),
+            },
+            record: camera.clone(),
+        };
+        let mut scene = JDramaDocument {
+            root: JDramaRecord {
+                type_name: "MarScene".to_string(),
+                name: "scene".to_string(),
+                payload: JDramaRecordPayload::Group {
+                    fields: Vec::new(),
+                    children: vec![JDramaRecord {
+                        type_name: "CameraMapToolTable".to_string(),
+                        name: "blank stage camera table".to_string(),
+                        payload: JDramaRecordPayload::Group {
+                            fields: Vec::new(),
+                            children: Vec::new(),
+                        },
+                    }],
+                },
+            },
+        };
+
+        assert_eq!(
+            merge_runtime_table_dependencies(
+                Some(&mut scene),
+                None,
+                std::slice::from_ref(&dependency),
+            )
+            .unwrap(),
+            (true, false)
+        );
+        assert_eq!(
+            matching_record_paths(&scene, |record| {
+                record.type_name == "CameraMapInfo" && record.name == camera_name
+            })
+            .len(),
+            1
+        );
+        assert_eq!(
+            merge_runtime_table_dependencies(
+                Some(&mut scene),
+                None,
+                std::slice::from_ref(&dependency),
+            )
+            .unwrap(),
+            (false, false)
+        );
+    }
+
+    #[test]
+    fn catalog_preflight_persists_quick_camera_into_authored_scene_table() {
+        let camera_name = "\u{30b7}\u{30e3}\u{30a4}\u{30f3}\u{ff08}\u{3044}\u{304d}\u{306a}\u{308a}\u{51fa}\u{73fe}\u{ff09}\u{30ab}\u{30e1}\u{30e9}";
+        let dependency = sms_scene::ObjectAuthoringTableDependency {
+            target: sms_scene::AuthoredPlacementDependencyTarget::NamedGroup {
+                type_name: "CameraMapToolTable".to_string(),
+                name: "camera map tool table".to_string(),
+            },
+            record: JDramaRecord {
+                type_name: "CameraMapInfo".to_string(),
+                name: camera_name.to_string(),
+                payload: JDramaRecordPayload::Fields {
+                    fields: vec![JDramaField {
+                        name: "demo_length_frames".to_string(),
+                        value: JDramaFieldValue::I32(900),
+                    }],
+                },
+            },
+        };
+        let scene = JDramaDocument {
+            root: JDramaRecord {
+                type_name: "MarScene".to_string(),
+                name: "scene".to_string(),
+                payload: JDramaRecordPayload::Group {
+                    fields: Vec::new(),
+                    children: vec![JDramaRecord {
+                        type_name: "CameraMapToolTable".to_string(),
+                        name: "camera map tool table".to_string(),
+                        payload: JDramaRecordPayload::Group {
+                            fields: Vec::new(),
+                            children: Vec::new(),
+                        },
+                    }],
+                },
+            },
+        };
+        let mut archive = sms_scene::SourceFreeStageArchive::new_for_blank(
+            "test11",
+            sms_scene::BLANK_STAGE_PRESET_VERSION,
+        )
+        .unwrap();
+        archive
+            .insert_resource(
+                CATALOG_SCENE_PATH.to_vec(),
+                StageResourceDocument::Placement(scene),
+            )
+            .unwrap();
+        let mut document = command_test_document(Vec::new());
+        document.stage_archive = Some(archive);
+        let mut template = shine_catalog_template();
+        template.table_dependencies = vec![dependency];
+
+        let preflight = preflight_catalog_resources(&document, &template).unwrap();
+        assert_eq!(preflight.writes.len(), 1);
+        assert_eq!(preflight.writes[0].raw_resource_path, CATALOG_SCENE_PATH);
+        ObjectUndoRecord {
+            deltas: Vec::new(),
+            resource_deltas: catalog_resource_edit_deltas(&document, preflight.writes),
+        }
+        .apply_forward(&mut document);
+
+        let Some(StageResourceDocument::Placement(scene)) = document
+            .effective_resource_clone(CATALOG_SCENE_PATH)
+            .unwrap()
+        else {
+            panic!("authored scene placement resource is missing");
+        };
+        assert_eq!(
+            matching_record_paths(&scene, |record| {
+                semantic_record_type(&record.type_name) == "CameraMapInfo"
+                    && record.name == camera_name
+            })
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn runtime_table_dependency_rejects_missing_or_ambiguous_containers() {
+        let dependency = sms_scene::ObjectAuthoringTableDependency {
+            target: sms_scene::AuthoredPlacementDependencyTarget::NamedGroup {
+                type_name: "CameraMapToolTable".to_string(),
+                name: "camera map tool table".to_string(),
+            },
+            record: JDramaRecord {
+                type_name: "CameraMapInfo".to_string(),
+                name: "quick camera".to_string(),
+                payload: JDramaRecordPayload::Fields { fields: Vec::new() },
+            },
+        };
+        let make_document = || JDramaDocument {
+            root: JDramaRecord {
+                type_name: "CameraMapToolTable".to_string(),
+                name: "camera map tool table".to_string(),
+                payload: JDramaRecordPayload::Group {
+                    fields: Vec::new(),
+                    children: Vec::new(),
+                },
+            },
+        };
+
+        let mut scene = make_document();
+        let mut tables = make_document();
+        let error = merge_runtime_table_dependencies(
+            Some(&mut scene),
+            Some(&mut tables),
+            std::slice::from_ref(&dependency),
+        )
+        .unwrap_err();
+        assert!(error.contains("2 matching target containers"), "{error}");
+
+        let mut missing = JDramaDocument {
+            root: JDramaRecord::new(
+                "NameRefGrp",
+                "empty",
+                JDramaRecordPayload::Group {
+                    fields: Vec::new(),
+                    children: Vec::new(),
+                },
+            )
+            .unwrap(),
+        };
+        let error = merge_runtime_table_dependencies(
+            Some(&mut missing),
+            None,
+            std::slice::from_ref(&dependency),
+        )
+        .unwrap_err();
+        assert!(error.contains("0 matching target containers"), "{error}");
     }
 
     #[test]
@@ -2922,6 +3730,7 @@ mod tests {
             record: prototype,
             dependencies: Vec::new(),
             character_records: Vec::new(),
+            table_dependencies: Vec::new(),
             required_graph_names: vec!["route_a".to_string()],
             resources: Vec::new(),
             preview_resource_path: None,
@@ -2998,6 +3807,7 @@ mod tests {
             record: prototype,
             dependencies: Vec::new(),
             character_records: Vec::new(),
+            table_dependencies: Vec::new(),
             required_graph_names: Vec::new(),
             resources: vec![sms_scene::ObjectAuthoringResource {
                 raw_resource_path: b"fixtureanm/runtime.prm".to_vec(),
@@ -3045,6 +3855,7 @@ mod tests {
                 .unwrap(),
             dependencies: Vec::new(),
             character_records: Vec::new(),
+            table_dependencies: Vec::new(),
             required_graph_names: Vec::new(),
             resources: vec![sms_scene::ObjectAuthoringResource {
                 raw_resource_path: raw_resource_path.clone(),
@@ -3140,6 +3951,7 @@ mod tests {
             record: JDramaRecord::new("Coin", "coin", JDramaRecordPayload::Empty).unwrap(),
             dependencies: Vec::new(),
             character_records: Vec::new(),
+            table_dependencies: Vec::new(),
             required_graph_names: Vec::new(),
             resources: vec![sms_scene::ObjectAuthoringResource {
                 raw_resource_path: raw_resource_path.clone(),
@@ -3263,6 +4075,7 @@ mod tests {
                 .unwrap(),
             dependencies: Vec::new(),
             character_records: Vec::new(),
+            table_dependencies: Vec::new(),
             required_graph_names: Vec::new(),
             resources: vec![sms_scene::ObjectAuthoringResource {
                 raw_resource_path: raw_resource_path.clone(),
@@ -3567,6 +4380,7 @@ mod tests {
                 record: dependency,
             }],
             character_records: Vec::new(),
+            table_dependencies: Vec::new(),
             required_graph_names: vec!["manager_route".to_string()],
             resources: Vec::new(),
             preview_resource_path: None,

@@ -7,10 +7,22 @@ use crate::Diagnostic;
 
 pub const MODEL_ASSET_FORMAT_VERSION: u32 = 1;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelCoordinateSpace {
+    /// Assets imported before the canonical glTF/Sunshine basis correction.
+    #[default]
+    LegacyReflectedZ,
+    /// Canonical right-handed Y-up coordinates shared by glTF and Sunshine.
+    GltfCompatible,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelAssetDocument {
     pub format_version: u32,
+    #[serde(default)]
+    pub coordinate_space: ModelCoordinateSpace,
     pub name: String,
     pub scene_roots: Vec<u32>,
     pub nodes: Vec<ModelNode>,
@@ -30,6 +42,7 @@ impl ModelAssetDocument {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             format_version: MODEL_ASSET_FORMAT_VERSION,
+            coordinate_space: ModelCoordinateSpace::GltfCompatible,
             name: name.into(),
             scene_roots: Vec::new(),
             nodes: Vec::new(),
@@ -50,6 +63,52 @@ impl ModelAssetDocument {
                     && !self.acknowledged_diagnostics.contains(&diagnostic.code)
             })
             .collect()
+    }
+
+    /// Migrates geometry imported with the original reflected-Z basis to the
+    /// canonical identity basis now shared with glTF and Blender.
+    pub(crate) fn migrate_legacy_reflected_z_coordinate_space(&mut self) -> bool {
+        if self.coordinate_space != ModelCoordinateSpace::LegacyReflectedZ {
+            return false;
+        }
+
+        for node in &mut self.nodes {
+            for column in 0..4 {
+                for row in 0..4 {
+                    if (column == 2) ^ (row == 2) {
+                        node.local_transform[column][row] = -node.local_transform[column][row];
+                    }
+                }
+            }
+        }
+        for primitive in self.meshes.iter_mut().flat_map(|mesh| &mut mesh.primitives) {
+            for position in &mut primitive.positions {
+                position[2] = -position[2];
+            }
+            for normal in &mut primitive.normals {
+                normal[2] = -normal[2];
+            }
+            for tangent in &mut primitive.tangents {
+                tangent[2] = -tangent[2];
+                tangent[3] = -tangent[3];
+            }
+            for triangle in primitive.indices.chunks_exact_mut(3) {
+                triangle.swap(1, 2);
+            }
+        }
+        if let Some(collision) = &mut self.collision {
+            for vertex in &mut collision.vertices {
+                vertex[2] = -vertex[2];
+            }
+            for group in &mut collision.groups {
+                for triangle in &mut group.triangles {
+                    triangle.swap(1, 2);
+                }
+            }
+        }
+
+        self.coordinate_space = ModelCoordinateSpace::GltfCompatible;
+        true
     }
 
     /// Repairs the conservative material program emitted by the initial v1
@@ -271,8 +330,8 @@ impl Default for CoordinateConversion {
     fn default() -> Self {
         Self {
             units_per_meter: 100.0,
-            basis: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, -1.0]],
-            reverse_winding: true,
+            basis: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            reverse_winding: false,
         }
     }
 }
