@@ -1,5 +1,12 @@
 use super::*;
 
+const ACTIVE_ROUTE_NODE_RADIUS: f32 = 10.0;
+const SELECTED_ROUTE_NODE_RADIUS: f32 = 12.0;
+const INACTIVE_ROUTE_NODE_RADIUS: f32 = 5.5;
+const ROUTE_NODE_HALO_WIDTH: f32 = 3.5;
+const ROUTE_NODE_HIT_RADIUS: f32 = 16.0;
+const GENERATED_ROUTE_NODE_RADIUS: f32 = 3.75;
+
 impl SmsEditorApp {
     pub(super) fn routes_hierarchy_panel(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
@@ -655,7 +662,12 @@ impl SmsEditorApp {
                         for point in points.iter().skip(1).step_by(4) {
                             painter.circle_filled(
                                 *point,
-                                2.5,
+                                GENERATED_ROUTE_NODE_RADIUS + 2.0,
+                                egui::Color32::from_rgba_unmultiplied(15, 18, 20, 220),
+                            );
+                            painter.circle_filled(
+                                *point,
+                                GENERATED_ROUTE_NODE_RADIUS,
                                 egui::Color32::from_rgb(255, 174, 82),
                             );
                         }
@@ -682,14 +694,31 @@ impl SmsEditorApp {
                     }
                 }
             }
-            for control in &graph.controls {
+            for (control_index, control) in graph.controls.iter().enumerate() {
                 if let Some((screen, _)) =
                     projection.project_world_to_screen(control.node.position.map(f32::from))
                 {
                     let selected = self.selected_route_controls.contains(&control.id);
+                    let radius = if selected {
+                        SELECTED_ROUTE_NODE_RADIUS
+                    } else if active {
+                        ACTIVE_ROUTE_NODE_RADIUS
+                    } else {
+                        INACTIVE_ROUTE_NODE_RADIUS
+                    };
                     painter.circle_filled(
                         screen,
-                        if active { 7.0 } else { 4.0 },
+                        radius + ROUTE_NODE_HALO_WIDTH,
+                        egui::Color32::from_rgba_unmultiplied(
+                            8,
+                            12,
+                            16,
+                            if active { 225 } else { 105 },
+                        ),
+                    );
+                    painter.circle_filled(
+                        screen,
+                        radius,
                         if selected {
                             egui::Color32::YELLOW
                         } else {
@@ -699,8 +728,23 @@ impl SmsEditorApp {
                     if active {
                         painter.circle_stroke(
                             screen,
-                            9.0,
-                            egui::Stroke::new(1.0, egui::Color32::WHITE),
+                            radius + 1.0,
+                            egui::Stroke::new(
+                                if selected { 3.0 } else { 2.0 },
+                                if selected {
+                                    egui::Color32::from_rgb(255, 145, 35)
+                                } else {
+                                    egui::Color32::WHITE
+                                },
+                            ),
+                        );
+                        painter.circle_filled(screen, 2.25, egui::Color32::from_rgb(12, 30, 38));
+                        painter.text(
+                            screen + egui::vec2(radius + 5.0, -radius - 2.0),
+                            egui::Align2::LEFT_TOP,
+                            (control_index + 1).to_string(),
+                            egui::FontId::monospace(12.0),
+                            egui::Color32::WHITE,
                         );
                     }
                 }
@@ -945,7 +989,8 @@ impl SmsEditorApp {
             .filter_map(|control| {
                 let (screen, depth) =
                     projection.project_world_to_screen(control.node.position.map(f32::from))?;
-                (screen.distance(pos) <= 12.0).then_some((depth, control.id.clone()))
+                (screen.distance(pos) <= ROUTE_NODE_HIT_RADIUS)
+                    .then_some((depth, control.id.clone()))
             })
             .min_by(|left, right| left.0.total_cmp(&right.0))
         {
