@@ -18,7 +18,7 @@ use sms_formats::{
 };
 use sms_scene::{
     BlankStageBootstrapManifest, BlankStageBootstrapResource, BlankStagePreset,
-    SourceFreeStageArchive, StageDocument, StageResourceDocument,
+    RouteAuthoringDocument, SourceFreeStageArchive, StageDocument, StageResourceDocument,
     BLANK_STAGE_BOOTSTRAP_REQUIREMENTS,
 };
 use sms_schema::SchemaGenerator;
@@ -241,6 +241,11 @@ enum Commands {
         /// Existing output directory plus archive filename; never the base tree.
         #[arg(long)]
         out: PathBuf,
+    },
+    /// Prove every discovered stage route and containing archive rebuilds byte-identically.
+    VerifyRouteCorpus {
+        #[arg(long)]
+        base_root: PathBuf,
     },
     /// Apply a saved editor object overlay and create a rebuilt external stage archive.
     #[command(alias = "export-project-stage")]
@@ -627,6 +632,7 @@ fn main() -> Result<()> {
             stage,
             out,
         } => rebuild_stage_archive(base_root, &stage, out),
+        Commands::VerifyRouteCorpus { base_root } => verify_route_corpus(base_root),
         Commands::ExportStage {
             base_root,
             stage,
@@ -1525,6 +1531,137 @@ fn write_create_new_external_synced(
     write_create_new_synced(&canonical_output, bytes)
 }
 
+fn verify_route_corpus(base_root: PathBuf) -> Result<()> {
+    let archives = discover_scene_archives(&base_root)?;
+    let mut archive_count = 0usize;
+    let mut rail_count = 0usize;
+    let mut graph_count = 0usize;
+    let mut node_count = 0usize;
+    let mut bytes_checked = 0u64;
+
+    for archive_info in archives {
+        let source = std::fs::read(&archive_info.path)
+            .with_context(|| format!("read stage archive {}", archive_info.path.display()))?;
+        let mut archive = SourceFreeStageArchive::parse(&source)
+            .with_context(|| format!("semantic import of stage {}", archive_info.stage_id))?;
+        let rails = archive
+            .resources()
+            .iter()
+            .filter_map(|resource| match &resource.document {
+                StageResourceDocument::Rail(rail) => {
+                    Some((resource.raw_path.clone(), rail.clone()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        for (raw_path, rail) in rails {
+            let internal = String::from_utf8_lossy(&raw_path).replace('\\', "/");
+            let virtual_path = format!("{}!/{internal}", archive_info.path.display());
+            let original_payload = read_stage_asset_bytes(&virtual_path).with_context(|| {
+                format!(
+                    "extract original RAL payload for stage {} resource {}",
+                    archive_info.stage_id, internal
+                )
+            })?;
+            let authoring = RouteAuthoringDocument::lift(raw_path.clone(), &rail);
+            let serialized = serde_json::to_vec(&authoring)?;
+            let reopened: RouteAuthoringDocument = serde_json::from_slice(&serialized)?;
+            let compiled = reopened.compile().with_context(|| {
+                format!(
+                    "compile lifted routes for stage {} resource {}",
+                    archive_info.stage_id, internal
+                )
+            })?;
+            let rebuilt_payload = compiled.encode()?;
+            if rebuilt_payload != original_payload {
+                let offset = first_differing_offset(&original_payload, &rebuilt_payload);
+                let expected = original_payload.get(offset).copied();
+                let actual = rebuilt_payload.get(offset).copied();
+                bail!(
+                    "route corpus mismatch: stage={} resource={} graph={} offset=0x{:X} expected={:?} actual={:?} expected_size={} actual_size={}",
+                    archive_info.stage_id,
+                    internal,
+                    differing_graph_name(&rail, &compiled).unwrap_or("unknown"),
+                    offset,
+                    expected,
+                    actual,
+                    original_payload.len(),
+                    rebuilt_payload.len()
+                );
+            }
+            graph_count += compiled.graphs.len();
+            node_count += compiled
+                .graphs
+                .iter()
+                .map(|graph| graph.nodes.len())
+                .sum::<usize>();
+            bytes_checked += original_payload.len() as u64;
+            rail_count += 1;
+            *archive
+                .resource_mut(&raw_path)
+                .expect("collected RAL resource remains present") =
+                StageResourceDocument::Rail(compiled);
+        }
+
+        let rebuilt_archive = archive.encode()?;
+        if rebuilt_archive != source {
+            let offset = first_differing_offset(&source, &rebuilt_archive);
+            bail!(
+                "archive corpus mismatch: stage={} archive={} offset=0x{:X} expected={:?} actual={:?} expected_size={} actual_size={}",
+                archive_info.stage_id,
+                archive_info.path.display(),
+                offset,
+                source.get(offset),
+                rebuilt_archive.get(offset),
+                source.len(),
+                rebuilt_archive.len()
+            );
+        }
+        bytes_checked += source.len() as u64;
+        archive_count += 1;
+    }
+
+    println!(
+        "{}",
+        serde_json::json!({
+            "archives": archive_count,
+            "ral_resources": rail_count,
+            "graphs": graph_count,
+            "nodes": node_count,
+            "bytes_checked": bytes_checked,
+            "mismatches": 0,
+            "source_payloads_retained": false,
+            "base_game_written": false,
+        })
+    );
+    Ok(())
+}
+
+fn first_differing_offset(expected: &[u8], actual: &[u8]) -> usize {
+    expected
+        .iter()
+        .zip(actual)
+        .position(|(left, right)| left != right)
+        .unwrap_or(expected.len().min(actual.len()))
+}
+
+fn differing_graph_name<'a>(
+    expected: &'a sms_formats::RalDocument,
+    actual: &sms_formats::RalDocument,
+) -> Option<&'a str> {
+    expected
+        .graphs
+        .iter()
+        .zip(&actual.graphs)
+        .find_map(|(left, right)| (left != right).then_some(left.name.as_str()))
+        .or_else(|| {
+            expected
+                .graphs
+                .get(actual.graphs.len())
+                .map(|graph| graph.name.as_str())
+        })
+}
 fn rebuild_stage_archive(base_root: PathBuf, stage: &str, out: PathBuf) -> Result<()> {
     let archives = discover_scene_archives(&base_root)?;
     let matches = archives

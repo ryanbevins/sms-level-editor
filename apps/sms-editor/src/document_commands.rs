@@ -1,7 +1,6 @@
 use super::*;
 
 impl ObjectUndoRecord {
-    #[cfg(test)]
     fn between(
         before: &[SceneObject],
         after: &[SceneObject],
@@ -46,11 +45,37 @@ impl ObjectUndoRecord {
                 before_archive_edits,
                 after_archive_edits,
             ),
+            route_delta: None,
         }
+    }
+    pub(super) fn route_edit(
+        before_objects: &[SceneObject],
+        after_objects: &[SceneObject],
+        before_archive_edits: &StageArchiveEdits,
+        after_archive_edits: &StageArchiveEdits,
+        before_route: Option<RouteAuthoringDocument>,
+        after_route: Option<RouteAuthoringDocument>,
+    ) -> Self {
+        let mut record = Self::between(
+            before_objects,
+            after_objects,
+            before_archive_edits,
+            after_archive_edits,
+        );
+        if before_route != after_route {
+            record.route_delta = Some(RouteAuthoringDelta {
+                before: before_route,
+                after: after_route,
+            });
+        }
+        record
     }
 
     fn apply_forward(&self, document: &mut StageDocument) {
         self.apply_resource_edits(document, false);
+        if let Some(delta) = &self.route_delta {
+            document.route_authoring = delta.after.clone();
+        }
         let objects = &mut document.objects;
         let mut removals = self
             .deltas
@@ -114,6 +139,9 @@ impl ObjectUndoRecord {
         for (index, object) in removed {
             objects.insert(index.min(objects.len()), object.clone());
         }
+        if let Some(delta) = &self.route_delta {
+            document.route_authoring = delta.before.clone();
+        }
         self.apply_resource_edits(document, true);
     }
 
@@ -132,8 +160,8 @@ impl ObjectUndoRecord {
         }));
     }
 
-    fn is_empty(&self) -> bool {
-        self.deltas.is_empty() && self.resource_deltas.is_empty()
+    pub(super) fn is_empty(&self) -> bool {
+        self.deltas.is_empty() && self.resource_deltas.is_empty() && self.route_delta.is_none()
     }
 }
 
@@ -155,7 +183,6 @@ fn resource_edit_state(edits: &StageArchiveEdits, raw_resource_path: &[u8]) -> R
     }
 }
 
-#[cfg(test)]
 fn resource_edit_deltas_between(
     before: &StageArchiveEdits,
     after: &StageArchiveEdits,
@@ -556,6 +583,7 @@ fn repair_authored_catalog_resources(
         ObjectUndoRecord {
             deltas: Vec::new(),
             resource_deltas,
+            route_delta: None,
         }
         .apply_forward(document);
     }
@@ -2187,6 +2215,7 @@ impl SmsEditorApp {
             "Added object",
             ObjectUndoRecord {
                 deltas: vec![ObjectDelta::Insert { index, object }],
+                route_delta: None,
                 resource_deltas: catalog_resource_deltas,
             },
         );
@@ -2291,6 +2320,7 @@ impl SmsEditorApp {
                     object: clone,
                 }],
                 resource_deltas: Vec::new(),
+                route_delta: None,
             },
         );
         self.selected_object_id = Some(id);
@@ -2319,6 +2349,7 @@ impl SmsEditorApp {
             ObjectUndoRecord {
                 deltas: vec![ObjectDelta::Remove { index, object }],
                 resource_deltas: Vec::new(),
+                route_delta: None,
             },
         );
         self.selected_object_id = None;
@@ -2348,6 +2379,7 @@ impl SmsEditorApp {
                     after: Box::new(after),
                 }],
                 resource_deltas: Vec::new(),
+                route_delta: None,
             },
         );
         let has_rendered_model = self
@@ -2454,6 +2486,7 @@ impl SmsEditorApp {
         self.apply_object_edit(
             "Updated object parameter",
             ObjectUndoRecord {
+                route_delta: None,
                 deltas: vec![ObjectDelta::Update {
                     before: Box::new(before),
                     after: Box::new(after),
@@ -2530,6 +2563,7 @@ impl SmsEditorApp {
                     after: Box::new(after),
                 }],
                 resource_deltas: Vec::new(),
+                route_delta: None,
             },
         );
     }
@@ -2614,7 +2648,7 @@ impl SmsEditorApp {
         }
     }
 
-    fn flush_document_change(&mut self) {
+    pub(super) fn flush_document_change(&mut self) {
         let Some(document) = &mut self.document else {
             return;
         };
@@ -2683,6 +2717,7 @@ impl SmsEditorApp {
                         .into_iter()
                         .collect(),
                     resource_deltas: Vec::new(),
+                    route_delta: None,
                 }
             } else {
                 ObjectUndoRecord {
@@ -2691,6 +2726,7 @@ impl SmsEditorApp {
                         object: transaction.before.clone(),
                     }],
                     resource_deltas: Vec::new(),
+                    route_delta: None,
                 }
             }
         });
@@ -2710,7 +2746,7 @@ impl SmsEditorApp {
         self.log.push(format!("{label}."));
     }
 
-    fn push_undo_record(&mut self, record: ObjectUndoRecord) {
+    pub(super) fn push_undo_record(&mut self, record: ObjectUndoRecord) {
         if record.is_empty() {
             return;
         }
@@ -3194,6 +3230,7 @@ mod tests {
             stage_archive_source_path: Some(PathBuf::from("virtual/fixture0.szs")),
             archive_edits: StageArchiveEdits::default(),
             registry: None,
+            route_authoring: None,
             load_issues: Vec::new(),
             lighting: StageLighting::default(),
             actor_previews: BTreeMap::new(),
@@ -3511,6 +3548,7 @@ mod tests {
             stage_archive: Some(archive),
             stage_archive_source_path: Some(PathBuf::from("custom0.szs")),
             archive_edits: sms_scene::StageArchiveEdits::default(),
+            route_authoring: None,
             registry: None,
             load_issues: Vec::new(),
             lighting: sms_scene::StageLighting::default(),
@@ -3585,6 +3623,7 @@ mod tests {
             changed_files: BTreeMap::new(),
             stage_archive: Some(archive),
             stage_archive_source_path: Some(PathBuf::from("custom0.szs")),
+            route_authoring: None,
             archive_edits: sms_scene::StageArchiveEdits::default(),
             registry: None,
             load_issues: Vec::new(),
@@ -3847,6 +3886,7 @@ mod tests {
         ObjectUndoRecord {
             deltas: Vec::new(),
             resource_deltas: catalog_resource_edit_deltas(&document, preflight.writes),
+            route_delta: None,
         }
         .apply_forward(&mut document);
 
@@ -4257,6 +4297,7 @@ mod tests {
         let edit = ObjectUndoRecord {
             deltas: Vec::new(),
             resource_deltas: catalog_resource_edit_deltas(&document, preflight.writes),
+            route_delta: None,
         };
         edit.apply_forward(&mut document);
         assert_eq!(
@@ -4303,6 +4344,7 @@ mod tests {
             ObjectUndoRecord {
                 deltas: vec![ObjectDelta::Insert { index: 0, object }],
                 resource_deltas,
+                route_delta: None,
             },
         );
 
@@ -4386,6 +4428,7 @@ mod tests {
             ObjectUndoRecord {
                 deltas: Vec::new(),
                 resource_deltas,
+                route_delta: None,
             },
         );
 
@@ -4438,6 +4481,7 @@ mod tests {
             ObjectUndoRecord {
                 deltas: Vec::new(),
                 resource_deltas,
+                route_delta: None,
             },
         );
         assert!(app.document_dirty);

@@ -139,9 +139,119 @@ fn validate_runtime_actor_links(document: &StageDocument, issues: &mut Vec<Valid
     }
 }
 
+fn route_reference_requires_named_graph(object: &super::SceneObject) -> bool {
+    // Sunshine deliberately maps unknown graph names to TGraphGroup's
+    // <nullrail> dummy. Retail placements use that behavior for stationary
+    // actors (for example dolpic10's NPCMonteMA named monte3), so a pristine
+    // source value is not a dangling reference. An editor-authored assignment
+    // is expected to name a real graph and remains an export-blocking error.
+    object
+        .raw_params
+        .get("graph_name")
+        .is_some_and(super::SceneParameter::is_dirty)
+        || matches!(object.placement, Some(super::PlacementBinding::Authored(_)))
+}
+
+fn validate_routes(document: &StageDocument, issues: &mut Vec<ValidationIssue>) {
+    let Some(routes) = document.route_authoring.as_ref() else {
+        return;
+    };
+    if let Err(error) = routes.compile() {
+        issues.push(ValidationIssue::error(
+            "route-compile-failed",
+            format!("Route export is blocked: {error}"),
+        ));
+    }
+    let mut names = BTreeSet::new();
+    for graph in &routes.graphs {
+        if !names.insert(graph.name.as_str()) {
+            issues.push(ValidationIssue::error(
+                "duplicate-route-name",
+                format!("Route name {:?} is duplicated", graph.name),
+            ));
+        }
+        if graph.controls.is_empty() {
+            continue;
+        }
+        let mut adjacency = BTreeMap::<&str, Vec<&str>>::new();
+        for control in &graph.controls {
+            adjacency.entry(control.id.as_str()).or_default();
+        }
+        for link in &graph.links {
+            adjacency
+                .entry(link.from.as_str())
+                .or_default()
+                .push(link.to.as_str());
+            adjacency
+                .entry(link.to.as_str())
+                .or_default()
+                .push(link.from.as_str());
+        }
+        let mut visited = BTreeSet::new();
+        let mut pending = vec![graph.controls[0].id.as_str()];
+        while let Some(id) = pending.pop() {
+            if visited.insert(id) {
+                pending.extend(adjacency.get(id).into_iter().flatten().copied());
+            }
+        }
+        if visited.len() != graph.controls.len() {
+            issues.push(ValidationIssue::warning(
+                "disconnected-route",
+                format!(
+                    "Route {:?} has {} disconnected control point(s)",
+                    graph.name,
+                    graph.controls.len() - visited.len()
+                ),
+            ));
+        }
+        if graph.name.starts_with("S_") && adjacency.values().any(|neighbors| neighbors.len() > 2) {
+            issues.push(ValidationIssue::warning(
+                "invalid-automatic-spline-topology",
+                format!(
+                    "Route {:?} is interpreted by Sunshine as an ordered automatic spline but contains a branch",
+                    graph.name
+                ),
+            ));
+        }
+    }
+    for object in &document.objects {
+        let Some(graph_name) = object.raw_param("graph_name") else {
+            continue;
+        };
+        if graph_name == "(null)" || graph_name.is_empty() {
+            continue;
+        }
+        let Some(graph) = routes.graph_by_name(graph_name) else {
+            if !route_reference_requires_named_graph(object) {
+                continue;
+            }
+            issues.push(ValidationIssue::error(
+                "missing-route-reference",
+                format!(
+                    "Object {} references missing route {:?}",
+                    object.id, graph_name
+                ),
+            ));
+            continue;
+        };
+        if let Some(distance) = graph.nearest_control_distance(object.transform.translation) {
+            if distance > 5000.0 {
+                issues.push(ValidationIssue::warning(
+                    "distant-route-start",
+                    format!(
+                        "Object {} is {:.0} units from its nearest starting node on {:?}",
+                        object.id, distance, graph_name
+                    ),
+                ));
+            }
+        }
+    }
+}
+
 pub(super) fn validate_document(document: &StageDocument) -> Vec<ValidationIssue> {
     let mut issues = document.load_issues.clone();
     validate_runtime_actor_links(document, &mut issues);
+    validate_routes(document, &mut issues);
 
     if !document.base_root.exists() {
         issues.push(ValidationIssue::error(
@@ -340,4 +450,34 @@ pub(super) fn validate_document(document: &StageDocument) -> Vec<ValidationIssue
     }
 
     issues
+}
+
+#[cfg(test)]
+mod tests {
+    use super::route_reference_requires_named_graph;
+    use crate::{AuthoredPlacement, PlacementBinding, SceneObject};
+    use sms_formats::{JDramaRecord, JDramaRecordPayload};
+
+    #[test]
+    fn pristine_retail_dummy_route_is_not_a_required_reference() {
+        let mut object = SceneObject::new("retail", "NPCMonteMA");
+        object.insert_source_raw_param("graph_name", "monte3");
+        assert!(!route_reference_requires_named_graph(&object));
+
+        object.set_raw_param("graph_name", "missing-authored-route");
+        assert!(route_reference_requires_named_graph(&object));
+    }
+
+    #[test]
+    fn authored_placement_requires_its_named_route() {
+        let mut object = SceneObject::new("authored", "NPCMonteMA");
+        object.insert_source_raw_param("graph_name", "missing-authored-route");
+        object.placement = Some(PlacementBinding::Authored(AuthoredPlacement {
+            raw_resource_path: b"map/scene.bin".to_vec(),
+            target_group_index: 0,
+            prototype: JDramaRecord::new("Group", "Group", JDramaRecordPayload::Empty).unwrap(),
+            dependencies: Vec::new(),
+        }));
+        assert!(route_reference_requires_named_graph(&object));
+    }
 }

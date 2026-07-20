@@ -25,9 +25,10 @@ use sms_render::{
     gx_blend_compatibility, GxBlendCompatibility, RenderScene, RendererConfig, ViewportRenderer,
 };
 use sms_scene::{
-    AssetRef, AssetRole, ObjectAuthoringCatalog, ObjectAuthoringCatalogWarning, SceneError,
-    SceneObject, StageArchiveEdits, StageDocument, StageLighting, StageResourceDocument,
-    StageResourceEdit, Transform, ValidationIssue, ValidationSeverity,
+    AssetRef, AssetRole, ObjectAuthoringCatalog, ObjectAuthoringCatalogWarning,
+    RouteAuthoringDocument, SceneError, SceneObject, StageArchiveEdits, StageDocument,
+    StageLighting, StageResourceDocument, StageResourceEdit, Transform, ValidationIssue,
+    ValidationSeverity,
 };
 use sms_schema::{ObjectDefinition, ObjectRegistry, ParticleBindingTarget, SchemaGenerator};
 
@@ -42,6 +43,7 @@ mod outliner;
 mod play_in_editor;
 mod project;
 mod project_ui;
+mod routes;
 mod scene_labels;
 mod skybox_library;
 mod stage_creation;
@@ -690,9 +692,16 @@ struct ResourceEditDelta {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+struct RouteAuthoringDelta {
+    before: Option<RouteAuthoringDocument>,
+    after: Option<RouteAuthoringDocument>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 struct ObjectUndoRecord {
     deltas: Vec<ObjectDelta>,
     resource_deltas: Vec<ResourceEditDelta>,
+    route_delta: Option<RouteAuthoringDelta>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -706,6 +715,20 @@ struct ObjectUndoTransaction {
     index: usize,
     before: SceneObject,
     kind: ObjectUndoTransactionKind,
+}
+#[derive(Debug, Clone, PartialEq)]
+struct RouteUndoTransaction {
+    before_objects: Vec<SceneObject>,
+    before_archive_edits: StageArchiveEdits,
+    before_route: Option<RouteAuthoringDocument>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct RouteHandleDrag {
+    graph_id: String,
+    link_id: String,
+    from_handle: bool,
+    plane_y: f32,
 }
 
 struct SmsEditorApp {
@@ -798,6 +821,14 @@ struct SmsEditorApp {
     show_effects: bool,
     outliner_filter: String,
     startup_camera_focus: Option<[f32; 3]>,
+    route_mode: bool,
+    show_all_routes: bool,
+    active_route_graph: Option<String>,
+    selected_route_controls: BTreeSet<String>,
+    selected_route_link: Option<String>,
+    route_curve_confirmation: Option<(String, String)>,
+    pending_route_assignment: Option<(String, String)>,
+    route_handle_drag: Option<RouteHandleDrag>,
     startup_focus_object: Option<String>,
     startup_camera_distance: Option<f32>,
     startup_camera_yaw: Option<f32>,
@@ -818,6 +849,7 @@ struct SmsEditorApp {
     undo_stack: VecDeque<ObjectUndoRecord>,
     redo_stack: VecDeque<ObjectUndoRecord>,
     undo_transaction: Option<ObjectUndoTransaction>,
+    route_undo_transaction: Option<RouteUndoTransaction>,
     pending_stage_open: Option<String>,
     pending_project_hub: bool,
     close_confirmation_requested: bool,
@@ -990,6 +1022,14 @@ impl Default for SmsEditorApp {
             show_goop_meshes: true,
             show_effects: true,
             outliner_filter: String::new(),
+            route_mode: false,
+            show_all_routes: true,
+            active_route_graph: None,
+            selected_route_controls: BTreeSet::new(),
+            selected_route_link: None,
+            route_curve_confirmation: None,
+            pending_route_assignment: None,
+            route_handle_drag: None,
             startup_camera_focus: args.camera_focus,
             startup_focus_object: args.focus_object,
             startup_camera_distance: args.camera_distance,
@@ -1011,6 +1051,7 @@ impl Default for SmsEditorApp {
             undo_stack: VecDeque::new(),
             redo_stack: VecDeque::new(),
             undo_transaction: None,
+            route_undo_transaction: None,
             pending_stage_open: None,
             pending_project_hub: false,
             close_confirmation_requested: false,
@@ -1709,7 +1750,7 @@ impl SmsEditorApp {
             object_authoring_catalog,
             object_authoring_catalog_warnings,
             project_warning,
-            document,
+            mut document,
             scene,
             preview,
             scene_labels,
@@ -1835,6 +1876,19 @@ impl SmsEditorApp {
                 issue.code, issue.message
             ));
         }
+        if let Err(error) = document.ensure_route_authoring() {
+            self.log.push(format!("Routes unavailable: {error}"));
+        }
+        self.active_route_graph = document
+            .route_authoring
+            .as_ref()
+            .and_then(|routes| routes.graphs.first())
+            .map(|graph| graph.id.clone());
+        self.selected_route_controls.clear();
+        self.selected_route_link = None;
+        self.route_curve_confirmation = None;
+        self.pending_route_assignment = None;
+        self.route_handle_drag = None;
         self.saved_objects = document.objects.clone();
         self.saved_lighting = document.lighting.clone();
         self.saved_archive_edits = document.archive_edits.clone();
@@ -1859,6 +1913,7 @@ impl SmsEditorApp {
         self.undo_stack.clear();
         self.redo_stack.clear();
         self.undo_transaction = None;
+        self.route_undo_transaction = None;
         self.reset_camera();
         self.restore_project_camera_state();
         self.apply_startup_camera_focus();

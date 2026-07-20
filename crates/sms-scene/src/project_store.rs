@@ -11,7 +11,7 @@ use super::{
 };
 
 pub(super) const PROJECT_KIND: &str = "sms-editor-project";
-pub(super) const PROJECT_FORMAT_VERSION: u32 = 3;
+pub(super) const PROJECT_FORMAT_VERSION: u32 = 4;
 const MAX_PROJECT_MANIFEST_BYTES: u64 = 1024 * 1024;
 static PROJECT_TRANSACTION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -378,7 +378,38 @@ pub(super) fn load_project_overlay(
     };
     document.objects = overlay.objects;
     document.archive_edits = overlay.archive_edits;
+    document.route_authoring = overlay.route_authoring;
     document.sync_archive_edit_assets();
+    if let Some(authoring) = document.route_authoring.as_ref() {
+        match (
+            authoring.compile(),
+            document.effective_resource_clone(&authoring.raw_resource_path),
+        ) {
+            (Ok(compiled), Ok(Some(super::StageResourceDocument::Rail(stored))))
+                if compiled != stored =>
+            {
+                document.load_issues.push(super::ValidationIssue::error(
+                    "route-authoring-overlay-mismatch",
+                    "Saved route authoring data does not compile to the stored RAL overlay; both representations were retained for review.",
+                ));
+            }
+            (Err(error), _) => document.load_issues.push(super::ValidationIssue::error(
+                "route-authoring-compile-failed",
+                format!("Saved route authoring data could not be compiled: {error}"),
+            )),
+            (_, Ok(Some(super::StageResourceDocument::Rail(_)))) => {}
+            (_, Ok(Some(_)) | Ok(None)) => {
+                document.load_issues.push(super::ValidationIssue::error(
+                    "route-authoring-resource-missing",
+                    "Saved route authoring data has no matching RAL overlay.",
+                ))
+            }
+            (_, Err(error)) => document.load_issues.push(super::ValidationIssue::error(
+                "route-authoring-resource-check-failed",
+                format!("Could not verify saved route authoring data: {error}"),
+            )),
+        }
+    }
     if let Some(lighting) = overlay.lighting {
         document.lighting = lighting;
     }

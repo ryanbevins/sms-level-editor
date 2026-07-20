@@ -3903,6 +3903,7 @@ mod tests {
                 stage_archive_source_path: Some(self.archive_path.clone()),
                 archive_edits: StageArchiveEdits::default(),
                 registry: None,
+                route_authoring: None,
                 load_issues: Vec::new(),
                 lighting: crate::StageLighting::default(),
                 actor_previews: BTreeMap::new(),

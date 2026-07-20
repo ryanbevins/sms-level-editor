@@ -33,6 +33,7 @@ fn document_with_archive(archive: SourceFreeStageArchive) -> StageDocument {
         stage_archive_source_path: None,
         archive_edits: StageArchiveEdits::default(),
         registry: None,
+        route_authoring: None,
         load_issues: Vec::new(),
         lighting: StageLighting::default(),
         actor_previews: BTreeMap::new(),

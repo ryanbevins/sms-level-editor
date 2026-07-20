@@ -168,6 +168,22 @@ impl SmsEditorApp {
                     self.tool = tool;
                 }
             }
+            if ui
+                .selectable_label(self.route_mode, "Routes")
+                .on_hover_text("Edit scene.ral graphs, links, Bezier handles, and actor assignments")
+                .clicked()
+            {
+                self.route_mode = !self.route_mode;
+                if self.route_mode {
+                    self.tool = EditorTool::Move;
+                }
+                if self.route_mode && self.active_route_graph.is_none() {
+                    self.active_route_graph = self.document.as_ref()
+                        .and_then(|document| document.route_authoring.as_ref())
+                        .and_then(|routes| routes.graphs.first())
+                        .map(|graph| graph.id.clone());
+                }
+            }
 
             ui.separator();
             if ui
@@ -979,6 +995,10 @@ impl SmsEditorApp {
     }
 
     pub(super) fn outliner_panel(&mut self, ui: &mut egui::Ui) {
+        if self.route_mode {
+            self.routes_hierarchy_panel(ui);
+            return;
+        }
         ui.horizontal(|ui| {
             ui.heading("Hierarchy");
             let object_count = self
@@ -1123,6 +1143,9 @@ impl SmsEditorApp {
     }
 
     pub(super) fn inspector_panel(&mut self, ui: &mut egui::Ui) {
+        if self.route_inspector_panel(ui) {
+            return;
+        }
         if self.selected_model_instance_id.is_some() {
             self.model_instance_inspector_panel(ui);
             self.stage_lighting_panel(ui);
@@ -1176,6 +1199,7 @@ impl SmsEditorApp {
                 }
             });
 
+            self.graph_reference_control(ui, &object);
             if !object.runtime_references.is_empty() {
                 ui.separator();
                 ui.heading("Runtime Links");
@@ -1265,6 +1289,10 @@ impl SmsEditorApp {
                         .show(ui, |ui| {
                             for parameter in parameters {
                                 canonical_keys.insert(parameter.key.clone());
+                                if parameter.key == "graph_name" {
+                                    canonical_keys.insert(parameter.key);
+                                    continue;
+                                }
                                 let editable = parameter.read_only_reason.is_none();
                                 let parameter_hover = parameter.info.as_ref().map_or_else(
                                     || format!("{:?}", parameter.kind),

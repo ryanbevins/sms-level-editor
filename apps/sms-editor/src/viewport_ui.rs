@@ -280,7 +280,9 @@ impl SmsEditorApp {
 
         let pointer_delta = ui.input(|input| input.pointer.delta());
         let modifiers = ui.input(|input| input.modifiers);
-        let gizmo_using_pointer = self.handle_transform_gizmo_input(ui, rect, response);
+        let route_handle_using_pointer = self.handle_route_handle_drag(ui, rect, response);
+        let gizmo_using_pointer =
+            route_handle_using_pointer || self.handle_transform_gizmo_input(ui, rect, response);
 
         if response.hovered() && ui.input(|input| input.key_pressed(egui::Key::F)) {
             self.frame_selected();
@@ -321,6 +323,9 @@ impl SmsEditorApp {
 
         if response.clicked() && self.hovered_gizmo_axis.is_none() && !gizmo_using_pointer {
             if let Some(pos) = response.interact_pointer_pos() {
+                if self.handle_route_viewport_click(rect, response, modifiers) {
+                    return;
+                }
                 if self.tool == EditorTool::Place {
                     if let Some(asset_id) = self.placing_model_asset {
                         let world = self.screen_to_world_floor(rect, pos);
@@ -365,16 +370,22 @@ impl SmsEditorApp {
         rect: egui::Rect,
         response: &egui::Response,
     ) -> bool {
-        let supports_gizmo = matches!(
-            self.tool,
-            EditorTool::Move | EditorTool::Rotate | EditorTool::Scale
-        );
+        let route_origin = self.selected_route_control_position();
+        let supports_gizmo = if route_origin.is_some() {
+            self.tool == EditorTool::Move
+        } else {
+            matches!(
+                self.tool,
+                EditorTool::Move | EditorTool::Rotate | EditorTool::Scale
+            )
+        };
         let pointer = ui.input(|input| input.pointer.interact_pos());
+        let world_origin = route_origin.or_else(|| {
+            self.selected_object()
+                .map(|object| object.transform.translation)
+        });
         let geometry = supports_gizmo
-            .then(|| {
-                self.selected_object()
-                    .and_then(|object| self.gizmo_geometry(rect, object.transform.translation))
-            })
+            .then(|| world_origin.and_then(|origin| self.gizmo_geometry(rect, origin)))
             .flatten();
         let hovered = if response.hovered() {
             pointer
@@ -395,13 +406,20 @@ impl SmsEditorApp {
 
         let primary_pressed = ui.input(|input| input.pointer.primary_pressed());
         if self.gizmo_drag.is_none() && primary_pressed {
-            if let (Some(axis), Some(pointer), Some(geometry), Some(object)) = (
-                hovered,
-                pointer,
-                geometry.as_ref(),
-                self.selected_object().cloned(),
-            ) {
-                self.begin_undo_transaction();
+            if let (Some(axis), Some(pointer), Some(geometry), Some(origin)) =
+                (hovered, pointer, geometry.as_ref(), world_origin)
+            {
+                let start_transform = if route_origin.is_some() {
+                    self.begin_route_undo_transaction();
+                    Transform {
+                        translation: origin,
+                        ..Transform::default()
+                    }
+                } else {
+                    self.begin_undo_transaction();
+                    self.selected_object()
+                        .map_or_else(Transform::default, |object| object.transform)
+                };
                 self.gizmo_drag = Some(GizmoDrag {
                     axis,
                     tool: self.tool,
@@ -409,7 +427,7 @@ impl SmsEditorApp {
                     screen_origin: geometry.origin,
                     screen_direction: geometry.axes[axis.index()].direction,
                     world_units_per_pixel: geometry.world_units_per_pixel,
-                    start_transform: object.transform,
+                    start_transform,
                 });
             }
         }
@@ -426,13 +444,21 @@ impl SmsEditorApp {
                     self.snap_rotation,
                     self.snap_scale,
                 );
-                self.update_selected_transform(transform);
+                if self.route_undo_transaction.is_some() {
+                    self.update_selected_route_control_position(transform.translation);
+                } else {
+                    self.update_selected_transform(transform);
+                }
             }
         }
 
         let primary_released = ui.input(|input| input.pointer.primary_released());
         if primary_released {
             if let Some(drag) = self.gizmo_drag.take() {
+                if self.route_undo_transaction.is_some() {
+                    self.commit_route_undo_transaction("Moved route control point");
+                    return true;
+                }
                 self.commit_undo_transaction(match drag.tool {
                     EditorTool::Move => "Moved object",
                     EditorTool::Rotate => "Rotated object",
@@ -733,6 +759,7 @@ impl SmsEditorApp {
             self.paint_grid(painter, rect);
         }
         self.paint_model_instances(painter, rect);
+        self.paint_routes(painter, rect);
         self.paint_selected_object_outline(painter, rect);
 
         let projection = self.camera_projection(rect);

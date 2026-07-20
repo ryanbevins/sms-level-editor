@@ -23,6 +23,7 @@ mod blank_stage;
 mod object_authoring;
 mod object_parameters;
 mod project_store;
+mod route_authoring;
 mod stage_archive;
 mod stage_export;
 mod validation;
@@ -47,6 +48,11 @@ pub use object_parameters::{
     sync_scene_object_parameter_aliases, EditableSceneParameter, ObjectParameterBitFlag,
     ObjectParameterChoice, ObjectParameterIndexedChoice, ObjectParameterInfo, ObjectParameterKind,
     ParameterApplyMode, OBJECT_PARAMETER_CHARACTER_NAME, OBJECT_PARAMETER_NAME,
+};
+pub use route_authoring::{
+    BezierHandles, RouteAssignmentSuggestion, RouteAuthoringDocument, RouteAuthoringError,
+    RouteControlPoint, RouteDirection, RouteGraph, RouteLink, RoutePeriod,
+    DEFAULT_ROUTE_BAKE_TOLERANCE, MAX_ROUTE_SAMPLES_PER_LINK, ROUTE_RESOURCE_PATH,
 };
 pub use stage_archive::{
     SourceFreeStageArchive, StageCompression, StageObjectPlacement, StageOrigin, StageResource,
@@ -204,6 +210,9 @@ pub struct StageDocument {
     /// Source-free model and collision replacements authored for stage export.
     pub archive_edits: StageArchiveEdits,
     pub registry: Option<ObjectRegistry>,
+    /// Project-only control points and Bezier handles for `map/scene.ral`.
+    /// The compiled retail representation remains an authored Rail resource.
+    pub route_authoring: Option<RouteAuthoringDocument>,
     pub load_issues: Vec<ValidationIssue>,
     pub lighting: StageLighting,
     pub actor_previews: BTreeMap<String, ActorPreview>,
@@ -321,6 +330,7 @@ impl StageDocument {
             archive_edits: StageArchiveEdits::default(),
             registry: None,
             load_issues,
+            route_authoring: None,
             lighting,
             actor_previews: BTreeMap::new(),
             loaded_project: None,
@@ -365,6 +375,7 @@ impl StageDocument {
             archive_edits: StageArchiveEdits::default(),
             registry: None,
             load_issues,
+            route_authoring: None,
             lighting,
             actor_previews: BTreeMap::new(),
             loaded_project: None,
@@ -431,6 +442,7 @@ impl StageDocument {
         self.archive_edits = StageArchiveEdits::default();
         self.load_issues = load_issues;
         self.lighting = lighting;
+        self.route_authoring = None;
         self.actor_previews.clear();
         if let Some(registry) = registry {
             self.set_registry(registry);
@@ -563,9 +575,250 @@ impl StageDocument {
         }
         Ok(current)
     }
+    /// Materializes the effective retail rail as project-side controls on first use.
+    pub fn ensure_route_authoring(&mut self) -> Result<&mut RouteAuthoringDocument> {
+        if self.route_authoring.is_none() {
+            let resource = self.effective_resource_clone(ROUTE_RESOURCE_PATH)?;
+            let rail = match resource {
+                Some(StageResourceDocument::Rail(rail)) => rail,
+                Some(_) => {
+                    return Err(SceneError::StageExport(
+                        "map/scene.ral is not a RAL resource".to_string(),
+                    ));
+                }
+                None => sms_formats::RalDocument {
+                    graphs: Vec::new(),
+                    file_size: 0,
+                    padding: Vec::new(),
+                },
+            };
+            self.route_authoring = Some(RouteAuthoringDocument::lift(ROUTE_RESOURCE_PATH, &rail));
+        }
+        Ok(self
+            .route_authoring
+            .as_mut()
+            .expect("route authoring initialized"))
+    }
 
+    /// Compiles project-side route state into the detached semantic archive overlay.
+    pub fn compile_route_authoring(&mut self) -> Result<()> {
+        let Some(authoring) = self.route_authoring.as_ref() else {
+            return Ok(());
+        };
+        let rail = authoring
+            .compile()
+            .map_err(|error| SceneError::StageExport(error.to_string()))?;
+        self.upsert_authored_resource(
+            authoring.raw_resource_path.clone(),
+            StageResourceDocument::Rail(rail),
+        );
+        Ok(())
+    }
+
+    pub fn route_consumers(&self, graph_name: &str) -> Vec<&SceneObject> {
+        self.objects
+            .iter()
+            .filter(|object| object.raw_param("graph_name") == Some(graph_name))
+            .collect()
+    }
+    pub fn route_reference_count(&self, graph_name: &str) -> usize {
+        self.objects
+            .iter()
+            .map(|object| {
+                usize::from(object.raw_param("graph_name") == Some(graph_name))
+                    + match &object.placement {
+                        Some(PlacementBinding::Authored(authored)) => authored
+                            .dependencies
+                            .iter()
+                            .map(|dependency| {
+                                graph_name_in_record_count(&dependency.record, graph_name)
+                            })
+                            .sum::<usize>(),
+                        _ => 0,
+                    }
+            })
+            .sum()
+    }
+
+    pub fn route_assignment_suggestions(&self, object_id: &str) -> Vec<RouteAssignmentSuggestion> {
+        let Some(object) = self.objects.iter().find(|object| object.id == object_id) else {
+            return Vec::new();
+        };
+        let Some(routes) = self.route_authoring.as_ref() else {
+            return Vec::new();
+        };
+        let current = object.raw_param("graph_name").unwrap_or("(null)");
+        let position = object.transform.translation;
+        let mut suggestions = routes
+            .graphs
+            .iter()
+            .map(|graph| {
+                let consumers = self.route_consumers(&graph.name);
+                RouteAssignmentSuggestion {
+                    graph_id: graph.id.clone(),
+                    graph_name: graph.name.clone(),
+                    current: graph.name == current,
+                    same_factory_uses: consumers
+                        .iter()
+                        .filter(|candidate| candidate.factory_name == object.factory_name)
+                        .count(),
+                    consumer_count: consumers.len(),
+                    nearest_distance: graph
+                        .nearest_control_distance(position)
+                        .unwrap_or(f32::INFINITY),
+                }
+            })
+            .collect::<Vec<_>>();
+        suggestions.sort_by(|left, right| {
+            right
+                .current
+                .cmp(&left.current)
+                .then_with(|| right.same_factory_uses.cmp(&left.same_factory_uses))
+                .then_with(|| left.nearest_distance.total_cmp(&right.nearest_distance))
+                .then_with(|| left.graph_name.cmp(&right.graph_name))
+        });
+        suggestions
+    }
+
+    /// Renames a graph and every exact typed consumer as one transactional mutation.
+    pub fn rename_route_graph(&mut self, graph_id: &str, new_name: &str) -> Result<usize> {
+        let before_routes = self.route_authoring.clone();
+        let before_objects = self.objects.clone();
+        let before_edits = self.archive_edits.clone();
+        let result = (|| {
+            let old_name = self
+                .ensure_route_authoring()?
+                .graph(graph_id)
+                .ok_or_else(|| {
+                    SceneError::StageExport(format!("route graph {graph_id:?} was not found"))
+                })?
+                .name
+                .clone();
+            self.route_authoring
+                .as_mut()
+                .expect("route authoring initialized")
+                .rename_graph(graph_id, new_name)
+                .map_err(|error| SceneError::StageExport(error.to_string()))?;
+            let mut changed = 0;
+            for object in &mut self.objects {
+                if object.raw_param("graph_name") == Some(old_name.as_str()) {
+                    object.set_raw_param("graph_name", new_name);
+                    changed += 1;
+                }
+                if let Some(PlacementBinding::Authored(authored)) = &mut object.placement {
+                    changed +=
+                        rewrite_graph_name_in_record(&mut authored.prototype, &old_name, new_name);
+                    for dependency in &mut authored.dependencies {
+                        changed += rewrite_graph_name_in_record(
+                            &mut dependency.record,
+                            &old_name,
+                            new_name,
+                        );
+                    }
+                }
+            }
+            self.compile_route_authoring()?;
+            Ok(changed)
+        })();
+        if result.is_err() {
+            self.route_authoring = before_routes;
+            self.objects = before_objects;
+            self.archive_edits = before_edits;
+        }
+        result
+    }
+
+    pub fn assign_object_route(&mut self, object_id: &str, graph_name: Option<&str>) -> Result<()> {
+        let value = graph_name.unwrap_or("(null)");
+        if graph_name.is_some() {
+            let routes = self.ensure_route_authoring()?;
+            if routes.graph_by_name(value).is_none() {
+                return Err(SceneError::StageExport(format!(
+                    "route graph {value:?} was not found"
+                )));
+            }
+        }
+        let object = self
+            .objects
+            .iter_mut()
+            .find(|object| object.id == object_id)
+            .ok_or_else(|| {
+                SceneError::StageExport(format!("object {object_id:?} was not found"))
+            })?;
+        object.set_raw_param("graph_name", value);
+        Ok(())
+    }
+
+    pub fn create_route_from_actor(&mut self, object_id: &str) -> Result<String> {
+        let object = self
+            .objects
+            .iter()
+            .find(|object| object.id == object_id)
+            .cloned()
+            .ok_or_else(|| {
+                SceneError::StageExport(format!("object {object_id:?} was not found"))
+            })?;
+        let routes = self.ensure_route_authoring()?;
+        let name = (1u32..)
+            .map(|serial| format!("Route{serial:03}"))
+            .find(|name| routes.graph_by_name(name).is_none())
+            .expect("route name space");
+        let yaw = object.transform.rotation_degrees[1].to_radians();
+        let first = object.transform.translation.map(|value| {
+            value
+                .round()
+                .clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16
+        });
+        let second = [
+            (object.transform.translation[0] + yaw.sin() * 500.0)
+                .round()
+                .clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16,
+            first[1],
+            (object.transform.translation[2] + yaw.cos() * 500.0)
+                .round()
+                .clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16,
+        ];
+        let graph_id = routes
+            .add_graph(name.clone(), first, second)
+            .map_err(|error| SceneError::StageExport(error.to_string()))?;
+        self.assign_object_route(object_id, Some(&name))?;
+        self.compile_route_authoring()?;
+        Ok(graph_id)
+    }
+
+    pub fn duplicate_route_and_reassign(&mut self, object_id: &str) -> Result<String> {
+        let current_name = self
+            .objects
+            .iter()
+            .find(|object| object.id == object_id)
+            .and_then(|object| object.raw_param("graph_name"))
+            .filter(|name| !name.is_empty() && *name != "(null)")
+            .map(str::to_string)
+            .ok_or_else(|| {
+                SceneError::StageExport("actor has no route to duplicate".to_string())
+            })?;
+        let routes = self.ensure_route_authoring()?;
+        let source_id = routes
+            .graph_by_name(&current_name)
+            .map(|graph| graph.id.clone())
+            .ok_or_else(|| {
+                SceneError::StageExport(format!("route graph {current_name:?} was not found"))
+            })?;
+        let new_name = (1u32..)
+            .map(|serial| format!("{current_name}_copy{serial:02}"))
+            .find(|name| routes.graph_by_name(name).is_none())
+            .expect("route name space");
+        let graph_id = routes
+            .duplicate_graph(&source_id, new_name.clone())
+            .map_err(|error| SceneError::StageExport(error.to_string()))?;
+        self.assign_object_route(object_id, Some(&new_name))?;
+        self.compile_route_authoring()?;
+        Ok(graph_id)
+    }
+    #[allow(clippy::empty_line_after_doc_comments)]
     /// Adds a detached semantic resource to the authored archive overlay and
     /// immediately exposes it through the document asset catalog.
+
     pub fn insert_authored_resource(
         &mut self,
         raw_resource_path: impl Into<Vec<u8>>,
@@ -885,6 +1138,7 @@ impl StageDocument {
             objects: self.objects.clone(),
             archive_edits: self.archive_edits.clone(),
             lighting: Some(self.lighting.clone()),
+            route_authoring: self.route_authoring.clone(),
         };
         let bytes = serde_json::to_vec_pretty(&overlay)?;
         self.mark_changed_file(path, bytes)?;
@@ -976,6 +1230,8 @@ pub struct EditorSceneOverlay {
     pub archive_edits: StageArchiveEdits,
     /// Ordered typed `AmbAry`/`LightAry` state authored in the scene.
     ///
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_authoring: Option<RouteAuthoringDocument>,
     /// `None` preserves compatibility with older overlays, whose lighting is
     /// inherited from the semantic stage baseline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1108,6 +1364,57 @@ impl PlacementBinding {
             Self::Authored(authored) => Self::Authored(authored.clone()),
         }
     }
+}
+fn graph_name_in_record_count(record: &JDramaRecord, graph_name: &str) -> usize {
+    let fields = match &record.payload {
+        JDramaRecordPayload::Actor { fields, .. }
+        | JDramaRecordPayload::Fields { fields }
+        | JDramaRecordPayload::Group { fields, .. } => fields,
+        JDramaRecordPayload::Empty => return 0,
+    };
+    let own = fields
+        .iter()
+        .filter(|field| {
+            field.name == "graph_name"
+                && matches!(&field.value, JDramaFieldValue::String(value) if value == graph_name)
+        })
+        .count();
+    own + match &record.payload {
+        JDramaRecordPayload::Group { children, .. } => children
+            .iter()
+            .map(|child| graph_name_in_record_count(child, graph_name))
+            .sum(),
+        _ => 0,
+    }
+}
+
+fn rewrite_graph_name_in_record(
+    record: &mut JDramaRecord,
+    old_name: &str,
+    new_name: &str,
+) -> usize {
+    let fields = match &mut record.payload {
+        JDramaRecordPayload::Actor { fields, .. }
+        | JDramaRecordPayload::Fields { fields }
+        | JDramaRecordPayload::Group { fields, .. } => fields,
+        JDramaRecordPayload::Empty => return 0,
+    };
+    let mut changed = 0;
+    for field in fields.iter_mut().filter(|field| field.name == "graph_name") {
+        if let JDramaFieldValue::String(value) = &mut field.value {
+            if value == old_name {
+                *value = new_name.to_string();
+                changed += 1;
+            }
+        }
+    }
+    if let JDramaRecordPayload::Group { children, .. } = &mut record.payload {
+        changed += children
+            .iter_mut()
+            .map(|child| rewrite_graph_name_in_record(child, old_name, new_name))
+            .sum::<usize>();
+    }
+    changed
 }
 
 impl SceneObject {
@@ -2786,6 +3093,7 @@ mod tests {
             stage_archive_source_path: Some(source_path),
             archive_edits: StageArchiveEdits::default(),
             registry: None,
+            route_authoring: None,
             load_issues: Vec::new(),
             lighting: StageLighting::default(),
             actor_previews: BTreeMap::new(),
@@ -2881,6 +3189,7 @@ mod tests {
             stage_archive_source_path: None,
             archive_edits: StageArchiveEdits::default(),
             registry: None,
+            route_authoring: None,
             load_issues: Vec::new(),
             lighting: StageLighting::default(),
             actor_previews: BTreeMap::new(),
@@ -3010,6 +3319,7 @@ mod tests {
             stage_archive_source_path: None,
             archive_edits: StageArchiveEdits::default(),
             registry: None,
+            route_authoring: None,
             load_issues: Vec::new(),
             lighting: StageLighting::default(),
             actor_previews: BTreeMap::new(),
@@ -3912,6 +4222,7 @@ mod tests {
             stage_archive_source_path: None,
             archive_edits: StageArchiveEdits::default(),
             registry: None,
+            route_authoring: None,
             load_issues: Vec::new(),
             lighting: StageLighting::default(),
             actor_previews: BTreeMap::new(),

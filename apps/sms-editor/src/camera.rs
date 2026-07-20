@@ -96,8 +96,16 @@ impl SmsEditorApp {
     }
 
     pub(super) fn screen_to_world_floor(&self, rect: egui::Rect, pos: egui::Pos2) -> [f32; 3] {
+        self.screen_to_world_plane_y(rect, pos, self.renderer.camera().focus[1])
+    }
+
+    pub(super) fn screen_to_world_plane_y(
+        &self,
+        rect: egui::Rect,
+        pos: egui::Pos2,
+        plane_y: f32,
+    ) -> [f32; 3] {
         let frame = self.camera_frame();
-        let floor_y = self.renderer.camera().focus[1];
         let focal = perspective_focal_length(rect, self.viewport_zoom);
         let local = pos - rect.center() - self.viewport_pan;
         let ray = vec3_normalize(vec3_add(
@@ -110,7 +118,7 @@ impl SmsEditorApp {
         if ray[1].abs() < 0.0001 {
             return self.renderer.camera().focus;
         }
-        let t = (floor_y - frame.position[1]) / ray[1];
+        let t = (plane_y - frame.position[1]) / ray[1];
         if !t.is_finite() || t <= 0.0 {
             return self.renderer.camera().focus;
         }
