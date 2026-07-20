@@ -401,6 +401,48 @@ struct CatalogResourcePreflight {
     writes: Vec<CatalogResourceWrite>,
     graph_name_rewrites: BTreeMap<String, String>,
     reused_existing_resources: usize,
+    upgraded_bootstrap_proxies: usize,
+}
+
+fn is_exact_blank_stage_bootstrap_proxy(
+    document: &StageDocument,
+    raw_resource_path: &[u8],
+    effective: &StageResourceDocument,
+) -> Result<bool, String> {
+    if !document
+        .stage_archive
+        .as_ref()
+        .is_some_and(|archive| matches!(archive.origin(), sms_scene::StageOrigin::Blank { .. }))
+    {
+        return Ok(false);
+    }
+    let Some(requirement) = sms_scene::BLANK_STAGE_BOOTSTRAP_REQUIREMENTS
+        .iter()
+        .find(|requirement| requirement.raw_path == raw_resource_path)
+    else {
+        return Ok(false);
+    };
+
+    let proxy = sms_authoring::built_in_blank_stage_proxy(raw_resource_path);
+    let bytes = match requirement.kind {
+        sms_scene::BlankStageBootstrapKind::Model => {
+            proxy.compile_bmd().map_err(|error| error.to_string())?
+        }
+        sms_scene::BlankStageBootstrapKind::Collision => proxy
+            .collision
+            .as_ref()
+            .ok_or_else(|| {
+                format!(
+                    "built-in bootstrap proxy {} has no collision",
+                    String::from_utf8_lossy(raw_resource_path)
+                )
+            })?
+            .to_col_bytes()
+            .map_err(|error| error.to_string())?,
+    };
+    let expected = StageResourceDocument::parse_for_path(raw_resource_path, &bytes)
+        .map_err(|error| error.to_string())?;
+    Ok(effective == &expected)
 }
 
 fn catalog_resource_edit_deltas(
@@ -522,6 +564,26 @@ fn preflight_catalog_resources(
                     document: source,
                     upsert: restores_removed_baseline,
                 });
+            }
+            Some(existing)
+                if is_exact_blank_stage_bootstrap_proxy(
+                    document,
+                    &resource.raw_resource_path,
+                    &existing,
+                )? =>
+            {
+                // New authored stages carry tiny deterministic stand-ins for
+                // resources which retail managers open unconditionally. Once
+                // a catalog object owns that runtime path, upgrade only the
+                // exact built-in stand-in to the real retail resource. Exact
+                // matching keeps stage-local and user-authored replacements
+                // authoritative.
+                preflight.writes.push(CatalogResourceWrite {
+                    raw_resource_path: resource.raw_resource_path.clone(),
+                    document: parse_catalog_resource(resource)?,
+                    upsert: true,
+                });
+                preflight.upgraded_bootstrap_proxies += 1;
             }
             Some(_) => {
                 // Catalog entries express runtime path dependencies. An exact
@@ -1451,18 +1513,20 @@ impl SmsEditorApp {
             );
             let authored_resource_count = preflight.writes.len();
             let reused_resource_count = preflight.reused_existing_resources;
+            let upgraded_bootstrap_count = preflight.upgraded_bootstrap_proxies;
             catalog_resource_deltas = catalog_resource_edit_deltas(
                 self.document.as_ref().expect("document was checked above"),
                 preflight.writes,
             );
             catalog_log = Some(format!(
-                "Placed '{factory_name}' from retail stage '{}': {} manager/support dependency record(s), {} stage-local character registration(s), {} required graph(s), {} catalog resource(s), {} existing target resource(s) reused, {} resource write(s).",
+                "Placed '{factory_name}' from retail stage '{}': {} manager/support dependency record(s), {} stage-local character registration(s), {} required graph(s), {} catalog resource(s), {} existing target resource(s) reused, {} bootstrap proxy resource(s) upgraded, {} resource write(s).",
                 template.source_stage,
                 template.dependencies.len(),
                 template.character_records.len(),
                 template.required_graph_names.len(),
                 template.resources.len(),
                 reused_resource_count,
+                upgraded_bootstrap_count,
                 authored_resource_count
             ));
             object
@@ -2441,6 +2505,21 @@ mod tests {
         })
     }
 
+    fn built_in_proxy_document(raw_resource_path: &[u8]) -> StageResourceDocument {
+        let requirement = sms_scene::BLANK_STAGE_BOOTSTRAP_REQUIREMENTS
+            .iter()
+            .find(|requirement| requirement.raw_path == raw_resource_path)
+            .unwrap();
+        let proxy = sms_authoring::built_in_blank_stage_proxy(raw_resource_path);
+        let bytes = match requirement.kind {
+            sms_scene::BlankStageBootstrapKind::Model => proxy.compile_bmd().unwrap(),
+            sms_scene::BlankStageBootstrapKind::Collision => {
+                proxy.collision.as_ref().unwrap().to_col_bytes().unwrap()
+            }
+        };
+        StageResourceDocument::parse_for_path(raw_resource_path, &bytes).unwrap()
+    }
+
     #[test]
     fn spawn_skips_loaded_object_id_collision() {
         let mut template = SceneObject::new("fixture0-obj-0001", "FixtureEnemy");
@@ -2986,6 +3065,125 @@ mod tests {
             Some(existing_resource)
         );
     }
+    #[test]
+    fn exact_blank_stage_bootstrap_proxies_are_recognized_for_every_runtime_path() {
+        let mut document = command_test_document(Vec::new());
+        document.stage_archive = Some(
+            sms_scene::SourceFreeStageArchive::new_for_blank(
+                "test11",
+                sms_scene::BLANK_STAGE_PRESET_VERSION,
+            )
+            .unwrap(),
+        );
+
+        for requirement in sms_scene::BLANK_STAGE_BOOTSTRAP_REQUIREMENTS {
+            let proxy = built_in_proxy_document(requirement.raw_path);
+            assert!(
+                is_exact_blank_stage_bootstrap_proxy(&document, requirement.raw_path, &proxy,)
+                    .unwrap(),
+                "{} should be recognized as an exact built-in proxy",
+                String::from_utf8_lossy(requirement.raw_path)
+            );
+        }
+
+        let different_model = sms_authoring::built_in_blank_stage_proxy(b"different/model.bmd")
+            .compile_bmd()
+            .unwrap();
+        let different_model =
+            StageResourceDocument::parse_for_path(b"mapobj/coin.bmd", &different_model).unwrap();
+        assert!(
+            !is_exact_blank_stage_bootstrap_proxy(&document, b"mapobj/coin.bmd", &different_model,)
+                .unwrap(),
+            "a user-authored model at a bootstrap path must remain authoritative"
+        );
+
+        let mut imported = sms_scene::SourceFreeStageArchive::new().unwrap();
+        imported.set_origin(sms_scene::StageOrigin::ImportedArchive);
+        document.stage_archive = Some(imported);
+        let coin_proxy = built_in_proxy_document(b"mapobj/coin.bmd");
+        assert!(
+            !is_exact_blank_stage_bootstrap_proxy(&document, b"mapobj/coin.bmd", &coin_proxy,)
+                .unwrap(),
+            "imported stages must never opt into authored proxy migration"
+        );
+    }
+
+    #[test]
+    fn catalog_preflight_upgrades_exact_coin_proxy_and_undo_restores_it() {
+        let raw_resource_path = b"mapobj/coin.bmd".to_vec();
+        let proxy_document = built_in_proxy_document(&raw_resource_path);
+        let retail_bytes = sms_authoring::built_in_blank_stage_proxy(b"retail/coin.bmd")
+            .compile_bmd()
+            .unwrap();
+        let retail_document =
+            StageResourceDocument::parse_for_path(&raw_resource_path, &retail_bytes).unwrap();
+        assert_ne!(proxy_document, retail_document);
+
+        let temp = tempfile::tempdir().unwrap();
+        let source_asset_path = temp.path().join("coin.bmd");
+        std::fs::write(&source_asset_path, retail_bytes).unwrap();
+
+        let mut archive = sms_scene::SourceFreeStageArchive::new_for_blank(
+            "test11",
+            sms_scene::BLANK_STAGE_PRESET_VERSION,
+        )
+        .unwrap();
+        archive
+            .insert_resource(raw_resource_path.clone(), proxy_document.clone())
+            .unwrap();
+        let mut document = command_test_document(Vec::new());
+        document.stage_archive = Some(archive);
+
+        let template = sms_scene::ObjectAuthoringTemplate {
+            factory_name: "Coin".to_string(),
+            group_index: 4,
+            record: JDramaRecord::new("Coin", "coin", JDramaRecordPayload::Empty).unwrap(),
+            dependencies: Vec::new(),
+            character_records: Vec::new(),
+            required_graph_names: Vec::new(),
+            resources: vec![sms_scene::ObjectAuthoringResource {
+                raw_resource_path: raw_resource_path.clone(),
+                source_asset_path,
+            }],
+            preview_resource_path: Some(raw_resource_path.clone()),
+            source_stage: "retail-source".to_string(),
+        };
+
+        let preflight = preflight_catalog_resources(&document, &template).unwrap();
+        assert_eq!(preflight.reused_existing_resources, 0);
+        assert_eq!(preflight.upgraded_bootstrap_proxies, 1);
+        assert_eq!(preflight.writes.len(), 1);
+        assert!(preflight.writes[0].upsert);
+        assert_eq!(preflight.writes[0].document, retail_document);
+
+        let edit = ObjectUndoRecord {
+            deltas: Vec::new(),
+            resource_deltas: catalog_resource_edit_deltas(&document, preflight.writes),
+        };
+        edit.apply_forward(&mut document);
+        assert_eq!(
+            document
+                .effective_resource_clone(&raw_resource_path)
+                .unwrap(),
+            Some(retail_document.clone())
+        );
+        let rebuilt = document.build_stage_archive().unwrap();
+        let reopened = sms_scene::SourceFreeStageArchive::parse(&rebuilt).unwrap();
+        assert_eq!(
+            reopened.resource(&raw_resource_path),
+            Some(&retail_document)
+        );
+
+        edit.apply_reverse(&mut document);
+        assert_eq!(
+            document
+                .effective_resource_clone(&raw_resource_path)
+                .unwrap(),
+            Some(proxy_document)
+        );
+        assert!(document.archive_edits.resources.is_empty());
+    }
+
     #[test]
     fn catalog_resource_import_is_atomic_with_object_undo_and_redo() {
         let mut app = SmsEditorApp {
