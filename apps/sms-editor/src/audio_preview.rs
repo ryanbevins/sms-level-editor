@@ -3,7 +3,9 @@ use std::fs;
 use std::num::NonZeroU16;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, TryRecvError};
 use std::sync::Arc;
+use std::thread;
 
 use rodio::buffer::SamplesBuffer;
 use rodio::{DeviceSinkBuilder, MixerDeviceSink, Player};
@@ -14,39 +16,100 @@ use crate::SmsEditorApp;
 // Sunshine's JAudio/DSP pipeline mixes at the GameCube's nominal 32 kHz rate.
 const OUTPUT_RATE: u32 = 32_000;
 const PREVIEW_SECONDS: f32 = 45.0;
+const SOUND_PREVIEW_SECONDS: f32 = 8.0;
 const MAX_TRACKS: usize = 64;
 const MAX_COMMANDS_PER_TICK: usize = 50_000;
 
 pub(super) struct AudioPreviewPlayback {
-    bgm_id: u32,
+    target: AudioPreviewTarget,
     _device: MixerDeviceSink,
     player: Player,
 }
 
 impl AudioPreviewPlayback {
     fn is_playing(&self, bgm_id: u32) -> bool {
-        self.bgm_id == bgm_id && !self.player.empty()
+        self.target == AudioPreviewTarget::Music(bgm_id) && !self.player.empty()
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AudioPreviewTarget {
+    Music(u32),
+    Sound(u32),
+}
+
+pub(super) struct AudioPreviewRenderResult {
+    generation: u64,
+    target: AudioPreviewTarget,
+    result: Result<Vec<f32>, String>,
+}
+
 impl SmsEditorApp {
+    pub(super) fn audio_preview_is_active(&self) -> bool {
+        self.audio_preview_playback
+            .as_ref()
+            .is_some_and(|playback| !playback.player.empty())
+    }
+
+    pub(super) fn bgm_preview_is_active(&self, bgm_id: u32) -> bool {
+        self.audio_preview_playback
+            .as_ref()
+            .is_some_and(|playback| playback.is_playing(bgm_id))
+    }
+
+    pub(super) fn sound_preview_is_active(&self, sound_id: u32) -> bool {
+        self.audio_preview_playback
+            .as_ref()
+            .is_some_and(|playback| {
+                playback.target == AudioPreviewTarget::Sound(sound_id) && !playback.player.empty()
+            })
+    }
+
+    pub(super) fn audio_preview_is_loading(&self) -> bool {
+        self.audio_preview_receiver.is_some()
+    }
+
+    pub(super) fn audio_preview_target_is_loading(&self, target: AudioPreviewTarget) -> bool {
+        self.audio_preview_receiver.is_some() && self.audio_preview_loading_target == Some(target)
+    }
+
+    pub(super) fn preview_bgm_now(&mut self, bgm_id: u32) {
+        if let Err(error) = self.start_audio_preview_render(AudioPreviewTarget::Music(bgm_id)) {
+            self.log
+                .push(format!("Could not preview Sunshine BGM: {error}"));
+        }
+    }
+
+    pub(super) fn preview_sound_now(&mut self, sound_id: u32) {
+        if let Err(error) = self.start_audio_preview_render(AudioPreviewTarget::Sound(sound_id)) {
+            self.log
+                .push(format!("Could not preview Sunshine sound: {error}"));
+        }
+    }
+
     pub(super) fn bgm_preview_transport(&mut self, ui: &mut egui::Ui, bgm_id: u32) {
         let is_playing = self
             .audio_preview_playback
             .as_ref()
             .is_some_and(|playback| playback.is_playing(bgm_id));
+        let is_loading = self.audio_preview_target_is_loading(AudioPreviewTarget::Music(bgm_id));
         ui.horizontal(|ui| {
             if ui
-                .add_enabled(!is_playing, egui::Button::new("Preview"))
+                .add_enabled(
+                    !is_playing && !is_loading,
+                    egui::Button::new(if is_loading { "Loading..." } else { "Preview" }),
+                )
                 .on_hover_text("Render this track from Sunshine's sequence, instrument-bank, and AW sample data")
                 .clicked()
             {
-                if let Err(error) = self.play_sunshine_bgm(bgm_id) {
+                if let Err(error) =
+                    self.start_audio_preview_render(AudioPreviewTarget::Music(bgm_id))
+                {
                     self.log.push(format!("Could not preview Sunshine BGM: {error}"));
                 }
             }
             if ui
-                .add_enabled(is_playing, egui::Button::new("Stop"))
+                .add_enabled(is_playing || is_loading, egui::Button::new("Stop"))
                 .clicked()
             {
                 self.stop_audio_preview();
@@ -56,10 +119,10 @@ impl SmsEditorApp {
     }
 
     pub(super) fn se_preview_notice(&self, ui: &mut egui::Ui) {
-        ui.small("Sound-effect preview uses a different JAudio event path; the assigned retail sound is still used by Build Game.");
+        ui.small("Preview runs the selected retail sound through Sunshine's JAudio SE dispatcher, banks, and AW samples.");
     }
 
-    fn play_sunshine_bgm(&mut self, bgm_id: u32) -> Result<(), String> {
+    fn start_audio_preview_render(&mut self, target: AudioPreviewTarget) -> Result<(), String> {
         self.stop_audio_preview();
         let base_root = self
             .current_project
@@ -70,7 +133,69 @@ impl SmsEditorApp {
                 (!root.is_empty()).then(|| PathBuf::from(root))
             })
             .ok_or_else(|| "select a Sunshine base game first".to_string())?;
-        let samples = render_bgm_preview(&base_root, bgm_id, PREVIEW_SECONDS)?;
+        self.audio_preview_generation = self.audio_preview_generation.wrapping_add(1);
+        let generation = self.audio_preview_generation;
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = match target {
+                AudioPreviewTarget::Music(bgm_id) => {
+                    render_bgm_preview(&base_root, bgm_id, PREVIEW_SECONDS)
+                }
+                AudioPreviewTarget::Sound(sound_id) => {
+                    render_sound_preview(&base_root, sound_id, SOUND_PREVIEW_SECONDS)
+                }
+            };
+            let _ = sender.send(AudioPreviewRenderResult {
+                generation,
+                target,
+                result,
+            });
+        });
+        self.audio_preview_receiver = Some(receiver);
+        self.audio_preview_loading_target = Some(target);
+        Ok(())
+    }
+
+    pub(super) fn poll_audio_preview(&mut self, ctx: &egui::Context) {
+        let Some(receiver) = self.audio_preview_receiver.take() else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(message) => {
+                self.audio_preview_loading_target = None;
+                if message.generation != self.audio_preview_generation {
+                    return;
+                }
+                match message.result {
+                    Ok(samples) => {
+                        if let Err(error) = self.start_rendered_audio(message.target, samples) {
+                            self.log
+                                .push(format!("Could not start audio preview: {error}"));
+                        }
+                    }
+                    Err(error) => self
+                        .log
+                        .push(format!("Could not render audio preview: {error}")),
+                }
+                ctx.request_repaint();
+            }
+            Err(TryRecvError::Empty) => {
+                self.audio_preview_receiver = Some(receiver);
+                ctx.request_repaint_after(std::time::Duration::from_millis(33));
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.audio_preview_loading_target = None;
+                self.log
+                    .push("The audio preview worker stopped unexpectedly.".to_string());
+            }
+        }
+    }
+
+    fn start_rendered_audio(
+        &mut self,
+        target: AudioPreviewTarget,
+        samples: Vec<f32>,
+    ) -> Result<(), String> {
         let device = DeviceSinkBuilder::open_default_sink()
             .map_err(|error| format!("open the default audio output: {error}"))?;
         let player = Player::connect_new(device.mixer());
@@ -80,7 +205,7 @@ impl SmsEditorApp {
             samples,
         ));
         self.audio_preview_playback = Some(AudioPreviewPlayback {
-            bgm_id,
+            target,
             _device: device,
             player,
         });
@@ -88,6 +213,9 @@ impl SmsEditorApp {
     }
 
     pub(super) fn stop_audio_preview(&mut self) {
+        self.audio_preview_generation = self.audio_preview_generation.wrapping_add(1);
+        self.audio_preview_receiver = None;
+        self.audio_preview_loading_target = None;
         if let Some(playback) = self.audio_preview_playback.take() {
             playback.player.stop();
         }
@@ -119,12 +247,21 @@ struct AudioAssets {
     audio_res: PathBuf,
     sequence: Vec<u8>,
     sequence_header: Vec<u8>,
+    sound_table: Vec<u8>,
     banks: HashMap<u8, BankRecord>,
     waves: Vec<HashMap<u16, WaveRecord>>,
     wave_archives: HashMap<String, Arc<Vec<u8>>>,
     decoded_waves: HashMap<(usize, u16), Arc<DecodedWave>>,
     fx_lines: [Option<FxLineConfig>; 4],
     instrument_rng: u32,
+}
+
+#[derive(Clone, Copy)]
+struct SoundPreviewTrigger {
+    id: u32,
+    volume: f32,
+    pitch: f32,
+    fxmix: f32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -212,7 +349,8 @@ impl AudioAssets {
         let sequence = fs::read(audio_res.join("Seqs/sequence.arc"))
             .map_err(|error| format!("read sequence.arc: {error}"))?;
         let aaf = load_msound_aaf(base_root, &audio_res)?;
-        let (sequence_header, bank_entries, wave_entries, fx_lines) = parse_aaf_tables(&aaf)?;
+        let (sequence_header, sound_table, bank_entries, wave_entries, fx_lines) =
+            parse_aaf_tables(&aaf)?;
         let mut banks = HashMap::new();
         for (offset, size, wave_bank) in bank_entries {
             let bytes = checked_slice(&aaf, offset, size, "AAF bank")?.to_vec();
@@ -234,6 +372,7 @@ impl AudioAssets {
             audio_res,
             sequence,
             sequence_header,
+            sound_table,
             banks,
             waves,
             wave_archives: HashMap::new(),
@@ -247,7 +386,10 @@ impl AudioAssets {
         if bgm_id & 0xffff_0000 != 0x8001_0000 {
             return Err(format!("0x{bgm_id:08X} is not a sequence BGM"));
         }
-        let mut entry = (bgm_id & 0x3ff) as usize;
+        self.sequence_for_entry((bgm_id & 0x3ff) as usize)
+    }
+
+    fn sequence_for_entry(&self, mut entry: usize) -> Result<&[u8], String> {
         for _ in 0..16 {
             let at = (entry + 1)
                 .checked_mul(0x20)
@@ -263,6 +405,54 @@ impl AudioAssets {
             return checked_slice(&self.sequence, offset, size, "sequence data");
         }
         Err("sequence alias chain is too deep".to_string())
+    }
+
+    fn sound_preview_trigger(&self, sound_id: u32) -> Result<SoundPreviewTrigger, String> {
+        if sound_id & 0xc000_0000 != 0 {
+            return Err(format!("0x{sound_id:08X} is not a sound-effect ID"));
+        }
+        let category = ((sound_id >> 12) & 0xff) as usize;
+        if category >= 16 {
+            return Err(format!(
+                "sound category {category} is outside Sunshine's SE table"
+            ));
+        }
+        checked_slice(&self.sound_table, 0, 0x50, "sound table header")?;
+        let count = be_u16(&self.sound_table, 6 + category * 4, "sound category count")? as usize;
+        let first = be_u16(&self.sound_table, 8 + category * 4, "sound category start")? as usize;
+        let index = (sound_id & 0x3ff) as usize;
+        if index >= count {
+            return Err(format!(
+                "sound 0x{sound_id:08X} is outside category {category}'s {count} entries"
+            ));
+        }
+        let record = 0x50 + (first + index) * 0x10;
+        checked_slice(&self.sound_table, record, 0x10, "sound info record")?;
+        let format = self.sound_table[0];
+        let id = if format & 1 == 0 {
+            sound_id
+        } else {
+            let alias = be_u16(&self.sound_table, record + 6, "sound alias")?;
+            (sound_id & !0x3ff) | u32::from(alias)
+        };
+        Ok(SoundPreviewTrigger {
+            id,
+            pitch: if format & 2 != 0 {
+                be_f32(&self.sound_table, record + 8, "sound pitch")?
+            } else {
+                1.0
+            },
+            volume: if format & 4 != 0 {
+                f32::from(self.sound_table[record + 0x0c]) / 127.0
+            } else {
+                1.0
+            },
+            fxmix: if format & 8 != 0 {
+                f32::from(self.sound_table[record + 0x0d]) / 127.0
+            } else {
+                0.0
+            },
+        })
     }
 
     fn instrument_region(
@@ -495,6 +685,7 @@ type WaveEntry = (usize, usize, u32);
 
 type AafTables = (
     Vec<u8>,
+    Vec<u8>,
     Vec<BankEntry>,
     Vec<WaveEntry>,
     [Option<FxLineConfig>; 4],
@@ -503,6 +694,7 @@ type AafTables = (
 fn parse_aaf_tables(aaf: &[u8]) -> Result<AafTables, String> {
     let mut cursor = 0usize;
     let mut sequence_header = None;
+    let mut sound_table = None;
     let mut banks = Vec::new();
     let mut waves = Vec::new();
     let mut fx_resource = None;
@@ -517,6 +709,7 @@ fn parse_aaf_tables(aaf: &[u8]) -> Result<AafTables, String> {
                 let split = be_u32(aaf, cursor + 8, "sound table split")?;
                 cursor += if split == 0 { 12 } else { 24 };
                 checked_slice(aaf, offset, size, "sound table")?;
+                sound_table = Some(checked_slice(aaf, offset, size, "sound table")?.to_vec());
             }
             2 | 3 => loop {
                 let offset = be_u32(aaf, cursor, "AAF table offset")? as usize;
@@ -550,6 +743,7 @@ fn parse_aaf_tables(aaf: &[u8]) -> Result<AafTables, String> {
     }
     Ok((
         sequence_header.ok_or_else(|| "msound.aaf has no sequence archive header".to_string())?,
+        sound_table.ok_or_else(|| "msound.aaf has no sound-effect table".to_string())?,
         banks,
         waves,
         fx_resource
@@ -931,6 +1125,9 @@ struct Track {
     pitch: f32,
     pan: f32,
     fxmix: f32,
+    external_volume: f32,
+    external_pitch: f32,
+    external_fxmix: f32,
     tempo: u16,
     timebase: u16,
     call_stack: Vec<usize>,
@@ -943,6 +1140,27 @@ struct Track {
     inherit_parent_mix: bool,
     self_oscillators: [VoiceOscillator; 2],
     self_osc_routes: [u8; 2],
+    // JASystem::TTrackPort stores one value array shared by both directions.
+    // Import/export flags only describe who most recently has unread data;
+    // writing an export must overwrite an earlier imported value on that port.
+    port_values: [u16; 16],
+    import_flags: u16,
+    export_flags: u16,
+    interrupt_offsets: [Option<usize>; 8],
+    interrupt_stack: Vec<(usize, u32)>,
+    pending_interrupts: u16,
+    interrupts_enabled: bool,
+    interrupt_timer_repeats: u8,
+    interrupt_timer_interval: u32,
+    interrupt_timer_remaining: u32,
+    timed_moves: [Option<TimedMove>; 12],
+    pending_closes: Vec<usize>,
+}
+
+#[derive(Clone, Copy)]
+struct TimedMove {
+    amount: f32,
+    remaining: u32,
 }
 
 impl Track {
@@ -960,6 +1178,9 @@ impl Track {
             pitch: 0.0,
             pan: 0.5,
             fxmix: 0.0,
+            external_volume: 1.0,
+            external_pitch: 1.0,
+            external_fxmix: 0.0,
             tempo: 120,
             timebase: 48,
             call_stack: Vec::new(),
@@ -973,6 +1194,18 @@ impl Track {
             self_oscillators: [default_track_envelope(), default_track_vibrato()],
             // JASTrack::initTrack starts oscillator 1 on the track-local route.
             self_osc_routes: [0x0f, 0x0e],
+            port_values: [0; 16],
+            import_flags: 0,
+            export_flags: 0,
+            interrupt_offsets: [None; 8],
+            interrupt_stack: Vec::new(),
+            pending_interrupts: 0,
+            interrupts_enabled: true,
+            interrupt_timer_repeats: 0,
+            interrupt_timer_interval: 0,
+            interrupt_timer_remaining: 0,
+            timed_moves: [None; 12],
+            pending_closes: Vec::new(),
         }
     }
 
@@ -993,6 +1226,13 @@ impl Track {
             0x20 => self.registers[6] >> 8,
             0x21 => self.registers[6] & 0xff,
             0x22 => (self.registers[0] << 8) | (self.registers[1] & 0xff),
+            0x2c => self
+                .children
+                .iter()
+                .enumerate()
+                .fold(0u16, |mask, (index, child)| {
+                    mask | (u16::from(child.is_some()) << index)
+                }),
             _ => self.registers.get(register as usize).copied().unwrap_or(0),
         }
     }
@@ -1024,6 +1264,78 @@ impl Track {
         self.self_oscillators[index] = oscillator;
     }
 
+    fn set_simple_envelope(
+        &mut self,
+        sequence: &[u8],
+        kind: u8,
+        offset: usize,
+    ) -> Result<(), String> {
+        let commands = Arc::new(parse_envelope_table(sequence, offset)?);
+        match kind {
+            0 => {
+                let release = self.self_oscillators[0].spec.release.clone();
+                self.self_oscillators[0] = VoiceOscillator::new(OscillatorSpec {
+                    kind: 0,
+                    rate: 1.0,
+                    attack: Some(commands),
+                    release,
+                    width: 1.0,
+                    vertex: 0.0,
+                });
+            }
+            1 => {
+                self.self_oscillators[0].spec.release = Some(commands);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn set_simple_adsr(&mut self, args: &[u32]) {
+        let attack = Arc::new(vec![
+            EnvelopeCommand {
+                mode: 0,
+                time: args[0] as u16,
+                value: 0x7fff,
+            },
+            EnvelopeCommand {
+                mode: 0,
+                time: args[1] as u16,
+                value: 0x7fff,
+            },
+            EnvelopeCommand {
+                mode: 0,
+                time: args[2] as u16,
+                value: args[3] as u16 as i16,
+            },
+            EnvelopeCommand {
+                mode: 14,
+                time: 0,
+                value: 0,
+            },
+        ]);
+        let release = Arc::new(vec![
+            EnvelopeCommand {
+                mode: 0,
+                time: args[4] as u16,
+                value: 0,
+            },
+            EnvelopeCommand {
+                mode: 15,
+                time: 1,
+                value: 0,
+            },
+        ]);
+        self.self_oscillators[0] = VoiceOscillator::new(OscillatorSpec {
+            kind: 0,
+            rate: 1.0,
+            attack: Some(attack),
+            release: Some(release),
+            width: 1.0,
+            vertex: 0.0,
+        });
+    }
+
     fn set_oscillator_parameter(&mut self, target: u8, value: f32) {
         let Some(index) = target.checked_sub(6).map(|value| value as usize / 3) else {
             return;
@@ -1052,6 +1364,121 @@ impl Track {
         *route = new_route;
     }
 
+    fn apply_voice_oscillator_routes(&self, oscillators: &mut Vec<VoiceOscillator>) {
+        for source in 0..self.self_osc_routes.len() {
+            let route = self.self_osc_routes[source];
+            if route >= 0x0e {
+                continue;
+            }
+            let (destination, inherit_attack) = match route {
+                0..=3 => (route as usize, false),
+                4..=7 => ((route - 4) as usize, true),
+                // Routes 8..=11 copy the channel oscillator back into the
+                // track before overwriting it. They do not alter a newly
+                // created voice's effective oscillator definition.
+                _ => continue,
+            };
+            while oscillators.len() <= destination {
+                oscillators.push(default_volume_oscillator());
+            }
+            let mut spec = self.self_oscillators[source].spec.clone();
+            if inherit_attack {
+                spec.attack = oscillators[destination].spec.attack.clone();
+            }
+            oscillators[destination] = VoiceOscillator::new(spec);
+        }
+    }
+
+    fn set_interrupt_timer(&mut self, repeats: u8, interval: u32) {
+        self.interrupt_timer_repeats = repeats;
+        self.interrupt_timer_interval = interval;
+        self.interrupt_timer_remaining = interval;
+    }
+
+    fn advance_interrupts(&mut self) {
+        if self.interrupt_offsets[7].is_some() {
+            self.pending_interrupts |= 1 << 7;
+        }
+        if self.interrupt_timer_remaining == 0 {
+            return;
+        }
+        self.interrupt_timer_remaining -= 1;
+        if self.interrupt_timer_remaining != 0 {
+            return;
+        }
+        if self.interrupt_offsets[6].is_some() {
+            self.pending_interrupts |= 1 << 6;
+        }
+        if self.interrupt_timer_repeats == 0 {
+            self.interrupt_timer_remaining = self.interrupt_timer_interval;
+        } else {
+            self.interrupt_timer_repeats -= 1;
+            if self.interrupt_timer_repeats != 0 {
+                self.interrupt_timer_remaining = self.interrupt_timer_interval;
+            }
+        }
+    }
+
+    fn time_parameter(&self, target: u8) -> f32 {
+        match target {
+            0 => self.volume,
+            1 => self.pitch,
+            2 => self.fxmix,
+            3 => self.pan,
+            6..=11 => {
+                let index = (target - 6) as usize / 3;
+                let oscillator = &self.self_oscillators[index].spec;
+                match (target - 6) % 3 {
+                    0 => oscillator.width,
+                    1 => oscillator.rate,
+                    _ => oscillator.vertex,
+                }
+            }
+            _ => 0.0,
+        }
+    }
+
+    fn set_time_parameter(&mut self, target: u8, value: f32) {
+        match target {
+            0 => self.volume = value,
+            1 => self.pitch = value,
+            2 => self.fxmix = value,
+            3 => self.pan = value,
+            6..=11 => self.set_oscillator_parameter(target, value),
+            _ => {}
+        }
+    }
+
+    fn move_time_parameter(&mut self, target: u8, value: f32, duration: u32) {
+        let current = self.time_parameter(target);
+        let Some(slot) = self.timed_moves.get_mut(target as usize) else {
+            return;
+        };
+        if duration == 0 {
+            *slot = None;
+            self.set_time_parameter(target, value);
+            return;
+        }
+        *slot = Some(TimedMove {
+            amount: (value - current) / duration as f32,
+            remaining: duration,
+        });
+    }
+
+    fn advance_timed_parameters(&mut self) {
+        for target in 0..self.timed_moves.len() {
+            let Some(mut movement) = self.timed_moves[target] else {
+                continue;
+            };
+            self.set_time_parameter(
+                target as u8,
+                self.time_parameter(target as u8) + movement.amount,
+            );
+            movement.remaining -= 1;
+            self.timed_moves[target] = (movement.remaining != 0).then_some(movement);
+        }
+    }
+
     fn next_self_modulation(&mut self) -> TrackModulation {
         let mut modulation = TrackModulation::default();
         for index in 0..2 {
@@ -1072,6 +1499,46 @@ impl Track {
             }
         }
         modulation
+    }
+
+    fn write_import_port(&mut self, port: usize, value: u16) {
+        if port >= self.port_values.len() {
+            return;
+        }
+        self.port_values[port] = value;
+        self.import_flags |= 1 << port;
+        if port <= 1 {
+            self.pending_interrupts |= 1 << if port == 0 { 3 } else { 4 };
+        }
+    }
+
+    fn read_import_port(&mut self, port: usize) -> u16 {
+        self.import_flags &= !(1 << port);
+        self.port_values[port]
+    }
+
+    fn write_export_port(&mut self, port: usize, value: u16) {
+        self.port_values[port] = value;
+        self.export_flags |= 1 << port;
+    }
+
+    fn begin_pending_interrupt(&mut self) -> bool {
+        if !self.interrupts_enabled || !self.interrupt_stack.is_empty() {
+            return false;
+        }
+        let Some(kind) = (0..self.interrupt_offsets.len())
+            .find(|kind| self.pending_interrupts & (1 << kind) != 0)
+        else {
+            return false;
+        };
+        self.pending_interrupts &= !(1 << kind);
+        let Some(offset) = self.interrupt_offsets[kind] else {
+            return false;
+        };
+        self.interrupt_stack.push((self.pc, self.wait));
+        self.wait = 0;
+        self.pc = offset;
+        true
     }
 }
 
@@ -1405,6 +1872,25 @@ struct PendingTrack {
 fn render_bgm_preview(base_root: &Path, bgm_id: u32, seconds: f32) -> Result<Vec<f32>, String> {
     let mut assets = AudioAssets::load(base_root)?;
     let sequence = assets.sequence_for_bgm(bgm_id)?.to_vec();
+    render_sequence_preview(&mut assets, sequence, seconds, None)
+}
+
+fn render_sound_preview(base_root: &Path, sound_id: u32, seconds: f32) -> Result<Vec<f32>, String> {
+    let mut assets = AudioAssets::load(base_root)?;
+    let sound_trigger = assets.sound_preview_trigger(sound_id)?;
+    // JAIBasic starts archive entry zero (ID 0x80000800) as Sunshine's
+    // persistent sound-effect dispatcher. Individual SE IDs are delivered to
+    // its category tracks through imported ports and interrupt 3.
+    let sequence = assets.sequence_for_entry(0)?.to_vec();
+    render_sequence_preview(&mut assets, sequence, seconds, Some(sound_trigger))
+}
+
+fn render_sequence_preview(
+    assets: &mut AudioAssets,
+    sequence: Vec<u8>,
+    seconds: f32,
+    sound_trigger: Option<SoundPreviewTrigger>,
+) -> Result<Vec<f32>, String> {
     let mut tracks = vec![Track::new(0)];
     let mut voices = Vec::<Voice>::new();
     let mut next_voice_id = 1u64;
@@ -1414,6 +1900,8 @@ fn render_bgm_preview(base_root: &Path, bgm_id: u32, seconds: f32) -> Result<Vec
     let mut commands = 0usize;
     let mut sequence_frame_clock = 0.0f64;
     let mut mixed_sequence_frames = 0usize;
+    let mut sound_triggered = sound_trigger.is_none();
+    let mut voice_errors = Vec::new();
 
     while output.len() / 2 < max_frames && tracks.iter().any(|track| !track.finished) {
         let mut track_index = 0usize;
@@ -1426,26 +1914,38 @@ fn render_bgm_preview(base_root: &Path, bgm_id: u32, seconds: f32) -> Result<Vec
                 continue;
             }
             advanced[track_index] = true;
+            tracks[track_index].advance_interrupts();
             let mut children = Vec::new();
-            if sequence_tick_ready(&mut tracks[track_index]) {
+            let interrupted = tracks[track_index].begin_pending_interrupt();
+            if interrupted || sequence_tick_ready(&mut tracks[track_index]) {
                 process_track(
                     &sequence,
                     &mut tracks[track_index],
                     track_index,
-                    &mut assets,
+                    assets,
                     &mut voices,
                     &mut children,
                     &mut next_voice_id,
                     &mut commands,
-                )?;
+                    &mut voice_errors,
+                )
+                .map_err(|error| {
+                    format!(
+                        "{error} on track {track_index} at sequence offset 0x{:X} near {}",
+                        tracks[track_index].pc,
+                        hex_preview(&sequence, tracks[track_index].pc.saturating_sub(32), 64)
+                    )
+                })?;
             }
+            let pending_closes = std::mem::take(&mut tracks[track_index].pending_closes);
+            for child in pending_closes {
+                close_track_tree(&mut tracks, &mut voices, child);
+            }
+            tracks[track_index].advance_timed_parameters();
             if commands > MAX_COMMANDS_PER_TICK * (output.len() / 2 + 1) {
                 return Err("sequence exceeded the preview command safety limit".to_string());
             }
             for pending in children {
-                if tracks.len() >= MAX_TRACKS {
-                    return Err("sequence opened too many tracks".to_string());
-                }
                 let parent_index = match pending.relation {
                     TrackRelation::Child => Some(track_index),
                     TrackRelation::Sibling => tracks[track_index].parent,
@@ -1453,7 +1953,8 @@ fn render_bgm_preview(base_root: &Path, bgm_id: u32, seconds: f32) -> Result<Vec
                 let Some(parent_index) = parent_index else {
                     continue;
                 };
-                if let Some(previous) = tracks[parent_index].children[pending.slot as usize] {
+                let previous = tracks[parent_index].children[pending.slot as usize];
+                if let Some(previous) = previous {
                     close_track_tree(&mut tracks, &mut voices, previous);
                 }
                 // JASTrack::mainProc visits a newly opened child later in the
@@ -1464,11 +1965,46 @@ fn render_bgm_preview(base_root: &Path, bgm_id: u32, seconds: f32) -> Result<Vec
                     &tracks[parent_index],
                     pending.mode,
                 );
-                let child_index = tracks.len();
-                tracks.push(child);
+                let child_index = if let Some(previous) = previous {
+                    tracks[previous] = child;
+                    previous
+                } else if let Some(reusable) = tracks
+                    .iter()
+                    .enumerate()
+                    .skip(1)
+                    .find_map(|(index, track)| track.finished.then_some(index))
+                {
+                    tracks[reusable] = child;
+                    reusable
+                } else {
+                    if tracks.len() >= MAX_TRACKS {
+                        return Err("sequence opened too many tracks".to_string());
+                    }
+                    let child_index = tracks.len();
+                    tracks.push(child);
+                    child_index
+                };
                 tracks[parent_index].children[pending.slot as usize] = Some(child_index);
             }
             track_index += 1;
+        }
+        if !sound_triggered {
+            let trigger = sound_trigger.expect("checked above");
+            let category = ((trigger.id >> 12) & 0x0f) as u16;
+            let candidate = sound_dispatcher_track(&tracks, category);
+            if let Some(index) = candidate {
+                tracks[index].external_volume = trigger.volume;
+                tracks[index].external_pitch = trigger.pitch;
+                tracks[index].external_fxmix = trigger.fxmix;
+                // JAIBasic sends these route parameters before the ID/start
+                // ports even when their values are zero. Their import flags
+                // are observable to the dispatcher sequence.
+                tracks[index].write_import_port(3, 0);
+                tracks[index].write_import_port(6, 0);
+                tracks[index].write_import_port(4, (trigger.id & 0x3ff) as u16);
+                tracks[index].write_import_port(0, 1);
+                sound_triggered = true;
+            }
         }
         let root = &tracks[0];
         sequence_frame_clock +=
@@ -1488,11 +2024,46 @@ fn render_bgm_preview(base_root: &Path, bgm_id: u32, seconds: f32) -> Result<Vec
     if output.is_empty() {
         return Err("the selected sequence produced no preview audio".to_string());
     }
+    if sound_trigger.is_some() && !output.iter().any(|sample| sample.abs() > 0.0001) {
+        let detail = if voice_errors.is_empty() {
+            "the retail event did not emit a playable note without its in-game scene or actor parameters"
+                .to_string()
+        } else {
+            voice_errors.join("; ")
+        };
+        return Err(format!(
+            "the sound-effect dispatcher produced silence: {detail}"
+        ));
+    }
     apply_jaudio_reverb(&mut output, &reverb_send, &assets.fx_lines);
+    if sound_trigger.is_some() {
+        apply_preview_peak_guard(&mut output);
+    }
     for sample in &mut output {
         *sample = sample.clamp(-1.0, 32767.0 / 32768.0);
     }
     Ok(output)
+}
+
+fn sound_dispatcher_track(tracks: &[Track], category: u16) -> Option<usize> {
+    tracks
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find_map(|(index, track)| {
+            (track.export_flags & (1 << 9) != 0 && track.port_values[9] == category)
+                .then_some(index)
+        })
+}
+
+fn hex_preview(bytes: &[u8], offset: usize, size: usize) -> String {
+    bytes
+        .get(offset..offset.saturating_add(size).min(bytes.len()))
+        .unwrap_or_default()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 struct FxLineState {
@@ -1573,6 +2144,20 @@ fn apply_jaudio_reverb(
                 .copy_from_slice(&reverb_buffers[line_index]);
             state.block = (state.block + 1) % config.circular_buffer_blocks;
         }
+    }
+}
+
+fn apply_preview_peak_guard(samples: &mut [f32]) {
+    const TARGET_PEAK: f32 = 0.95;
+    let peak = samples
+        .iter()
+        .fold(0.0f32, |peak, sample| peak.max(sample.abs()));
+    if peak <= TARGET_PEAK {
+        return;
+    }
+    let gain = TARGET_PEAK / peak;
+    for sample in samples {
+        *sample *= gain;
     }
 }
 
@@ -1672,9 +2257,13 @@ fn process_track(
     children: &mut Vec<PendingTrack>,
     next_voice_id: &mut u64,
     commands: &mut usize,
+    voice_errors: &mut Vec<String>,
 ) -> Result<(), String> {
+    let mut trace = [0usize; 16];
     for _ in 0..MAX_COMMANDS_PER_TICK {
         *commands += 1;
+        trace.rotate_left(1);
+        trace[15] = track.pc;
         let flag = read_u8(sequence, &mut track.pc, "sequence command")?;
         if flag < 0x80 {
             let mode = read_u8(sequence, &mut track.pc, "note mode")?;
@@ -1701,6 +2290,9 @@ fn process_track(
                     duration =
                         (duration << 8) | read_u8(sequence, &mut track.pc, "note duration")? as u32;
                 }
+                if width == 1 && duration >= 0x80 {
+                    duration = u32::from(track.reg(duration as u8 - 0x80));
+                }
                 (0usize, Some(duration), gate)
             } else {
                 let mut slot = (mode & 7) as usize;
@@ -1713,44 +2305,50 @@ fn process_track(
             let program = track.registers[6] as u8;
             let gate_ticks =
                 duration.map(|duration| (duration as u64 * gate as u64 / 100).max(1) as u32);
-            if let Ok((wave_bank, region)) = assets.instrument_region(bank, program, note, velocity)
-            {
-                if let Ok(wave) = assets.decoded_wave(wave_bank, region.wave_id) {
-                    let semitones = note as f32 - wave.root_key as f32;
-                    let base_step = wave.sample_rate as f64 / OUTPUT_RATE as f64
-                        * 2.0f64.powf(semitones as f64 / 12.0)
-                        * region.pitch as f64;
-                    let id = *next_voice_id;
-                    *next_voice_id += 1;
-                    if let Some(previous) = track.slots[slot].take() {
-                        if let Some(voice) = voices.iter_mut().find(|voice| voice.id == previous) {
-                            begin_release(voice, None);
+            match assets.instrument_region(bank, program, note, velocity) {
+                Ok((wave_bank, region)) => match assets.decoded_wave(wave_bank, region.wave_id) {
+                    Ok(wave) => {
+                        let semitones = note as f32 - wave.root_key as f32;
+                        let base_step = wave.sample_rate as f64 / OUTPUT_RATE as f64
+                            * 2.0f64.powf(semitones as f64 / 12.0)
+                            * region.pitch as f64;
+                        let id = *next_voice_id;
+                        *next_voice_id += 1;
+                        if let Some(previous) = track.slots[slot].take() {
+                            if let Some(voice) =
+                                voices.iter_mut().find(|voice| voice.id == previous)
+                            {
+                                begin_release(voice, None);
+                            }
                         }
+                        let mut oscillators: Vec<_> = region
+                            .oscillators
+                            .into_iter()
+                            .map(VoiceOscillator::new)
+                            .collect();
+                        if oscillators.is_empty() {
+                            oscillators.push(default_volume_oscillator());
+                        }
+                        track.apply_voice_oscillator_routes(&mut oscillators);
+                        voices.push(Voice {
+                            id,
+                            wave,
+                            position: 0.0,
+                            base_step,
+                            base_volume: (velocity as f32 / 127.0).powi(2) * region.volume,
+                            instrument_pan: region.pan,
+                            instrument_fxmix: region.fxmix,
+                            oscillators,
+                            direct_release: region.direct_release,
+                            releasing: false,
+                            ticks_remaining: gate_ticks,
+                            owner_track: track_index,
+                        });
+                        track.slots[slot] = Some(id);
                     }
-                    let mut oscillators: Vec<_> = region
-                        .oscillators
-                        .into_iter()
-                        .map(VoiceOscillator::new)
-                        .collect();
-                    if oscillators.is_empty() {
-                        oscillators.push(default_volume_oscillator());
-                    }
-                    voices.push(Voice {
-                        id,
-                        wave,
-                        position: 0.0,
-                        base_step,
-                        base_volume: (velocity as f32 / 127.0).powi(2) * region.volume,
-                        instrument_pan: region.pan,
-                        instrument_fxmix: region.fxmix,
-                        oscillators,
-                        direct_release: region.direct_release,
-                        releasing: false,
-                        ticks_remaining: gate_ticks,
-                        owner_track: track_index,
-                    });
-                    track.slots[slot] = Some(id);
-                }
+                    Err(error) => push_voice_error(voice_errors, error),
+                },
+                Err(error) => push_voice_error(voice_errors, error),
             }
             if let Some(duration) = duration {
                 track.wait = duration.max(1);
@@ -1780,12 +2378,8 @@ fn process_track(
             }
             if let Some(id) = track.slots[slot.min(7)].take() {
                 if let Some(voice) = voices.iter_mut().find(|voice| voice.id == id) {
-                    begin_release(
-                        voice,
-                        direct_release
-                            .filter(|release| *release != 0)
-                            .map(u16::from),
-                    );
+                    let direct_release = direct_release.map(decode_note_release);
+                    begin_release(voice, direct_release.filter(|release| *release != 0));
                 }
             }
         } else if flag & 0xf0 == 0x90 {
@@ -1826,7 +2420,15 @@ fn process_track(
             return Ok(());
         }
     }
-    Err("sequence command loop did not yield".to_string())
+    Err(format!(
+        "sequence command loop did not yield; recent offsets: {trace:02X?}"
+    ))
+}
+
+fn push_voice_error(errors: &mut Vec<String>, error: String) {
+    if errors.len() < 8 && !errors.contains(&error) {
+        errors.push(error);
+    }
 }
 
 const COMMAND_ARGS: [(u16, u16); 64] = [
@@ -1909,7 +2511,22 @@ fn process_command(
         let condition = read_u8(sequence, &mut track.pc, "branch condition")?;
         let offset = if condition & 0x80 != 0 {
             let register = read_u8(sequence, &mut track.pc, "branch register")?;
-            track.reg(register) as usize
+            let index = track.reg(register) as usize;
+            if condition & 0x40 != 0 {
+                let table = if condition & 0x20 != 0 {
+                    let table_register = read_u8(sequence, &mut track.pc, "branch table register")?;
+                    track.reg(table_register) as usize
+                } else {
+                    read_be_value(sequence, &mut track.pc, 3, "branch table")? as usize
+                };
+                let entry = table
+                    .checked_add(index.saturating_mul(3))
+                    .ok_or_else(|| "branch table offset overflow".to_string())?;
+                let mut cursor = entry;
+                read_be_value(sequence, &mut cursor, 3, "branch table entry")? as usize
+            } else {
+                index
+            }
         } else {
             read_be_value(sequence, &mut track.pc, 3, "branch offset")? as usize
         };
@@ -1958,6 +2575,9 @@ fn process_command(
                     TrackRelation::Sibling
                 },
             });
+            // Opening is immediate in JASTrack. Yield so the owning track list
+            // can install the child before this sequence observes register 0x2c.
+            return Ok(true);
         }
         0xc6 if condition_matches(track.reg(3), args[0] as u8) => {
             if let Some(pc) = track.call_stack.pop() {
@@ -1979,12 +2599,60 @@ fn process_command(
                 }
             }
         }
+        0xcb => {
+            let port = (args[0] as usize).min(15);
+            let value = track.read_import_port(port);
+            track.set_reg(args[1] as u8, value);
+        }
+        0xcc => {
+            let port = (args[0] as usize).min(15);
+            track.write_export_port(port, args[1] as u16);
+        }
+        0xcd => track.set_reg(
+            3,
+            u16::from(track.import_flags & (1 << args[0].min(15)) != 0),
+        ),
+        0xce => track.set_reg(
+            3,
+            u16::from(track.export_flags & (1 << args[0].min(15)) != 0),
+        ),
         0xcf | 0xea => {
             track.wait = args[0];
             return Ok(track.wait > 0);
         }
         0xd6 => track.set_simple_oscillator(args[0] as u8),
+        0xd7 => track.set_simple_envelope(sequence, args[0] as u8, args[1] as usize)?,
+        0xd8 => track.set_simple_adsr(&args[..5]),
         0xd9 => track.transpose = args[0] as u8 as i8 as i16,
+        0xda => {
+            let slot = (args[0] as usize).min(15);
+            if let Some(child) = track.children[slot].take() {
+                track.pending_closes.push(child);
+            }
+        }
+        0xdf => {
+            let kind = args[0] as usize;
+            if let Some(slot) = track.interrupt_offsets.get_mut(kind) {
+                *slot = Some(args[1] as usize);
+            }
+        }
+        0xe0 => {
+            let kind = args[0] as usize;
+            if let Some(slot) = track.interrupt_offsets.get_mut(kind) {
+                *slot = None;
+            }
+        }
+        0xe1 => track.interrupts_enabled = true,
+        0xe2 => track.interrupts_enabled = false,
+        0xe3 => {
+            track.interrupts_enabled = true;
+            if let Some((pc, wait)) = track.interrupt_stack.pop() {
+                track.pc = pc;
+                track.wait = wait;
+            }
+            return Ok(true);
+        }
+        0xe4 => track.set_interrupt_timer(args[0] as u8, args[1]),
         0xe7 => track.set_reg(3, 0),
         0xe8 => {
             for voice in voices
@@ -2038,28 +2706,26 @@ fn parse_time_param(sequence: &[u8], track: &mut Track, mode: u8) -> Result<(), 
         }
         _ => read_be_value(sequence, &mut track.pc, 2, "time parameter value")? as u16 as i16,
     };
-    match mode & 3 {
+    let duration = match mode & 3 {
         1 => {
-            let _ = read_u8(sequence, &mut track.pc, "time duration register")?;
+            let register = read_u8(sequence, &mut track.pc, "time duration register")?;
+            u32::from(track.reg(register))
         }
-        2 => {
-            let _ = read_u8(sequence, &mut track.pc, "time duration")?;
-        }
-        3 => {
-            let _ = read_be_value(sequence, &mut track.pc, 2, "time duration")?;
-        }
-        _ => {}
-    }
+        2 => u32::from(read_u8(sequence, &mut track.pc, "time duration")?),
+        3 => read_be_value(sequence, &mut track.pc, 2, "time duration")?,
+        _ => 0,
+    };
     let value = raw as f32 / 32768.0;
-    match target {
-        0 => track.volume = value.max(0.0),
-        1 => track.pitch = value,
-        2 => track.fxmix = value.max(0.0),
-        3 => track.pan = value,
-        6..=11 => track.set_oscillator_parameter(target, value),
-        _ => {}
-    }
+    track.move_time_parameter(target, value, duration);
     Ok(())
+}
+
+fn decode_note_release(encoded: u8) -> u16 {
+    if encoded > 100 {
+        u16::from(encoded - 98) * 20
+    } else {
+        u16::from(encoded)
+    }
 }
 
 fn parse_register_param(sequence: &[u8], track: &mut Track, mut mode: u8) -> Result<(), String> {
@@ -2092,11 +2758,20 @@ fn parse_register_param(sequence: &[u8], track: &mut Track, mut mode: u8) -> Res
         _ => read_be_value(sequence, &mut track.pc, 2, "register immediate")? as u16 as i16 as i32,
     };
     let current = track.reg(destination) as i16 as i32;
+    if operation == 2 {
+        let product = current.wrapping_mul(source);
+        track.set_reg(4, ((product as u32) >> 16) as u16);
+        track.set_reg(5, product as u16);
+        return Ok(());
+    }
+    if operation == 3 {
+        track.registers[3] = current.wrapping_sub(source) as u16;
+        return Ok(());
+    }
     let result = match operation {
         0 => source,
         1 => current.wrapping_add(source),
-        2 => current.wrapping_mul(source),
-        3 | 0x0b => current.wrapping_sub(source),
+        0x0b => current.wrapping_sub(source),
         0x10 => {
             if source < 0 {
                 ((current as u16) >> (-source).min(15)) as i32
@@ -2207,7 +2882,10 @@ fn mix_voices(
             let track = &tracks[voice.owner_track];
             let modulation = track_modulations[voice.owner_track];
             let pan = (track.pan * modulation.pan + osc_pan - 0.5).clamp(0.0, 1.0);
-            let fxmix = (track.fxmix * modulation.fxmix + osc_fxmix).clamp(0.0, 1.0);
+            let fxmix = (track.fxmix * modulation.fxmix
+                + osc_fxmix
+                + effective_track_external_fxmix(tracks, voice.owner_track))
+            .clamp(0.0, 1.0);
             let sample =
                 resample_voice(voice) * voice.base_volume * track_volume * osc_volume.max(0.0);
             let left_gain = ((1.0 - pan) * std::f32::consts::FRAC_PI_2).sin();
@@ -2266,8 +2944,12 @@ fn effective_track_gain_and_pitch(
     loop {
         let track = &tracks[index];
         let modulation = modulations[index];
-        volume *= track.volume.max(0.0).powi(2) * modulation.volume.max(0.0);
-        pitch *= 2.0f32.powf(track.pitch * 4.0) * modulation.pitch.max(0.0);
+        volume *= track.volume.max(0.0).powi(2)
+            * modulation.volume.max(0.0)
+            * track.external_volume.max(0.0);
+        pitch *= 2.0f32.powf(track.pitch * 4.0)
+            * modulation.pitch.max(0.0)
+            * track.external_pitch.max(0.0);
         if !track.inherit_parent_mix {
             break;
         }
@@ -2277,6 +2959,22 @@ fn effective_track_gain_and_pitch(
         index = parent;
     }
     (volume, pitch)
+}
+
+fn effective_track_external_fxmix(tracks: &[Track], mut index: usize) -> f32 {
+    let mut fxmix = 0.0f32;
+    loop {
+        let track = &tracks[index];
+        fxmix += track.external_fxmix;
+        if !track.inherit_parent_mix {
+            break;
+        }
+        let Some(parent) = track.parent else {
+            break;
+        };
+        index = parent;
+    }
+    fxmix.clamp(0.0, 1.0)
 }
 
 fn envelope_curve(curve: u8, start: f32, target: f32, progress: f32) -> f32 {
@@ -2465,6 +3163,34 @@ mod tests {
     }
 
     #[test]
+    fn sound_dispatch_never_falls_back_to_the_wrong_category() {
+        let root = Track::new(0);
+        let mut category_zero = Track::new(0);
+        category_zero.export_flags = 1 << 9;
+        category_zero.port_values[9] = 0;
+        let mut category_three = Track::new(0);
+        category_three.export_flags = 1 << 9;
+        category_three.port_values[9] = 3;
+        let tracks = [root, category_zero, category_three];
+        assert_eq!(sound_dispatcher_track(&tracks, 3), Some(2));
+        assert_eq!(sound_dispatcher_track(&tracks, 5), None);
+    }
+
+    #[test]
+    fn track_ports_share_values_between_imports_and_exports() {
+        let mut track = Track::new(0);
+        track.write_import_port(0, 1);
+
+        // The dispatcher acknowledges the request by exporting status on the
+        // same port. TTrackPort uses one value array for both directions.
+        track.write_export_port(0, 2);
+
+        assert_eq!(track.read_import_port(0), 2);
+        assert_eq!(track.import_flags & 1, 0);
+        assert_eq!(track.export_flags & 1, 1);
+    }
+
+    #[test]
     fn child_local_tempo_uses_jaudio_parent_ratio() {
         let root = Track::new(0);
         let mut child = Track::new_child(1, 0, &root, 0);
@@ -2532,12 +3258,128 @@ mod tests {
     }
 
     #[test]
+    fn sequence_adsr_is_routed_onto_spawned_voices() {
+        let mut track = Track::new(0);
+        track.set_simple_adsr(&[1, 1, 2000, 31_000, 200]);
+        track.set_oscillator_route(0);
+        let mut oscillators = vec![default_volume_oscillator()];
+        track.apply_voice_oscillator_routes(&mut oscillators);
+
+        assert!(oscillators[0].spec.attack.is_some());
+        assert!(oscillators[0].spec.release.is_some());
+        assert_eq!(oscillators[0].next_value().0, 0.0);
+        oscillators[0].begin_release(None);
+        assert!(matches!(
+            oscillators[0].state,
+            OscillatorState::Table { .. }
+        ));
+    }
+
+    #[test]
+    fn jaudio_note_release_encoding_expands_long_values() {
+        assert_eq!(decode_note_release(0), 0);
+        assert_eq!(decode_note_release(100), 100);
+        assert_eq!(decode_note_release(101), 60);
+        assert_eq!(decode_note_release(200), 2040);
+    }
+
+    #[test]
+    fn sequence_interrupt_timer_preempts_and_restores_wait() {
+        let mut track = Track::new(10);
+        track.wait = 60;
+        track.interrupt_offsets[6] = Some(123);
+        track.set_interrupt_timer(0, 2);
+        track.advance_interrupts();
+        assert!(!track.begin_pending_interrupt());
+        track.advance_interrupts();
+        assert!(track.begin_pending_interrupt());
+        assert_eq!(track.pc, 123);
+        assert_eq!(track.wait, 0);
+
+        let mut children = Vec::new();
+        let mut voices = Vec::new();
+        process_command(&[], &mut track, 0, 0xe3, 0, &mut children, &mut voices).unwrap();
+        assert_eq!(track.pc, 10);
+        assert_eq!(track.wait, 60);
+    }
+
+    #[test]
+    fn timed_parameters_move_once_per_sequence_tick() {
+        let mut track = Track::new(0);
+        track.move_time_parameter(0, 0.5, 2);
+        track.advance_timed_parameters();
+        assert!((track.volume - 0.75).abs() < f32::EPSILON);
+        track.advance_timed_parameters();
+        assert!((track.volume - 0.5).abs() < f32::EPSILON);
+        assert!(track.timed_moves[0].is_none());
+    }
+
+    #[test]
+    fn sound_preview_peak_guard_prevents_hard_clipping() {
+        let mut samples = [2.0, -1.0, 0.5];
+        apply_preview_peak_guard(&mut samples);
+        assert!((samples[0] - 0.95).abs() < f32::EPSILON);
+        assert!((samples[1] + 0.475).abs() < f32::EPSILON);
+    }
+
+    #[test]
     #[ignore = "requires an extracted retail Sunshine base in SMS_BASE_ROOT"]
     fn renders_real_sunshine_bgm() {
         let root = std::env::var_os("SMS_BASE_ROOT").expect("SMS_BASE_ROOT");
         let samples = render_bgm_preview(Path::new(&root), 0x8001_0023, 1.0).unwrap();
         assert_eq!(samples.len(), OUTPUT_RATE as usize * 2);
         assert!(samples.iter().any(|sample| sample.abs() > 0.0001));
+    }
+
+    #[test]
+    #[ignore = "requires an extracted retail Sunshine base in SMS_BASE_ROOT"]
+    fn renders_real_sunshine_sound_effect() {
+        let root = std::env::var_os("SMS_BASE_ROOT").expect("SMS_BASE_ROOT");
+        let sound_id = std::env::var("SMS_SOUND_ID")
+            .ok()
+            .and_then(|value| u32::from_str_radix(value.trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0x19);
+        let samples = render_sound_preview(Path::new(&root), sound_id, 8.0).unwrap();
+        assert_eq!(samples.len(), OUTPUT_RATE as usize * 16);
+        assert!(samples.iter().any(|sample| sample.abs() > 0.0001));
+    }
+
+    #[test]
+    #[ignore = "requires an extracted retail Sunshine base in SMS_BASE_ROOT"]
+    fn audits_retail_sunshine_sound_previews() {
+        let root = PathBuf::from(std::env::var_os("SMS_BASE_ROOT").expect("SMS_BASE_ROOT"));
+        let entries = crate::music_library::index_retail_sounds(&root).unwrap();
+        let mut assets = AudioAssets::load(&root).unwrap();
+        let dispatcher = assets.sequence_for_entry(0).unwrap().to_vec();
+        let mut per_category = [0usize; 16];
+        for entry in entries {
+            let category = ((entry.sound_id >> 12) & 0xf) as usize;
+            if per_category[category] >= 12 {
+                continue;
+            }
+            per_category[category] += 1;
+            let trigger = assets.sound_preview_trigger(entry.sound_id).unwrap();
+            let samples =
+                render_sequence_preview(&mut assets, dispatcher.clone(), 2.0, Some(trigger));
+            match samples {
+                Ok(samples) => {
+                    let peak = samples
+                        .iter()
+                        .fold(0.0f32, |peak, value| peak.max(value.abs()));
+                    let rms = (samples.iter().map(|value| value * value).sum::<f32>()
+                        / samples.len().max(1) as f32)
+                        .sqrt();
+                    let clipped = samples.iter().filter(|value| value.abs() > 0.99).count();
+                    eprintln!(
+                        "{:04x} {:<40} peak={peak:.4} rms={rms:.4} clip={clipped}",
+                        entry.sound_id, entry.symbol
+                    );
+                }
+                Err(error) => {
+                    eprintln!("{:04x} {:<40} ERROR {error}", entry.sound_id, entry.symbol)
+                }
+            }
+        }
     }
 
     #[test]

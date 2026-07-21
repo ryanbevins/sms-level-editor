@@ -661,7 +661,7 @@ impl SmsEditorApp {
         self.model_instances_dirty = false;
         self.model_instance_undo_stack.clear();
         self.model_instance_redo_stack.clear();
-        self.placing_model_asset = None;
+        self.active_placement = None;
         self.asset_dirty = false;
         self.asset_undo_stack.clear();
         self.asset_redo_stack.clear();

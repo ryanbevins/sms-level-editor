@@ -251,6 +251,7 @@ impl SmsEditorApp {
                 let world = self.screen_to_world_floor(rect, pointer);
                 self.clear_audio_helper_selection();
                 self.spawn_object_at(payload.factory_name.clone(), world);
+                self.content_browser.inspector_active = false;
             }
             return;
         }
@@ -259,6 +260,7 @@ impl SmsEditorApp {
                 let world = self.screen_to_world_floor(rect, pointer);
                 self.clear_audio_helper_selection();
                 self.spawn_model_instance_at(payload.asset_id, world);
+                self.content_browser.inspector_active = false;
             }
             return;
         }
@@ -324,6 +326,7 @@ impl SmsEditorApp {
         }
 
         if response.clicked() && self.hovered_gizmo_axis.is_none() && !gizmo_using_pointer {
+            self.content_browser.inspector_active = false;
             if let Some(pos) = response.interact_pointer_pos() {
                 let model_instance_id = self.model_instance_at_screen_position(rect, pos);
                 let object_id = model_instance_id
@@ -338,16 +341,17 @@ impl SmsEditorApp {
                     return;
                 }
                 if self.tool == EditorTool::Place {
-                    if let Some(asset_id) = self.placing_model_asset {
+                    if let Some(placement) = self.active_placement.clone() {
                         let world = self.screen_to_world_floor(rect, pos);
                         self.clear_audio_helper_selection();
-                        self.spawn_model_instance_at(asset_id, world);
-                        return;
-                    }
-                    if let Some(factory) = self.palette_factory.clone() {
-                        let world = self.screen_to_world_floor(rect, pos);
-                        self.clear_audio_helper_selection();
-                        self.spawn_object_at(factory, world);
+                        match placement {
+                            ActivePlacement::Model { asset_id } => {
+                                self.spawn_model_instance_at(asset_id, world);
+                            }
+                            ActivePlacement::Object { factory_name } => {
+                                self.spawn_object_at(factory_name, world);
+                            }
+                        }
                         return;
                     }
                 }
@@ -2020,10 +2024,31 @@ impl SmsEditorApp {
 
     pub(super) fn paint_viewport_overlays(
         &self,
-        _ui: &egui::Ui,
+        ui: &egui::Ui,
         painter: &egui::Painter,
         rect: egui::Rect,
     ) {
+        if self.show_fps {
+            ui.ctx().request_repaint();
+            let stable_dt = ui.input(|input| input.stable_dt).max(0.000_001);
+            let fps = 1.0 / stable_dt;
+            let text = format!("{fps:.0} FPS");
+            let anchor = rect.right_top() + egui::vec2(-12.0, 12.0);
+            painter.text(
+                anchor + egui::vec2(1.0, 1.0),
+                egui::Align2::RIGHT_TOP,
+                &text,
+                egui::FontId::monospace(14.0),
+                egui::Color32::from_black_alpha(210),
+            );
+            painter.text(
+                anchor,
+                egui::Align2::RIGHT_TOP,
+                text,
+                egui::FontId::monospace(14.0),
+                egui::Color32::from_rgb(235, 241, 242),
+            );
+        }
         if self.show_stats {
             let overlay = egui::Rect::from_min_size(
                 rect.min + egui::vec2(16.0, 16.0),
@@ -2140,19 +2165,20 @@ impl SmsEditorApp {
             egui::Stroke::new(2.0, egui::Color32::from_rgb(93, 158, 236)),
         );
 
-        if (self.palette_factory.is_some() || self.placing_model_asset.is_some())
-            && self.tool == EditorTool::Place
+        if let Some(placement) = self
+            .active_placement
+            .as_ref()
+            .filter(|_| self.tool == EditorTool::Place)
         {
-            let text = self.palette_factory.clone().unwrap_or_else(|| {
-                self.placing_model_asset
-                    .and_then(|id| {
-                        self.model_catalog_entries
-                            .iter()
-                            .find(|entry| entry.id == id)
-                            .map(|entry| entry.name.clone())
-                    })
-                    .unwrap_or_else(|| "model asset".to_string())
-            });
+            let text = match placement {
+                ActivePlacement::Object { factory_name } => factory_name.clone(),
+                ActivePlacement::Model { asset_id } => self
+                    .model_catalog_entries
+                    .iter()
+                    .find(|entry| entry.id == *asset_id)
+                    .map(|entry| entry.name.clone())
+                    .unwrap_or_else(|| "model asset".to_string()),
+            };
             let rect = egui::Rect::from_min_size(
                 rect.left_bottom() + egui::vec2(16.0, -48.0),
                 egui::vec2(260.0, 34.0),

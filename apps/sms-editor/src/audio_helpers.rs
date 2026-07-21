@@ -275,6 +275,7 @@ impl SmsEditorApp {
         if self.selected_audio_helper_id.as_deref() != Some(helper.id.as_str()) {
             self.finish_audio_cube_edit();
         }
+        self.content_browser.inspector_active = false;
         self.selected_audio_helper_id = Some(helper.id.clone());
         self.selected_model_instance_id = None;
         self.selected_model_asset = None;
@@ -528,6 +529,70 @@ impl SmsEditorApp {
                 );
             }
             AudioHelperKind::Cube { .. } => {}
+        }
+    }
+
+    pub(super) fn can_assign_sound_to_selected_helper(&self) -> bool {
+        let Some(selected_id) = self.selected_audio_helper_id.as_deref() else {
+            return false;
+        };
+        self.audio_helpers().into_iter().any(|helper| {
+            helper.id == selected_id
+                && matches!(
+                    helper.kind,
+                    AudioHelperKind::Point { .. } | AudioHelperKind::Rail { .. }
+                )
+        })
+    }
+
+    pub(super) fn assign_sound_to_selected_helper(&mut self, sound_id: u32) -> bool {
+        let Some(selected_id) = self.selected_audio_helper_id.clone() else {
+            self.log
+                .push("Select a compatible audio helper before assigning a sound.".to_string());
+            return false;
+        };
+        let Some(helper) = self
+            .audio_helpers()
+            .into_iter()
+            .find(|helper| helper.id == selected_id)
+        else {
+            self.log
+                .push("The selected audio helper is no longer available.".to_string());
+            return false;
+        };
+        match helper.kind {
+            AudioHelperKind::Point {
+                actor_name,
+                original_sound_id,
+                ..
+            } => {
+                self.set_helper_sound_assignment(
+                    ProjectSoundAssignmentKind::MapStatic,
+                    &actor_name,
+                    original_sound_id,
+                    sound_id,
+                );
+                true
+            }
+            AudioHelperKind::Rail {
+                graph_name,
+                original_sound_id,
+                ..
+            } => {
+                self.set_helper_sound_assignment(
+                    ProjectSoundAssignmentKind::Graph,
+                    &graph_name,
+                    original_sound_id,
+                    sound_id,
+                );
+                true
+            }
+            AudioHelperKind::Cube { .. } => {
+                self.log.push(
+                    "Sound cubes do not expose a compatible retail sound assignment.".to_string(),
+                );
+                false
+            }
         }
     }
 

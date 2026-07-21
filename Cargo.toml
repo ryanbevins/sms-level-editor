@@ -47,3 +47,11 @@ sms-schema = { path = "crates/sms-schema" }
 # x86-64 target needed by older PCs.
 codegen-units = 1
 lto = "fat"
+
+[profile.fast-release]
+# Keep iteration builds close to release behavior without paying the full
+# whole-program optimization cost reserved for distributable releases.
+inherits = "release"
+codegen-units = 16
+incremental = true
+lto = "thin"

@@ -11,6 +11,7 @@ mod bmg;
 mod bmp;
 mod bti;
 mod col;
+mod game_files;
 mod gx_material;
 mod gx_texture;
 mod j3d;
@@ -35,6 +36,11 @@ pub use bmg::{BmgEntry, BmgFile, BmgMessage, BmgMessageToken};
 pub use bmp::BmpFile;
 pub use bti::BtiFile;
 pub use col::{ColFile, ColGroup, ColHeader, ColTriangle, ColVertex};
+pub use game_files::{
+    classify_game_resource_path, classify_game_resource_raw_path, index_game_files,
+    index_game_files_with_events, GameArchiveEntryMetadata, GameFileId, GameFileIndex,
+    GameFileIndexEvent, GameFileMetadata, GameFileWarning, GameFileWarningKind, GameResourceKind,
+};
 pub use gx_material::*;
 pub use gx_texture::*;
 pub use j3d::{

@@ -1071,9 +1071,8 @@ impl SmsEditorApp {
                 .push("Open a stage before placing a model asset.".to_string());
             return;
         }
-        self.placing_model_asset = Some(id);
+        self.active_placement = Some(ActivePlacement::Model { asset_id: id });
         self.tool = EditorTool::Place;
-        self.palette_factory = None;
         let label = self
             .model_catalog_entries
             .iter()
@@ -2345,7 +2344,7 @@ impl SmsEditorApp {
         }
     }
 
-    fn model_import_options_panel(&mut self, ui: &mut egui::Ui) {
+    pub(super) fn model_import_options_panel(&mut self, ui: &mut egui::Ui) {
         let collision_surfaces = self
             .registry
             .as_ref()

@@ -382,7 +382,7 @@ fn authored_runtime_readiness_error(
         })
     {
         return Some(
-            "The authored stage has no Mario placement. Drag the Mario class from the Object Palette into the viewport before building or launching."
+            "The authored stage has no Mario placement. Drag the Mario template from the Content Browser into the viewport before building or launching."
             .to_string(),
         );
     }

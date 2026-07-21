@@ -32,11 +32,16 @@ use sms_scene::{
 };
 use sms_schema::{ObjectDefinition, ObjectRegistry, ParticleBindingTarget, SchemaGenerator};
 
+mod active_placement;
 mod audio_helpers;
 mod audio_preview;
+mod browser_settings;
 mod camera;
+mod content_browser;
+mod content_thumbnails;
 mod direct_boot;
 mod document_commands;
+mod game_content_index;
 mod game_text;
 mod gpu_viewport;
 mod managed_build;
@@ -53,8 +58,13 @@ mod stage_creation;
 mod ui_panels;
 mod viewport_ui;
 
+use active_placement::*;
 use audio_helpers::*;
 use audio_preview::*;
+use browser_settings::*;
+use content_browser::*;
+use content_thumbnails::*;
+use game_content_index::*;
 use game_text::*;
 use model_assets::*;
 use music_library::*;
@@ -178,7 +188,6 @@ impl ViewMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BottomTab {
     Content,
-    Palette,
     Console,
 }
 
@@ -773,6 +782,8 @@ struct SmsEditorApp {
     retail_music: Vec<RetailMusicEntry>,
     retail_sounds: Vec<RetailSoundEntry>,
     retail_stage_audio: Vec<RetailStageAudioProfile>,
+    game_content_index: GameContentIndexState,
+    content_thumbnails: ContentThumbnailService,
     model_preview: Option<ModelPreview>,
     gpu_viewport: Option<gpu_viewport::GpuViewportScene>,
     gpu_target_format: Option<eframe::wgpu::TextureFormat>,
@@ -782,11 +793,12 @@ struct SmsEditorApp {
     log: Vec<String>,
     renderer: ViewportRenderer,
     selected_object_id: Option<String>,
-    palette_factory: Option<String>,
+    active_placement: Option<ActivePlacement>,
     object_filter: String,
     scene_filter: String,
     skybox_filter: String,
     content_browser_kind: ContentBrowserKind,
+    content_browser: ContentBrowserState,
     model_asset_filter: String,
     model_folder_filter: Option<String>,
     model_asset_rename_draft: String,
@@ -818,7 +830,6 @@ struct SmsEditorApp {
     model_instance_redo_stack: VecDeque<ModelInstanceUndoRecord>,
     model_collision_override_template: Option<sms_authoring::CollisionSurface>,
     selected_model_instance_id: Option<uuid::Uuid>,
-    placing_model_asset: Option<sms_authoring::AssetId>,
     last_scanned_base_root: String,
     pending_auto_refresh_root: Option<String>,
     last_auto_refresh_attempt_root: String,
@@ -829,6 +840,7 @@ struct SmsEditorApp {
     show_issues: bool,
     show_console: bool,
     show_stats: bool,
+    show_fps: bool,
     applied_window_title: String,
     snap_enabled: bool,
     snap_translation: f32,
@@ -842,6 +854,9 @@ struct SmsEditorApp {
     audio_cube_edit_before: Option<StageArchiveEdits>,
     audio_cube_helpers_cache: Vec<AudioHelper>,
     audio_preview_playback: Option<AudioPreviewPlayback>,
+    audio_preview_receiver: Option<Receiver<AudioPreviewRenderResult>>,
+    audio_preview_loading_target: Option<AudioPreviewTarget>,
+    audio_preview_generation: u64,
     outliner_filter: String,
     startup_camera_focus: Option<[f32; 3]>,
     route_mode: bool,
@@ -983,6 +998,8 @@ impl Default for SmsEditorApp {
             retail_music: Vec::new(),
             retail_sounds: Vec::new(),
             retail_stage_audio: Vec::new(),
+            game_content_index: GameContentIndexState::default(),
+            content_thumbnails: ContentThumbnailService::default(),
             model_preview: None,
             gpu_viewport: None,
             gpu_target_format: None,
@@ -992,11 +1009,12 @@ impl Default for SmsEditorApp {
             log: vec!["Ready.".to_string()],
             renderer: ViewportRenderer::new(RendererConfig::default()),
             selected_object_id: None,
-            palette_factory: None,
+            active_placement: None,
             object_filter: String::new(),
             scene_filter: String::new(),
             skybox_filter: String::new(),
             content_browser_kind: ContentBrowserKind::default(),
+            content_browser: ContentBrowserState::default(),
             model_asset_filter: String::new(),
             model_folder_filter: None,
             model_asset_rename_draft: String::new(),
@@ -1028,7 +1046,6 @@ impl Default for SmsEditorApp {
             model_instance_redo_stack: VecDeque::new(),
             model_collision_override_template: None,
             selected_model_instance_id: None,
-            placing_model_asset: None,
             last_scanned_base_root: String::new(),
             pending_auto_refresh_root: None,
             last_auto_refresh_attempt_root: String::new(),
@@ -1039,6 +1056,7 @@ impl Default for SmsEditorApp {
             show_issues: false,
             show_console: false,
             show_stats: false,
+            show_fps: false,
             applied_window_title: String::new(),
             snap_enabled: true,
             snap_translation: 50.0,
@@ -1052,6 +1070,9 @@ impl Default for SmsEditorApp {
             audio_cube_edit_before: None,
             audio_cube_helpers_cache: Vec::new(),
             audio_preview_playback: None,
+            audio_preview_receiver: None,
+            audio_preview_loading_target: None,
+            audio_preview_generation: 0,
             outliner_filter: String::new(),
             route_mode: false,
             show_all_routes: true,
@@ -1117,6 +1138,10 @@ impl SmsEditorApp {
 impl eframe::App for SmsEditorApp {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.poll_background_task(ctx, Some(frame));
+        self.sync_game_content_index();
+        self.poll_game_content_index(ctx);
+        self.poll_content_thumbnails(ctx);
+        self.poll_audio_preview(ctx);
         self.poll_embedded_dolphin(ctx);
         self.poll_model_import(ctx);
         self.persist_camera_state_if_due();
@@ -1141,6 +1166,8 @@ impl eframe::App for SmsEditorApp {
         if ctx.egui_wants_keyboard_input() {
             return;
         }
+
+        self.content_browser_keyboard(ctx);
 
         if ctx.input(|i| i.modifiers.ctrl && !i.modifiers.shift && i.key_pressed(egui::Key::Z)) {
             self.undo();
@@ -1187,10 +1214,17 @@ impl eframe::App for SmsEditorApp {
             .default_size(360.0)
             .show(root_ui, |ui| self.right_dock(ui));
 
-        egui::Panel::bottom("content_dock")
-            .resizable(true)
-            .default_size(300.0)
-            .show(root_ui, |ui| self.bottom_dock(ui));
+        let max_content_dock_height =
+            (root_ui.available_height() - 140.0).max(BROWSER_DOCK_MIN_HEIGHT);
+        let content_dock_height = self
+            .content_browser
+            .settings
+            .dock_height
+            .clamp(BROWSER_DOCK_MIN_HEIGHT, max_content_dock_height);
+        egui::Panel::bottom("content_dock_v2")
+            .exact_size(content_dock_height)
+            .show_separator_line(false)
+            .show(root_ui, |ui| self.bottom_dock(ui, max_content_dock_height));
 
         egui::CentralPanel::default().show(root_ui, |ui| {
             self.viewport_toolbar(ui);
@@ -1206,6 +1240,7 @@ impl eframe::App for SmsEditorApp {
         self.project_settings_window(root_ui.ctx());
         self.new_stage_dialog(root_ui.ctx());
         self.issues_window(root_ui.ctx());
+        self.content_browser_preview_window(root_ui.ctx());
         self.unsaved_changes_dialog(root_ui.ctx());
     }
 
@@ -2023,7 +2058,7 @@ impl SmsEditorApp {
         self.clear_viewport_preview_cache();
         self.selected_object_id = None;
         self.selected_model_instance_id = None;
-        self.placing_model_asset = None;
+        self.active_placement = None;
         self.undo_stack.clear();
         self.redo_stack.clear();
         self.undo_transaction = None;

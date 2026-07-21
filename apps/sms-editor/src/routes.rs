@@ -62,6 +62,7 @@ impl SmsEditorApp {
                     name, nodes, consumers, route_type, status
                 );
                 if ui.selectable_label(active, label).clicked() {
+                    self.content_browser.inspector_active = false;
                     self.active_route_graph = Some(id);
                     self.selected_route_controls.clear();
                     self.selected_route_link = None;
