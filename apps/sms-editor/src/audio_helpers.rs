@@ -169,6 +169,17 @@ impl SmsEditorApp {
 
     pub(super) fn rebuild_audio_cube_helpers_cache(&mut self) {
         self.audio_cube_helpers_cache.clear();
+        let sound_change_assignment = self
+            .current_stage_music()
+            .and_then(|music| music.secondary_bgm_id)
+            .or_else(|| {
+                let stage_id = self.document.as_ref()?.stage_id.as_str();
+                self.retail_stage_audio
+                    .iter()
+                    .find(|profile| profile.stage_id.eq_ignore_ascii_case(stage_id))?
+                    .secondary_bgm_id
+            })
+            .map(|bgm_id| self.music_display_name(bgm_id));
         let Some(document) = self.document.as_ref() else {
             return;
         };
@@ -216,10 +227,20 @@ impl SmsEditorApp {
                                 .collect::<Vec<_>>()
                                 .join(".")
                         ),
-                        label: format!(
-                            "{} {} - data {}",
-                            manager.factory_name, index, cube.data_no
-                        ),
+                        label: match manager.kind {
+                            sms_schema::CubeManagerKind::SoundChange => format!(
+                                "{} {} - {}",
+                                manager.factory_name,
+                                index,
+                                sound_change_assignment
+                                    .as_deref()
+                                    .unwrap_or("No inside track")
+                            ),
+                            _ => format!(
+                                "{} {} - data {}",
+                                manager.factory_name, index, cube.data_no
+                            ),
+                        },
                         kind: AudioHelperKind::Cube {
                             record_path: path,
                             manager_kind: manager.kind,
@@ -313,6 +334,14 @@ impl SmsEditorApp {
             sms_schema::CubeManagerKind::SoundEffect => "Stage sound-effect region",
             sms_schema::CubeManagerKind::Other => "Runtime cube region",
         });
+        if manager_kind == sms_schema::CubeManagerKind::SoundChange {
+            self.sound_change_music_panel(ui);
+        } else if manager_kind == sms_schema::CubeManagerKind::SoundEffect {
+            ui.colored_label(
+                egui::Color32::from_rgb(255, 180, 90),
+                "No sound is assigned: the retail runtime creates this table but the decomp has no consumer that maps its data number to an SE.",
+            );
+        }
         ui.separator();
 
         let mut changed = false;
@@ -549,6 +578,7 @@ impl SmsEditorApp {
         if selected != sound_id {
             self.set_helper_sound_assignment(kind, source_name, original_sound_id, selected);
         }
+        self.se_preview_notice(ui);
     }
 
     fn set_helper_sound_assignment(
@@ -588,6 +618,128 @@ impl SmsEditorApp {
             "Set sound helper '{source_name}' to {}. Build Game applies it to the packaged main.dol.",
             self.sound_display_name(sound_id)
         ));
+    }
+
+    fn sound_change_music_panel(&mut self, ui: &mut egui::Ui) {
+        let Some(stage_id) = self
+            .document
+            .as_ref()
+            .map(|document| document.stage_id.clone())
+        else {
+            return;
+        };
+        let defaults = self
+            .retail_stage_audio
+            .iter()
+            .find(|profile| profile.stage_id.eq_ignore_ascii_case(&stage_id))
+            .cloned();
+        let current = self.current_stage_music();
+        let effective_primary = current
+            .map(|music| (music.bgm_id, music.wave_scene_id))
+            .or_else(|| {
+                defaults
+                    .as_ref()
+                    .and_then(|profile| profile.primary_bgm_id.zip(profile.wave_scene_id))
+            });
+        let effective_secondary = current
+            .and_then(|music| music.secondary_bgm_id)
+            .or_else(|| {
+                defaults
+                    .as_ref()
+                    .and_then(|profile| profile.secondary_bgm_id)
+            });
+
+        ui.separator();
+        ui.heading("Assigned Music");
+        if let Some((bgm_id, _)) = effective_primary {
+            ui.label(format!(
+                "Outside volume: {}",
+                self.music_display_name(bgm_id)
+            ));
+        } else {
+            ui.label("Outside volume: no track");
+        }
+
+        let mut secondary_override = current.and_then(|music| music.secondary_bgm_id);
+        let secondary_text = effective_secondary
+            .map(|bgm_id| self.music_display_name(bgm_id))
+            .unwrap_or_else(|| "No inside track".to_string());
+        ui.label("Inside volume");
+        egui::ComboBox::from_id_salt(("sound-change-track", stage_id.as_str()))
+            .selected_text(secondary_text)
+            .width(ui.available_width().clamp(200.0, 360.0))
+            .show_ui(ui, |ui| {
+                let default_label = defaults
+                    .as_ref()
+                    .and_then(|profile| profile.secondary_bgm_id)
+                    .map(|bgm_id| format!("Game default — {}", self.music_display_name(bgm_id)))
+                    .unwrap_or_else(|| "Game default — no inside track".to_string());
+                ui.selectable_value(&mut secondary_override, None, default_label);
+                for entry in &self.retail_music {
+                    ui.selectable_value(&mut secondary_override, Some(entry.bgm_id), &entry.label)
+                        .on_hover_text(format!(
+                            "BGM 0x{:08X}; wave scene 0x{:X}",
+                            entry.bgm_id, entry.wave_scene_id
+                        ));
+                }
+            });
+        let preview_secondary = secondary_override.or_else(|| {
+            defaults
+                .as_ref()
+                .and_then(|profile| profile.secondary_bgm_id)
+        });
+        if let Some(bgm_id) = preview_secondary {
+            self.bgm_preview_transport(ui, bgm_id);
+        }
+
+        let missing_secondary_wave_scene = current.is_some_and(|music| {
+            music.secondary_bgm_id.is_some() && music.secondary_wave_scene_id.is_none()
+        });
+        if secondary_override != current.and_then(|music| music.secondary_bgm_id)
+            || missing_secondary_wave_scene
+        {
+            let secondary_wave_scene_id = secondary_override.and_then(|bgm_id| {
+                self.retail_music
+                    .iter()
+                    .find(|entry| entry.bgm_id == bgm_id)
+                    .map(|entry| entry.wave_scene_id)
+            });
+            let updated = if let Some(mut music) = current {
+                music.secondary_bgm_id = secondary_override;
+                music.secondary_wave_scene_id = secondary_wave_scene_id;
+                Some(music)
+            } else if let (Some(secondary_bgm_id), Some((bgm_id, wave_scene_id))) =
+                (secondary_override, effective_primary)
+            {
+                Some(ProjectStageMusic {
+                    bgm_id,
+                    wave_scene_id,
+                    secondary_bgm_id: Some(secondary_bgm_id),
+                    secondary_wave_scene_id,
+                })
+            } else {
+                None
+            };
+            self.set_current_stage_music(updated);
+        }
+        if effective_primary.is_none() {
+            ui.colored_label(
+                egui::Color32::from_rgb(255, 180, 90),
+                "Choose the stage's outside music first so the stage assignment can be saved.",
+            );
+        } else {
+            ui.small(
+                "All decomp-mapped Sunshine tracks are available. Preview resolves each track's own retail wave scene from the selected base game.",
+            );
+        }
+    }
+
+    fn music_display_name(&self, bgm_id: u32) -> String {
+        self.retail_music
+            .iter()
+            .find(|entry| entry.bgm_id == bgm_id)
+            .map(|entry| format!("{} (0x{bgm_id:08X})", entry.label))
+            .unwrap_or_else(|| format!("BGM 0x{bgm_id:08X}"))
     }
 
     pub(super) fn paint_audio_helpers(&self, painter: &egui::Painter, rect: egui::Rect) {

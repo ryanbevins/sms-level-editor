@@ -1505,6 +1505,8 @@ impl SmsEditorApp {
         let updated = selected.map(|(bgm_id, wave_scene_id)| ProjectStageMusic {
             bgm_id,
             wave_scene_id,
+            secondary_bgm_id: current.and_then(|music| music.secondary_bgm_id),
+            secondary_wave_scene_id: current.and_then(|music| music.secondary_wave_scene_id),
         });
         if updated != current {
             self.set_current_stage_music(updated);

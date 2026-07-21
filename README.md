@@ -275,6 +275,16 @@ the packaged `stageArc.bin`. Therefore the music works when the runnable folder
 is booted normally in Dolphin; it is not limited to editor direct boot. The
 extracted base executable remains untouched.
 
+The viewport's **Audio Helpers** expose decomp-derived positional emitters,
+rail emitters, and sound-change volumes. Selecting one shows its exact retail
+sound name and assignment scope. Map-static and graph sounds can be changed;
+**Build Game** patches the matching named runtime table row in the managed DOL.
+Sound-change volumes show the outside and inside BGM tracks, including retail
+pairings such as Pinna Park and Merry-Go-Round, and can author a secondary
+track for custom stages. The editor previews any decomp-mapped track directly
+from the selected base game's `msound.aaf`, `sequence.arc`, instrument banks,
+and AW samples; no substitute audio clip is needed.
+
 **Launch in Editor** and **Launch in Dolphin** perform that same freshness
 pass, resolve the open archive's runtime area and scenario from the staged
 game's own

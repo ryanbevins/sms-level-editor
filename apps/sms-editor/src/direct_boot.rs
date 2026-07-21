@@ -46,6 +46,22 @@ pub(super) struct RuntimeStageMusicOverride {
     pub(super) scenario_index: u8,
     pub(super) bgm_id: u32,
     pub(super) wave_scene_id: u32,
+    pub(super) secondary_bgm_id: Option<u32>,
+    pub(super) secondary_wave_scene_id: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum RuntimeSoundAssignmentKind {
+    MapStatic,
+    Graph,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RuntimeSoundAssignment {
+    pub(super) kind: RuntimeSoundAssignmentKind,
+    pub(super) source_name: String,
+    pub(super) original_sound_id: u32,
+    pub(super) sound_id: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,9 +192,130 @@ struct DirectBootCaves {
 #[derive(Debug, Clone, Copy)]
 struct SoundStageHook {
     dispatch_anchor: WordAnchor,
+    enter_stage_anchor: WordAnchor,
+    enter_stage_target: u32,
     area_register: u8,
     scenario_register: u8,
     ms_stg_offset: i16,
+}
+
+pub(super) fn patch_sms_sound_assignments_dol(
+    source: &[u8],
+    assignments: &[RuntimeSoundAssignment],
+) -> Result<Vec<u8>, String> {
+    if assignments.is_empty() {
+        return Ok(source.to_vec());
+    }
+    let image = parse_dol(source)?;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut patches = Vec::with_capacity(assignments.len());
+    for assignment in assignments {
+        if assignment.source_name.is_empty() || assignment.source_name.as_bytes().contains(&0) {
+            return Err("Sound assignment source name is empty or contains NUL".to_string());
+        }
+        if assignment.original_sound_id > u16::MAX.into() || assignment.sound_id > u16::MAX.into() {
+            return Err(format!(
+                "Sound assignment '{}' is outside Sunshine's 16-bit SE identifier range",
+                assignment.source_name
+            ));
+        }
+        let identity = (assignment.kind.clone(), assignment.source_name.clone());
+        if !seen.insert(identity) {
+            return Err(format!(
+                "Duplicate sound assignment for '{}'",
+                assignment.source_name
+            ));
+        }
+        let field_offset = match assignment.kind {
+            RuntimeSoundAssignmentKind::MapStatic => 48,
+            RuntimeSoundAssignmentKind::Graph => 4,
+        };
+        let addresses = find_c_string_addresses(source, &image, &assignment.source_name)?;
+        let mut candidates = Vec::new();
+        for address in addresses {
+            for section in image
+                .sections
+                .iter()
+                .copied()
+                .filter(|section| !section.text)
+            {
+                let start = usize::try_from(section.file_offset)
+                    .map_err(|_| "DOL data section offset does not fit usize".to_string())?;
+                let section_end = usize::try_from(section.file_end()?)
+                    .map_err(|_| "DOL data section end does not fit usize".to_string())?;
+                for pointer_offset in (start..section_end.saturating_sub(3)).step_by(4) {
+                    if read_be_u32(source, pointer_offset)? != address {
+                        continue;
+                    }
+                    let sound_offset = pointer_offset
+                        .checked_add(field_offset)
+                        .ok_or_else(|| "Sound-table field offset overflows usize".to_string())?;
+                    if sound_offset
+                        .checked_add(4)
+                        .is_some_and(|field_end| field_end <= section_end)
+                        && read_be_u32(source, sound_offset)? == assignment.original_sound_id
+                    {
+                        candidates.push(sound_offset);
+                    }
+                }
+            }
+        }
+        candidates.sort_unstable();
+        candidates.dedup();
+        if candidates.len() != 1 {
+            return Err(format!(
+                "Could not uniquely locate the {:?} sound-table row '{}' with original SE 0x{:04X}; found {} candidate(s)",
+                assignment.kind,
+                assignment.source_name,
+                assignment.original_sound_id,
+                candidates.len()
+            ));
+        }
+        patches.push((candidates[0], assignment.sound_id));
+    }
+    let mut bytes = source.to_vec();
+    for (offset, sound_id) in patches {
+        write_be_u32(&mut bytes, offset, sound_id)?;
+    }
+    parse_dol(&bytes)?;
+    Ok(bytes)
+}
+
+fn find_c_string_addresses(
+    source: &[u8],
+    image: &DolImage,
+    value: &str,
+) -> Result<Vec<u32>, String> {
+    let mut needle = value.as_bytes().to_vec();
+    needle.push(0);
+    let mut addresses = Vec::new();
+    for section in image.sections.iter().copied() {
+        let start = usize::try_from(section.file_offset)
+            .map_err(|_| "DOL section offset does not fit usize".to_string())?;
+        let end = usize::try_from(section.file_end()?)
+            .map_err(|_| "DOL section end does not fit usize".to_string())?;
+        let Some(bytes) = source.get(start..end) else {
+            return Err(format!(
+                "DOL section {} is outside the file",
+                section.label()
+            ));
+        };
+        for (offset, window) in bytes.windows(needle.len()).enumerate() {
+            if window == needle {
+                addresses.push(
+                    section
+                        .address
+                        .checked_add(u32::try_from(offset).map_err(|_| {
+                            "DOL string offset does not fit the address space".to_string()
+                        })?)
+                        .ok_or_else(|| "DOL string address overflows u32".to_string())?,
+                );
+            }
+        }
+    }
+    addresses.sort_unstable();
+    addresses.dedup();
+    Ok(addresses)
 }
 
 pub(super) fn patch_sms_stage_music_dol(
@@ -214,10 +351,30 @@ pub(super) fn patch_sms_stage_music_dol(
                 override_.area_index, override_.scenario_index
             ));
         }
+        if override_
+            .secondary_bgm_id
+            .is_some_and(|bgm_id| bgm_id & 0xffff_0000 != 0x8001_0000)
+        {
+            return Err(format!(
+                "Stage music area {}, scenario {} has an invalid secondary BGM identifier",
+                override_.area_index, override_.scenario_index
+            ));
+        }
+        if (override_.secondary_bgm_id.is_none() && override_.secondary_wave_scene_id.is_some())
+            || override_
+                .secondary_wave_scene_id
+                .is_some_and(|wave| wave > u16::MAX.into())
+        {
+            return Err(format!(
+                "Stage music area {}, scenario {} has an invalid secondary wave-scene identifier",
+                override_.area_index, override_.scenario_index
+            ));
+        }
     }
 
     let image = parse_dol(source)?;
     let hook = find_sound_stage_hook(source, &image)?;
+    let wave_loader = find_wave_bank_load_wave(source, &image)?;
     let text_slot = (0..DOL_TEXT_SECTION_COUNT)
         .find(|slot| {
             !image
@@ -228,10 +385,19 @@ pub(super) fn patch_sms_stage_music_dol(
         .ok_or_else(|| "The DOL has no unused text section for stage music".to_string())?;
     let file_offset = align_up_usize(source.len(), FILE_ALIGNMENT as usize)?;
     let stack_top = find_stack_top(source, &image)?;
+    let preload_count = overrides
+        .iter()
+        .filter(|override_| {
+            override_.secondary_wave_scene_id.is_some()
+                && override_.secondary_wave_scene_id != Some(override_.wave_scene_id)
+        })
+        .count();
     let word_count = overrides
         .len()
-        .checked_mul(11)
+        .checked_mul(18)
         .and_then(|count| count.checked_add(2))
+        .and_then(|count| count.checked_add(14))
+        .and_then(|count| count.checked_add(preload_count.checked_mul(8)?))
         .ok_or_else(|| "Stage music dispatcher word count overflows usize".to_string())?;
     let unaligned_payload_size = word_count
         .checked_mul(4)
@@ -250,7 +416,7 @@ pub(super) fn patch_sms_stage_music_dol(
     // Extending the loaded image keeps the dispatcher outside the arena without changing
     // Sunshine's linker-defined startup stack or any runtime stack metadata derived from it.
     let stub_address = align_up_u32(loaded_end, FILE_ALIGNMENT)?;
-    let words = build_stage_music_stub(stub_address, hook, overrides)?;
+    let words = build_stage_music_stub(stub_address, hook, wave_loader, overrides)?;
     debug_assert_eq!(words.len(), word_count);
     let stub_end = stub_address
         .checked_add(u32::try_from(payload_size).map_err(|_| {
@@ -297,6 +463,17 @@ pub(super) fn patch_sms_stage_music_dol(
         &mut bytes,
         hook.dispatch_anchor.file_offset()?,
         encode_branch(hook_address, stub_address, false)?,
+    )?;
+    let wrapper_address = stub_address
+        .checked_add(
+            u32::try_from((overrides.len() * 18 + 2) * 4)
+                .map_err(|_| "Stage music wrapper address does not fit u32".to_string())?,
+        )
+        .ok_or_else(|| "Stage music wrapper address overflows u32".to_string())?;
+    write_be_u32(
+        &mut bytes,
+        hook.enter_stage_anchor.file_offset()?,
+        encode_branch(hook.enter_stage_anchor.address()?, wrapper_address, true)?,
     )?;
     parse_dol(&bytes)?;
     Ok(StageMusicDol {
@@ -483,6 +660,19 @@ fn find_sound_stage_hook(source: &[u8], image: &DolImage) -> Result<SoundStageHo
                     section,
                     word_index: word_index + 2,
                 },
+                enter_stage_anchor: WordAnchor {
+                    section,
+                    word_index: word_index + tail + 3,
+                },
+                enter_stage_target: decode_branch_target(
+                    sequence[tail + 3],
+                    section
+                        .address
+                        .checked_add(u32::try_from((word_index + tail + 3) * 4).map_err(|_| {
+                            "MSound enterStage call address does not fit u32".to_string()
+                        })?)
+                        .ok_or_else(|| "MSound enterStage call address overflows".to_string())?,
+                )?,
                 area_register,
                 scenario_register,
                 ms_stg_offset: immediate_i16(sequence[2]),
@@ -492,16 +682,85 @@ fn find_sound_stage_hook(source: &[u8], image: &DolImage) -> Result<SoundStageHo
     require_unique_value(candidates, "MSound stage initialization call")
 }
 
+fn find_wave_bank_load_wave(source: &[u8], image: &DolImage) -> Result<u32, String> {
+    let mut candidates = Vec::new();
+    for section in image
+        .sections
+        .iter()
+        .copied()
+        .filter(|section| section.text)
+    {
+        let words = section_words(source, section)?;
+        for word_index in 0..words.len().saturating_sub(58) {
+            let sequence = &words[word_index..word_index + 58];
+            if sequence[0] != 0x7c08_02a6
+                || sequence[1] != 0x9001_0004
+                || sequence[2] != 0x5460_103a
+                || sequence[3] != 0x9421_ffe8
+                || sequence[4] != 0x93e1_0014
+                || sequence[5] != 0x93c1_0010
+                || (sequence[6] != 0x7c9e_2378
+                    && decode_d_form(sequence[6], 14) != Some((30, 4, 0)))
+                || decode_d_form(sequence[7], 32).map(|(rt, ra, _)| (rt, ra)) != Some((5, 13))
+                || sequence[8] != 0x7fe5_002e
+                || sequence[17] != 0x4e80_0021
+                || sequence[18] != 0x3c03_bdad
+                || sequence[19] != 0x2800_4943
+                || sequence[43] != 0x4e80_0021
+                || sequence[44] != 0x3c03_acb3
+                || sequence[45] != 0x2800_504c
+            {
+                continue;
+            }
+            candidates.push(WordAnchor {
+                section,
+                word_index,
+            });
+        }
+    }
+    candidates.sort_by_key(|anchor| anchor.address().unwrap_or(u32::MAX));
+    let pairs = candidates
+        .windows(2)
+        .filter(|pair| {
+            pair[0].section == pair[1].section
+                && pair[0]
+                    .address()
+                    .ok()
+                    .zip(pair[1].address().ok())
+                    .is_some_and(|(left, right)| right > left && right - left < 0x200)
+        })
+        .collect::<Vec<_>>();
+    if pairs.len() != 1 {
+        return Err(format!(
+            "Expected one adjacent WaveBankMgr load/erase pair, found {}",
+            pairs.len()
+        ));
+    }
+    pairs[0][0].address()
+}
+
 fn build_stage_music_stub(
     stub_address: u32,
     hook: SoundStageHook,
+    wave_loader: u32,
     overrides: &[RuntimeStageMusicOverride],
 ) -> Result<Vec<u32>, String> {
-    const ENTRY_WORDS: usize = 11;
+    const ENTRY_WORDS: usize = 18;
     let stage_bgm_offset = hook
         .ms_stg_offset
         .checked_add(8)
         .ok_or_else(|| "MSStageInfo::stageBgm SDA offset overflows i16".to_string())?;
+    let stage_bgm_silent_offset = hook
+        .ms_stg_offset
+        .checked_add(12)
+        .ok_or_else(|| "MSStageInfo::stageBgmSilent SDA offset overflows i16".to_string())?;
+    let stage_bgm_silent_status_offset = hook.ms_stg_offset.checked_add(16).ok_or_else(|| {
+        "MSStageInfo::stageBgmSilentStartStatus SDA offset overflows i16".to_string()
+    })?;
+    let fade_event_offset = hook
+        .ms_stg_offset
+        .checked_add(20)
+        .ok_or_else(|| "MSStageInfo::fadeEvent SDA offset overflows i16".to_string())?;
     let tail_word = overrides
         .len()
         .checked_mul(ENTRY_WORDS)
@@ -514,7 +773,7 @@ fn build_stage_music_stub(
                 .ok_or_else(|| "Stage music dispatcher byte offset overflows u32".to_string())?,
         )
         .ok_or_else(|| "Stage music dispatcher tail address overflows u32".to_string())?;
-    let mut words = Vec::with_capacity(tail_word + 2);
+    let mut words = Vec::new();
     for (index, override_) in overrides.iter().enumerate() {
         let entry_address = stub_address
             .checked_add(
@@ -539,7 +798,17 @@ fn build_stage_music_stub(
         words.push(encode_d_form(36, 0, 13, stage_bgm_offset));
         words.extend(encode_u32(0, override_.wave_scene_id));
         words.push(encode_d_form(36, 0, 13, hook.ms_stg_offset));
-        words.push(encode_branch(entry_address + 40, tail_address, false)?);
+        if let Some(secondary_bgm_id) = override_.secondary_bgm_id {
+            words.extend(encode_u32(0, secondary_bgm_id));
+            words.push(encode_d_form(36, 0, 13, stage_bgm_silent_offset));
+            words.push(encode_li(0, 2));
+            words.push(encode_d_form(38, 0, 13, stage_bgm_silent_status_offset));
+            words.push(encode_li(0, 2));
+            words.push(encode_d_form(38, 0, 13, fade_event_offset));
+        } else {
+            words.extend(std::iter::repeat_n(0x6000_0000, 7));
+        }
+        words.push(encode_branch(entry_address + 68, tail_address, false)?);
     }
     words.push(encode_d_form(32, 4, 13, hook.ms_stg_offset));
     words.push(encode_branch(
@@ -550,6 +819,61 @@ fn build_stage_music_stub(
             .ok_or_else(|| "Stage music resume address overflows u32".to_string())?,
         false,
     )?);
+
+    let wrapper_address = stub_address
+        .checked_add(
+            u32::try_from(words.len() * 4)
+                .map_err(|_| "Stage music wrapper offset does not fit u32".to_string())?,
+        )
+        .ok_or_else(|| "Stage music wrapper address overflows u32".to_string())?;
+    words.extend([
+        0x7c08_02a6, // mflr r0
+        0x9001_0004, // stw r0, 4(r1)
+        0x9421_ffe0, // stwu r1, -32(r1)
+        0x93c1_0018, // stw r30, 24(r1)
+        0x93e1_001c, // stw r31, 28(r1)
+        0x7cbe_2b78, // mr r30, r5
+        0x7cdf_3378, // mr r31, r6
+    ]);
+    let enter_stage_call = wrapper_address + 7 * 4;
+    words.push(encode_branch(
+        enter_stage_call,
+        hook.enter_stage_target,
+        true,
+    )?);
+    let preload_overrides = overrides
+        .iter()
+        .filter_map(|override_| {
+            let secondary = override_.secondary_wave_scene_id?;
+            (secondary != override_.wave_scene_id).then_some((override_, secondary))
+        })
+        .collect::<Vec<_>>();
+    let epilogue_address = wrapper_address
+        .checked_add(
+            u32::try_from((8 + preload_overrides.len() * 8) * 4)
+                .map_err(|_| "Stage music epilogue offset does not fit u32".to_string())?,
+        )
+        .ok_or_else(|| "Stage music epilogue address overflows u32".to_string())?;
+    for (index, (override_, wave_scene)) in preload_overrides.iter().enumerate() {
+        let entry_address = wrapper_address + u32::try_from((8 + index * 8) * 4).unwrap();
+        let next_address = entry_address + 8 * 4;
+        words.push(encode_cmpwi(30, i16::from(override_.area_index)));
+        words.push(encode_bne(entry_address + 4, next_address)?);
+        words.push(encode_cmpwi(31, i16::from(override_.scenario_index)));
+        words.push(encode_bne(entry_address + 12, next_address)?);
+        words.push(encode_li(3, (wave_scene >> 8) as i16));
+        words.push(encode_li(4, (wave_scene & 0xff) as i16));
+        words.push(encode_branch(entry_address + 24, wave_loader, true)?);
+        words.push(encode_branch(entry_address + 28, epilogue_address, false)?);
+    }
+    words.extend([
+        0x8001_0024, // lwz r0, 36(r1)
+        0x83e1_001c, // lwz r31, 28(r1)
+        0x83c1_0018, // lwz r30, 24(r1)
+        0x7c08_03a6, // mtlr r0
+        0x3821_0020, // addi r1, r1, 32
+        PPC_BLR,
+    ]);
     Ok(words)
 }
 
@@ -2198,12 +2522,16 @@ mod tests {
                     scenario_index: 0,
                     bgm_id: 0x8001_0002,
                     wave_scene_id: 0x202,
+                    secondary_bgm_id: Some(0x8001_0003),
+                    secondary_wave_scene_id: Some(0x203),
                 },
                 RuntimeStageMusicOverride {
                     area_index: 17,
                     scenario_index: 1,
                     bgm_id: 0x8001_0001,
                     wave_scene_id: 0x201,
+                    secondary_bgm_id: None,
+                    secondary_wave_scene_id: None,
                 },
             ],
         )
@@ -2258,6 +2586,34 @@ mod tests {
         .unwrap_or_else(|error| panic!("composed direct boot: {error}"));
         parse_dol(&direct.bytes).unwrap();
         assert!(direct.bytes.len() >= music.bytes.len());
+    }
+
+    #[test]
+    #[ignore = "requires SMS_US_RETAIL_DOL"]
+    fn packaged_sound_helper_assignments_patch_retail_tables_by_identity() {
+        let path = PathBuf::from(std::env::var_os("SMS_US_RETAIL_DOL").expect("SMS_US_RETAIL_DOL"));
+        let source = fs::read(&path).unwrap();
+        let patched = patch_sms_sound_assignments_dol(
+            &source,
+            &[
+                RuntimeSoundAssignment {
+                    kind: RuntimeSoundAssignmentKind::MapStatic,
+                    source_name: "SoundObjRiver".to_string(),
+                    original_sound_id: 0x500f,
+                    sound_id: 0x5000,
+                },
+                RuntimeSoundAssignment {
+                    kind: RuntimeSoundAssignmentKind::Graph,
+                    source_name: "ms_sea".to_string(),
+                    original_sound_id: 0x5000,
+                    sound_id: 0x5003,
+                },
+            ],
+        )
+        .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        assert_eq!(patched.len(), source.len());
+        assert_ne!(patched, source);
+        parse_dol(&patched).unwrap();
     }
 
     fn audit_local_binary(path: &Path) {

@@ -33,6 +33,8 @@ pub(super) struct ProjectStageMusic {
     pub(super) wave_scene_id: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) secondary_bgm_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) secondary_wave_scene_id: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,8 +110,6 @@ pub(super) struct SmsProjectFile {
     pub(super) stage_music: BTreeMap<String, ProjectStageMusic>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(super) sound_assignments: BTreeMap<String, ProjectSoundAssignment>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub(super) audio_previews: BTreeMap<String, PathBuf>,
     #[serde(default)]
     pub(super) launch: ProjectLaunchConfiguration,
 }
@@ -135,7 +135,6 @@ impl SmsProjectFile {
             stage_cameras: BTreeMap::new(),
             stage_music: BTreeMap::new(),
             sound_assignments: BTreeMap::new(),
-            audio_previews: BTreeMap::new(),
             launch: ProjectLaunchConfiguration::default(),
         }
     }
@@ -296,6 +295,9 @@ impl SmsProjectFile {
                 || music
                     .secondary_bgm_id
                     .is_some_and(|bgm_id| bgm_id & 0xffff_0000 != 0x8001_0000)
+                || music
+                    .secondary_wave_scene_id
+                    .is_some_and(|wave_scene_id| wave_scene_id == u32::MAX)
         }) {
             return Err(format!(
                 "Project '{}' has an invalid saved stage music override",
@@ -310,22 +312,6 @@ impl SmsProjectFile {
         }) {
             return Err(format!(
                 "Project '{}' has an invalid sound helper assignment",
-                path.display()
-            ));
-        }
-        if self.audio_previews.iter().any(|(key, preview)| {
-            key.trim().is_empty()
-                || preview.as_os_str().is_empty()
-                || preview.is_absolute()
-                || preview.components().any(|component| {
-                    matches!(
-                        component,
-                        Component::ParentDir | Component::RootDir | Component::Prefix(_)
-                    )
-                })
-        }) {
-            return Err(format!(
-                "Project '{}' has an invalid editor audio-preview path",
                 path.display()
             ));
         }
@@ -827,9 +813,19 @@ mod tests {
             ProjectStageMusic {
                 bgm_id: 0x8001_0002,
                 wave_scene_id: 0x202,
+                secondary_bgm_id: Some(0x8001_0023),
+                secondary_wave_scene_id: Some(0x204),
             },
         );
-
+        project.sound_assignments.insert(
+            "graph:ms_sea".to_string(),
+            ProjectSoundAssignment {
+                kind: ProjectSoundAssignmentKind::Graph,
+                source_name: "ms_sea".to_string(),
+                original_sound_id: 0x5000,
+                sound_id: 0x5003,
+            },
+        );
         project.save(&descriptor_path).unwrap();
         let reopened = OpenProject::load(&descriptor_path).unwrap();
 

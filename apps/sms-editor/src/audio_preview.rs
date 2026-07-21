@@ -1,0 +1,1545 @@
+use std::collections::HashMap;
+use std::fs;
+use std::num::NonZeroU16;
+use std::num::NonZeroU32;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use rodio::buffer::SamplesBuffer;
+use rodio::{DeviceSinkBuilder, MixerDeviceSink, Player};
+use sms_formats::{decode_yaz0, RarcArchive};
+
+use crate::SmsEditorApp;
+
+// Sunshine's JAudio/DSP pipeline mixes at the GameCube's nominal 32 kHz rate.
+const OUTPUT_RATE: u32 = 32_000;
+const PREVIEW_SECONDS: f32 = 45.0;
+const MAX_TRACKS: usize = 64;
+const MAX_COMMANDS_PER_TICK: usize = 50_000;
+
+pub(super) struct AudioPreviewPlayback {
+    bgm_id: u32,
+    _device: MixerDeviceSink,
+    player: Player,
+}
+
+impl AudioPreviewPlayback {
+    fn is_playing(&self, bgm_id: u32) -> bool {
+        self.bgm_id == bgm_id && !self.player.empty()
+    }
+}
+
+impl SmsEditorApp {
+    pub(super) fn bgm_preview_transport(&mut self, ui: &mut egui::Ui, bgm_id: u32) {
+        let is_playing = self
+            .audio_preview_playback
+            .as_ref()
+            .is_some_and(|playback| playback.is_playing(bgm_id));
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(!is_playing, egui::Button::new("Preview"))
+                .on_hover_text("Render this track from Sunshine's sequence, instrument-bank, and AW sample data")
+                .clicked()
+            {
+                if let Err(error) = self.play_sunshine_bgm(bgm_id) {
+                    self.log.push(format!("Could not preview Sunshine BGM: {error}"));
+                }
+            }
+            if ui
+                .add_enabled(is_playing, egui::Button::new("Stop"))
+                .clicked()
+            {
+                self.stop_audio_preview();
+            }
+        });
+        ui.small("Preview uses the actual Sunshine sequence, banks, and AW samples from this project's base game.");
+    }
+
+    pub(super) fn se_preview_notice(&self, ui: &mut egui::Ui) {
+        ui.small("Sound-effect preview uses a different JAudio event path; the assigned retail sound is still used by Build Game.");
+    }
+
+    fn play_sunshine_bgm(&mut self, bgm_id: u32) -> Result<(), String> {
+        self.stop_audio_preview();
+        let base_root = self
+            .current_project
+            .as_ref()
+            .map(|project| project.descriptor.base_game_root.clone())
+            .or_else(|| {
+                let root = self.base_root.trim();
+                (!root.is_empty()).then(|| PathBuf::from(root))
+            })
+            .ok_or_else(|| "select a Sunshine base game first".to_string())?;
+        let samples = render_bgm_preview(&base_root, bgm_id, PREVIEW_SECONDS)?;
+        let device = DeviceSinkBuilder::open_default_sink()
+            .map_err(|error| format!("open the default audio output: {error}"))?;
+        let player = Player::connect_new(device.mixer());
+        player.append(SamplesBuffer::new(
+            NonZeroU16::new(2).expect("stereo is nonzero"),
+            NonZeroU32::new(OUTPUT_RATE).expect("output rate is nonzero"),
+            samples,
+        ));
+        self.audio_preview_playback = Some(AudioPreviewPlayback {
+            bgm_id,
+            _device: device,
+            player,
+        });
+        Ok(())
+    }
+
+    pub(super) fn stop_audio_preview(&mut self) {
+        if let Some(playback) = self.audio_preview_playback.take() {
+            playback.player.stop();
+        }
+    }
+}
+
+#[derive(Clone)]
+struct BankRecord {
+    bytes: Arc<Vec<u8>>,
+    wave_bank: usize,
+}
+
+#[derive(Clone)]
+struct WaveRecord {
+    archive: String,
+    format: u8,
+    root_key: u8,
+    sample_rate: f32,
+    offset: usize,
+    byte_len: usize,
+    looped: bool,
+    loop_start: usize,
+    loop_end: usize,
+    sample_count: usize,
+    _loop_history: [i16; 2],
+}
+
+struct AudioAssets {
+    audio_res: PathBuf,
+    sequence: Vec<u8>,
+    sequence_header: Vec<u8>,
+    banks: HashMap<u8, BankRecord>,
+    waves: Vec<HashMap<u16, WaveRecord>>,
+    wave_archives: HashMap<String, Arc<Vec<u8>>>,
+    decoded_waves: HashMap<(usize, u16), Arc<DecodedWave>>,
+}
+
+#[derive(Debug)]
+struct DecodedWave {
+    samples: Vec<f32>,
+    root_key: u8,
+    sample_rate: f32,
+    loop_range: Option<(usize, usize)>,
+}
+
+#[derive(Clone, Copy)]
+struct ReleaseSpec {
+    duration_units: u32,
+    curve: u8,
+}
+
+impl ReleaseSpec {
+    fn direct(encoded: u16) -> Self {
+        let encoded = if encoded == 0 { 0x10 } else { encoded };
+        Self {
+            duration_units: u32::from(encoded & 0x3fff),
+            curve: (encoded >> 14) as u8,
+        }
+    }
+
+    fn frames(self) -> usize {
+        ((self.duration_units as usize * OUTPUT_RATE as usize) / 600).max(1)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct InstrumentRegion {
+    wave_id: u16,
+    volume: f32,
+    pitch: f32,
+    release: ReleaseSpec,
+}
+
+impl AudioAssets {
+    fn load(base_root: &Path) -> Result<Self, String> {
+        let audio_res = find_audio_res(base_root)?;
+        let sequence = fs::read(audio_res.join("Seqs/sequence.arc"))
+            .map_err(|error| format!("read sequence.arc: {error}"))?;
+        let aaf = load_msound_aaf(base_root, &audio_res)?;
+        let (sequence_header, bank_entries, wave_entries) = parse_aaf_tables(&aaf)?;
+        let mut banks = HashMap::new();
+        for (offset, size, wave_bank) in bank_entries {
+            let bytes = checked_slice(&aaf, offset, size, "AAF bank")?.to_vec();
+            let virtual_bank = be_u32(&bytes, 8, "bank number")? as u8;
+            banks.insert(
+                virtual_bank,
+                BankRecord {
+                    bytes: Arc::new(bytes),
+                    wave_bank,
+                },
+            );
+        }
+        let mut waves = Vec::new();
+        for (offset, size, kind) in wave_entries {
+            let bytes = checked_slice(&aaf, offset, size, "AAF wave system")?;
+            waves.push(parse_wave_system(bytes, kind)?);
+        }
+        Ok(Self {
+            audio_res,
+            sequence,
+            sequence_header,
+            banks,
+            waves,
+            wave_archives: HashMap::new(),
+            decoded_waves: HashMap::new(),
+        })
+    }
+
+    fn sequence_for_bgm(&self, bgm_id: u32) -> Result<&[u8], String> {
+        if bgm_id & 0xffff_0000 != 0x8001_0000 {
+            return Err(format!("0x{bgm_id:08X} is not a sequence BGM"));
+        }
+        let mut entry = (bgm_id & 0x3ff) as usize;
+        for _ in 0..16 {
+            let at = (entry + 1)
+                .checked_mul(0x20)
+                .ok_or_else(|| "sequence entry overflow".to_string())?;
+            checked_slice(&self.sequence_header, at, 0x20, "sequence entry")?;
+            let alias = be_u16(&self.sequence_header, at + 0x0e, "sequence alias")?;
+            if alias != 0xffff {
+                entry = alias as usize;
+                continue;
+            }
+            let offset = be_u32(&self.sequence_header, at + 0x18, "sequence offset")? as usize;
+            let size = be_u32(&self.sequence_header, at + 0x1c, "sequence size")? as usize;
+            return checked_slice(&self.sequence, offset, size, "sequence data");
+        }
+        Err("sequence alias chain is too deep".to_string())
+    }
+
+    fn instrument_region(
+        &self,
+        virtual_bank: u8,
+        program: u8,
+        key: u8,
+        velocity: u8,
+    ) -> Result<(usize, InstrumentRegion), String> {
+        let bank = self
+            .banks
+            .get(&virtual_bank)
+            .ok_or_else(|| format!("sequence requested missing virtual bank {virtual_bank}"))?;
+        let bytes = bank.bytes.as_slice();
+        let region = if program < 0x80 {
+            let inst_offset =
+                be_u32(bytes, 0x24 + program as usize * 4, "instrument offset")? as usize;
+            if inst_offset == 0 {
+                return Err(format!("bank {virtual_bank} has no program {program}"));
+            }
+            let inst_volume = be_f32(bytes, inst_offset + 8, "instrument volume")?;
+            let inst_pitch = be_f32(bytes, inst_offset + 0x0c, "instrument pitch")?;
+            let key_count = be_u32(bytes, inst_offset + 0x28, "key-region count")? as usize;
+            let keymap =
+                choose_offset_region(bytes, inst_offset + 0x2c, key_count, key, "key region")?;
+            let velocity_count = be_u32(bytes, keymap + 4, "velocity-region count")? as usize;
+            let vmap = choose_offset_region(
+                bytes,
+                keymap + 8,
+                velocity_count,
+                velocity,
+                "velocity region",
+            )?;
+            let release = instrument_release(bytes, inst_offset)?;
+            parse_vmap(bytes, vmap, inst_volume, inst_pitch, release)?
+        } else if (0xe4..=0xef).contains(&program) {
+            let perc_offset = be_u32(
+                bytes,
+                0x3b4 + (program as usize - 0xe4) * 4,
+                "percussion offset",
+            )? as usize;
+            if perc_offset == 0 {
+                return Err(format!(
+                    "bank {virtual_bank} has no percussion program {program}"
+                ));
+            }
+            let pmap = be_u32(
+                bytes,
+                perc_offset + 0x88 + key as usize * 4,
+                "percussion key offset",
+            )? as usize;
+            if pmap == 0 {
+                return Err(format!("percussion program {program} has no key {key}"));
+            }
+            let volume = be_f32(bytes, pmap, "percussion volume")?;
+            let pitch = be_f32(bytes, pmap + 4, "percussion pitch")?;
+            let velocity_count = be_u32(bytes, pmap + 0x10, "percussion velocity count")? as usize;
+            let vmap = choose_offset_region(
+                bytes,
+                pmap + 0x14,
+                velocity_count,
+                velocity,
+                "percussion velocity region",
+            )?;
+            let release = if be_u32(bytes, perc_offset, "percussion magic")? == 0x5045_5232 {
+                ReleaseSpec::direct(be_u16(
+                    bytes,
+                    perc_offset + 0x308 + key as usize * 2,
+                    "percussion release",
+                )?)
+            } else {
+                // TDrumSet::TPerc initializes this to 1000 when the older PERC
+                // bank layout has no per-key release table.
+                ReleaseSpec::direct(1000)
+            };
+            parse_vmap(bytes, vmap, volume, pitch, release)?
+        } else {
+            return Err(format!("unsupported bank program 0x{program:02X}"));
+        };
+        Ok((bank.wave_bank, region))
+    }
+
+    fn decoded_wave(&mut self, wave_bank: usize, wave_id: u16) -> Result<Arc<DecodedWave>, String> {
+        if let Some(wave) = self.decoded_waves.get(&(wave_bank, wave_id)) {
+            return Ok(Arc::clone(wave));
+        }
+        let record = self
+            .waves
+            .get(wave_bank)
+            .and_then(|bank| bank.get(&wave_id))
+            .cloned()
+            .ok_or_else(|| format!("wave bank {wave_bank} has no wave 0x{wave_id:04X}"))?;
+        if !self.wave_archives.contains_key(&record.archive) {
+            let path = self.audio_res.join("Banks").join(&record.archive);
+            let bytes = fs::read(&path)
+                .map_err(|error| format!("read wave archive '{}': {error}", path.display()))?;
+            self.wave_archives
+                .insert(record.archive.clone(), Arc::new(bytes));
+        }
+        let archive = self
+            .wave_archives
+            .get(&record.archive)
+            .expect("inserted above");
+        let encoded = checked_slice(archive, record.offset, record.byte_len, "wave sample")?;
+        let samples = match record.format {
+            0 => decode_afc(encoded, record.sample_count, AfcQuality::High),
+            1 => decode_afc(encoded, record.sample_count, AfcQuality::Low),
+            2 => encoded
+                .iter()
+                .take(record.sample_count)
+                .map(|sample| (*sample as i8 as f32) / 128.0)
+                .collect(),
+            3 => encoded
+                .chunks_exact(2)
+                .take(record.sample_count)
+                .map(|sample| i16::from_be_bytes([sample[0], sample[1]]) as f32 / 32768.0)
+                .collect(),
+            format => return Err(format!("unsupported JAudio wave format {format}")),
+        };
+        let loop_range = if record.looped && !samples.is_empty() {
+            let start = record.loop_start.min(samples.len().saturating_sub(1));
+            let end = record.loop_end.min(samples.len()).max(start + 1);
+            Some((start, end))
+        } else {
+            None
+        };
+        let wave = Arc::new(DecodedWave {
+            samples,
+            root_key: record.root_key,
+            sample_rate: record.sample_rate,
+            loop_range,
+        });
+        self.decoded_waves
+            .insert((wave_bank, wave_id), Arc::clone(&wave));
+        Ok(wave)
+    }
+}
+
+fn find_audio_res(base_root: &Path) -> Result<PathBuf, String> {
+    [base_root.join("files/AudioRes"), base_root.join("AudioRes")]
+        .into_iter()
+        .find(|path| path.join("Seqs/sequence.arc").is_file())
+        .ok_or_else(|| {
+            format!(
+                "could not find AudioRes/Seqs/sequence.arc under '{}'",
+                base_root.display()
+            )
+        })
+}
+
+fn load_msound_aaf(base_root: &Path, audio_res: &Path) -> Result<Vec<u8>, String> {
+    for path in [
+        audio_res.join("msound.aaf"),
+        base_root.join("files/data/msound.aaf"),
+        base_root.join("data/msound.aaf"),
+    ] {
+        if path.is_file() {
+            return fs::read(&path).map_err(|error| format!("read '{}': {error}", path.display()));
+        }
+    }
+    let archive_path = [
+        base_root.join("files/data/nintendo.szs"),
+        base_root.join("data/nintendo.szs"),
+    ]
+    .into_iter()
+    .find(|path| path.is_file())
+    .ok_or_else(|| "could not find data/nintendo.szs containing audi/msound.aaf".to_string())?;
+    let encoded = fs::read(&archive_path)
+        .map_err(|error| format!("read '{}': {error}", archive_path.display()))?;
+    let decoded = if encoded.starts_with(b"Yaz0") {
+        decode_yaz0(&encoded)
+            .map_err(|error| format!("decode '{}': {error}", archive_path.display()))?
+    } else {
+        encoded
+    };
+    let archive = RarcArchive::parse(&decoded)
+        .map_err(|error| format!("parse '{}': {error}", archive_path.display()))?;
+    archive.file_bytes("audi/msound.aaf").map_err(|error| {
+        format!(
+            "read audi/msound.aaf from '{}': {error}",
+            archive_path.display()
+        )
+    })
+}
+
+type BankEntry = (usize, usize, usize);
+type WaveEntry = (usize, usize, u32);
+
+type AafTables = (Vec<u8>, Vec<BankEntry>, Vec<WaveEntry>);
+
+fn parse_aaf_tables(aaf: &[u8]) -> Result<AafTables, String> {
+    let mut cursor = 0usize;
+    let mut sequence_header = None;
+    let mut banks = Vec::new();
+    let mut waves = Vec::new();
+    for _ in 0..64 {
+        let command = be_u32(aaf, cursor, "AAF command")?;
+        cursor += 4;
+        match command {
+            0 => break,
+            1 => {
+                let offset = be_u32(aaf, cursor, "sound table offset")? as usize;
+                let size = be_u32(aaf, cursor + 4, "sound table size")? as usize;
+                let split = be_u32(aaf, cursor + 8, "sound table split")?;
+                cursor += if split == 0 { 12 } else { 24 };
+                checked_slice(aaf, offset, size, "sound table")?;
+            }
+            2 | 3 => loop {
+                let offset = be_u32(aaf, cursor, "AAF table offset")? as usize;
+                cursor += 4;
+                if offset == 0 {
+                    break;
+                }
+                let size = be_u32(aaf, cursor, "AAF table size")? as usize;
+                let extra = be_u32(aaf, cursor + 4, "AAF table metadata")? as usize;
+                cursor += 8;
+                checked_slice(aaf, offset, size, "AAF table")?;
+                if command == 2 {
+                    banks.push((offset, size, extra));
+                } else {
+                    waves.push((offset, size, extra as u32));
+                }
+            },
+            4..=8 => {
+                let offset = be_u32(aaf, cursor, "AAF resource offset")? as usize;
+                let size = be_u32(aaf, cursor + 4, "AAF resource size")? as usize;
+                cursor += 12;
+                let resource = checked_slice(aaf, offset, size, "AAF resource")?;
+                if command == 4 {
+                    sequence_header = Some(resource.to_vec());
+                }
+            }
+            other => return Err(format!("unsupported msound.aaf command {other}")),
+        }
+    }
+    Ok((
+        sequence_header.ok_or_else(|| "msound.aaf has no sequence archive header".to_string())?,
+        banks,
+        waves,
+    ))
+}
+
+fn parse_wave_system(bytes: &[u8], kind: u32) -> Result<HashMap<u16, WaveRecord>, String> {
+    if kind != 2 {
+        return Err(format!("unsupported JAudio wave-bank kind {kind}"));
+    }
+    let archive_bank = be_u32(bytes, 0x10, "wave archive bank")? as usize;
+    let control_group = be_u32(bytes, 0x14, "wave control group")? as usize;
+    let group_count = be_u32(bytes, control_group + 8, "wave group count")? as usize;
+    let mut result = HashMap::new();
+    for group in 0..group_count {
+        let scene = be_u32(bytes, control_group + 0x0c + group * 4, "wave scene")? as usize;
+        let control = be_u32(bytes, scene + 0x0c, "wave control")? as usize;
+        let archive = be_u32(bytes, archive_bank + 8 + group * 4, "wave archive")? as usize;
+        let wave_count = be_u32(bytes, control + 4, "wave count")? as usize;
+        let archive_name = c_string(checked_slice(bytes, archive, 0x74, "wave archive name")?);
+        for index in 0..wave_count {
+            let ctrl_wave = be_u32(bytes, control + 8 + index * 4, "control wave")? as usize;
+            let wave_id = be_u32(bytes, ctrl_wave, "virtual wave id")? as u16;
+            let wave = be_u32(bytes, archive + 0x74 + index * 4, "wave record")? as usize;
+            checked_slice(bytes, wave, 0x2c, "wave record")?;
+            result.insert(
+                wave_id,
+                WaveRecord {
+                    archive: archive_name.clone(),
+                    format: bytes[wave + 1],
+                    root_key: bytes[wave + 2],
+                    sample_rate: be_f32(bytes, wave + 4, "wave sample rate")?,
+                    offset: be_u32(bytes, wave + 8, "wave offset")? as usize,
+                    byte_len: be_u32(bytes, wave + 0x0c, "wave byte length")? as usize,
+                    looped: be_u32(bytes, wave + 0x10, "wave loop flag")? != 0,
+                    loop_start: be_u32(bytes, wave + 0x14, "wave loop start")? as usize,
+                    loop_end: be_u32(bytes, wave + 0x18, "wave loop end")? as usize,
+                    sample_count: be_u32(bytes, wave + 0x1c, "wave sample count")? as usize,
+                    _loop_history: [
+                        be_i16(bytes, wave + 0x20, "wave history 1")?,
+                        be_i16(bytes, wave + 0x22, "wave history 2")?,
+                    ],
+                },
+            );
+        }
+    }
+    Ok(result)
+}
+
+fn choose_offset_region(
+    bytes: &[u8],
+    table: usize,
+    count: usize,
+    value: u8,
+    label: &str,
+) -> Result<usize, String> {
+    if count == 0 || count > 256 {
+        return Err(format!("invalid {label} count {count}"));
+    }
+    let mut last = None;
+    for index in 0..count {
+        let offset = be_u32(bytes, table + index * 4, label)? as usize;
+        checked_slice(bytes, offset, 4, label)?;
+        last = Some(offset);
+        if value <= bytes[offset] {
+            return Ok(offset);
+        }
+    }
+    last.ok_or_else(|| format!("empty {label}"))
+}
+
+fn parse_vmap(
+    bytes: &[u8],
+    offset: usize,
+    volume: f32,
+    pitch: f32,
+    release: ReleaseSpec,
+) -> Result<InstrumentRegion, String> {
+    Ok(InstrumentRegion {
+        wave_id: be_u32(bytes, offset + 4, "wave id")? as u16,
+        volume: volume * be_f32(bytes, offset + 8, "region volume")?,
+        pitch: pitch * be_f32(bytes, offset + 0x0c, "region pitch")?,
+        release,
+    })
+}
+
+fn instrument_release(bytes: &[u8], inst_offset: usize) -> Result<ReleaseSpec, String> {
+    for index in 0..2 {
+        let osc_offset = be_u32(
+            bytes,
+            inst_offset + 0x10 + index * 4,
+            "instrument oscillator offset",
+        )? as usize;
+        if osc_offset == 0 {
+            continue;
+        }
+        checked_slice(bytes, osc_offset, 0x18, "instrument oscillator")?;
+        if bytes[osc_offset] != 0 {
+            continue;
+        }
+        let table_offset = be_u32(bytes, osc_offset + 0x0c, "release table offset")? as usize;
+        if table_offset == 0 {
+            return Ok(ReleaseSpec::direct(0x10));
+        }
+        return parse_release_table(bytes, table_offset);
+    }
+    Ok(ReleaseSpec::direct(0x10))
+}
+
+fn parse_release_table(bytes: &[u8], mut offset: usize) -> Result<ReleaseSpec, String> {
+    let mut duration_units = 0u32;
+    let mut curve = 0u8;
+    for _ in 0..256 {
+        let mode = be_i16(bytes, offset, "release envelope mode")?;
+        let time = be_i16(bytes, offset + 2, "release envelope time")?;
+        let _value = be_i16(bytes, offset + 4, "release envelope value")?;
+        offset += 6;
+        match mode {
+            0..=3 => {
+                curve = mode as u8;
+                duration_units = duration_units.saturating_add(time.max(0) as u32);
+            }
+            13 => {
+                // Release envelopes should not loop. If malformed data does,
+                // fall back to JAudio's short direct-release behavior.
+                return Ok(ReleaseSpec::direct(0x10));
+            }
+            14 | 15 => break,
+            _ => return Err(format!("unsupported release envelope mode {mode}")),
+        }
+    }
+    if duration_units == 0 {
+        Ok(ReleaseSpec::direct(0x10))
+    } else {
+        Ok(ReleaseSpec {
+            duration_units,
+            curve,
+        })
+    }
+}
+
+// Fixed AFC predictor table uploaded by Sunshine's JAudio driver to the DSP.
+const AFC_FILTERS: [(i32, i32); 16] = [
+    (0x0000, 0x0000),
+    (0x0800, 0x0000),
+    (0x0000, 0x0800),
+    (0x0400, 0x0400),
+    (0x1000, -0x0800),
+    (0x0e00, -0x0600),
+    (0x0c00, -0x0400),
+    (0x1200, -0x0a00),
+    (0x1068, -0x08c8),
+    (0x12c0, -0x08fc),
+    (0x1400, -0x0c00),
+    (0x0800, -0x0800),
+    (0x0400, -0x0400),
+    (-0x0400, 0x0400),
+    (-0x0400, 0x0000),
+    (-0x0800, 0x0000),
+];
+
+#[derive(Clone, Copy)]
+enum AfcQuality {
+    High,
+    Low,
+}
+
+fn decode_afc(encoded: &[u8], sample_count: usize, quality: AfcQuality) -> Vec<f32> {
+    let mut output = Vec::with_capacity(sample_count);
+    let mut hist1 = 0i32;
+    let mut hist2 = 0i32;
+    let block_bytes = match quality {
+        AfcQuality::High => 9,
+        AfcQuality::Low => 5,
+    };
+    for frame in encoded.chunks(block_bytes) {
+        if frame.len() < block_bytes || output.len() >= sample_count {
+            break;
+        }
+        let delta = 1i32 << ((frame[0] >> 4) & 0x0f);
+        let (coef1, coef2) = AFC_FILTERS[(frame[0] & 0x0f) as usize];
+        let mut residuals = [0i32; 16];
+        match quality {
+            AfcQuality::High => {
+                for (index, packed) in frame[1..].iter().enumerate() {
+                    for (half, nibble) in [packed >> 4, packed & 0x0f].into_iter().enumerate() {
+                        residuals[index * 2 + half] = if nibble >= 8 {
+                            nibble as i32 - 16
+                        } else {
+                            nibble as i32
+                        };
+                    }
+                }
+            }
+            AfcQuality::Low => {
+                for (index, packed) in frame[1..].iter().enumerate() {
+                    for quarter in 0..4 {
+                        let bits = (packed >> (6 - quarter * 2)) & 3;
+                        residuals[index * 4 + quarter] = (if bits >= 2 {
+                            bits as i32 - 4
+                        } else {
+                            bits as i32
+                        }) * 4;
+                    }
+                }
+            }
+        }
+        for residual in residuals {
+            if output.len() >= sample_count {
+                break;
+            }
+            let sample = ((delta * residual * 2048 + coef1 * hist1 + coef2 * hist2) >> 11)
+                .clamp(i16::MIN as i32, i16::MAX as i32);
+            hist2 = hist1;
+            hist1 = sample;
+            output.push(sample as f32 / 32768.0);
+        }
+    }
+    output
+}
+
+// First 0x100 signed coefficients from JAudio's DSPRES_FILTER. Sunshine's DSP
+// selects one four-tap row using the upper six bits of the 12-bit phase.
+const RESAMPLE_FILTER: [i16; 256] = [
+    3129, 26285, 3398, -33, 2873, 26262, 3679, -40, 2628, 26217, 3971, -48, 2394, 26150, 4276, -56,
+    2173, 26061, 4592, -65, 1963, 25950, 4920, -74, 1764, 25817, 5260, -84, 1576, 25663, 5611, -95,
+    1399, 25487, 5974, -106, 1233, 25291, 6347, -118, 1077, 25075, 6732, -130, 932, 24838, 7127,
+    -143, 796, 24583, 7532, -156, 671, 24309, 7947, -170, 554, 24016, 8371, -184, 446, 23706, 8804,
+    -198, 347, 23379, 9246, -212, 257, 23036, 9696, -226, 174, 22678, 10153, -240, 99, 22304,
+    10618, -254, 31, 21917, 11088, -268, -30, 21517, 11564, -280, -84, 21104, 12045, -293, -132,
+    20679, 12531, -304, -173, 20244, 13020, -314, -210, 19799, 13512, -323, -241, 19345, 14006,
+    -330, -267, 18882, 14501, -336, -289, 18413, 14997, -340, -306, 17937, 15493, -341, -320,
+    17456, 15988, -340, -330, 16970, 16480, -337, -337, 16480, 16970, -330, -340, 15988, 17456,
+    -320, -341, 15493, 17937, -306, -340, 14997, 18413, -289, -336, 14501, 18882, -267, -330,
+    14006, 19345, -241, -323, 13512, 19799, -210, -314, 13020, 20244, -173, -304, 12531, 20679,
+    -132, -293, 12045, 21104, -84, -280, 11564, 21517, -30, -268, 11088, 21917, 31, -254, 10618,
+    22304, 99, -240, 10153, 22678, 174, -226, 9696, 23036, 257, -212, 9246, 23379, 347, -198, 8804,
+    23706, 446, -184, 8371, 24016, 554, -170, 7947, 24309, 671, -156, 7532, 24583, 796, -143, 7127,
+    24838, 932, -130, 6732, 25075, 1077, -118, 6347, 25291, 1233, -106, 5974, 25487, 1399, -95,
+    5611, 25663, 1576, -84, 5260, 25817, 1764, -74, 4920, 25950, 1963, -65, 4592, 26061, 2173, -56,
+    4276, 26150, 2394, -48, 3971, 26217, 2628, -40, 3679, 26262, 2873, -33, 3398, 26285, 3129,
+];
+
+#[derive(Clone)]
+struct Track {
+    pc: usize,
+    wait: u32,
+    finished: bool,
+    transpose: i16,
+    registers: [u16; 64],
+    volume: f32,
+    pitch: f32,
+    pan: f32,
+    tempo: u16,
+    timebase: u16,
+    call_stack: Vec<usize>,
+    loop_stack: Vec<(usize, u16)>,
+    slots: [Option<u64>; 8],
+}
+
+impl Track {
+    fn new(pc: usize) -> Self {
+        let mut registers = [0; 64];
+        registers[6] = 0x00f0;
+        registers[14] = 12;
+        Self {
+            pc,
+            wait: 0,
+            finished: false,
+            transpose: 0,
+            registers,
+            volume: 1.0,
+            pitch: 0.0,
+            pan: 0.5,
+            tempo: 120,
+            timebase: 48,
+            call_stack: Vec::new(),
+            loop_stack: Vec::new(),
+            slots: [None; 8],
+        }
+    }
+
+    fn reg(&self, register: u8) -> u16 {
+        match register {
+            0x20 => self.registers[6] >> 8,
+            0x21 => self.registers[6] & 0xff,
+            0x22 => (self.registers[0] << 8) | (self.registers[1] & 0xff),
+            _ => self.registers.get(register as usize).copied().unwrap_or(0),
+        }
+    }
+
+    fn set_reg(&mut self, register: u8, value: u16) {
+        match register {
+            0..=2 => self.registers[register as usize] = sign_extend_8(value as u8),
+            0x20 => self.registers[6] = (value << 8) | (self.registers[6] & 0xff),
+            0x21 => self.registers[6] = (self.registers[6] & 0xff00) | (value & 0xff),
+            0x22 => {
+                self.registers[0] = sign_extend_8((value >> 8) as u8);
+                self.registers[1] = sign_extend_8(value as u8);
+            }
+            _ if (register as usize) < self.registers.len() => {
+                self.registers[register as usize] = value
+            }
+            _ => {}
+        }
+        self.registers[3] = value;
+    }
+}
+
+struct Voice {
+    id: u64,
+    wave: Arc<DecodedWave>,
+    position: f64,
+    step: f64,
+    volume: f32,
+    pan: f32,
+    release: ReleaseSpec,
+    release_samples: usize,
+    release_total_samples: usize,
+    release_start_gain: f32,
+    releasing: bool,
+    age: usize,
+    ticks_remaining: Option<u32>,
+}
+
+fn render_bgm_preview(base_root: &Path, bgm_id: u32, seconds: f32) -> Result<Vec<f32>, String> {
+    let mut assets = AudioAssets::load(base_root)?;
+    let sequence = assets.sequence_for_bgm(bgm_id)?.to_vec();
+    let mut tracks = vec![Track::new(0)];
+    let mut voices = Vec::<Voice>::new();
+    let mut next_voice_id = 1u64;
+    let max_frames = (OUTPUT_RATE as f32 * seconds) as usize;
+    let mut output = Vec::with_capacity(max_frames * 2);
+    let mut commands = 0usize;
+    let mut sequence_frame_clock = 0.0f64;
+    let mut mixed_sequence_frames = 0usize;
+
+    while output.len() / 2 < max_frames && tracks.iter().any(|track| !track.finished) {
+        let mut track_index = 0usize;
+        while track_index < tracks.len() {
+            if tracks[track_index].finished {
+                track_index += 1;
+                continue;
+            }
+            let mut children = Vec::new();
+            if sequence_tick_ready(&mut tracks[track_index]) {
+                process_track(
+                    &sequence,
+                    &mut tracks[track_index],
+                    &mut assets,
+                    &mut voices,
+                    &mut children,
+                    &mut next_voice_id,
+                    &mut commands,
+                )?;
+            }
+            if commands > MAX_COMMANDS_PER_TICK * (output.len() / 2 + 1) {
+                return Err("sequence exceeded the preview command safety limit".to_string());
+            }
+            for offset in children {
+                if tracks.len() >= MAX_TRACKS {
+                    return Err("sequence opened too many tracks".to_string());
+                }
+                // JASTrack::mainProc visits a newly opened child later in the
+                // same sequence update, so it must not lose its first tick.
+                tracks.push(Track::new(offset));
+            }
+            track_index += 1;
+        }
+        let root = &tracks[0];
+        sequence_frame_clock +=
+            (OUTPUT_RATE as f64 * 60.0) / (root.tempo.max(1) as f64 * root.timebase.max(1) as f64);
+        let target_frames = sequence_frame_clock.round().max(1.0) as usize;
+        let tick_frames = target_frames.saturating_sub(mixed_sequence_frames);
+        mixed_sequence_frames = target_frames;
+        mix_voices(&mut output, &mut voices, tick_frames, max_frames);
+    }
+    if output.is_empty() {
+        return Err("the selected sequence produced no preview audio".to_string());
+    }
+    Ok(output)
+}
+
+fn sequence_tick_ready(track: &mut Track) -> bool {
+    if track.wait > 0 {
+        track.wait -= 1;
+    }
+    track.wait == 0
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_track(
+    sequence: &[u8],
+    track: &mut Track,
+    assets: &mut AudioAssets,
+    voices: &mut Vec<Voice>,
+    children: &mut Vec<usize>,
+    next_voice_id: &mut u64,
+    commands: &mut usize,
+) -> Result<(), String> {
+    for _ in 0..MAX_COMMANDS_PER_TICK {
+        *commands += 1;
+        let flag = read_u8(sequence, &mut track.pc, "sequence command")?;
+        if flag < 0x80 {
+            let mode = read_u8(sequence, &mut track.pc, "note mode")?;
+            let mut note = flag.wrapping_add(track.transpose as u8);
+            if mode & 0x80 != 0 {
+                note = track.reg(note).wrapping_add(track.transpose as u16) as u8;
+            }
+            let velocity_raw = read_u8(sequence, &mut track.pc, "note velocity")?;
+            let velocity = if velocity_raw >= 0x80 {
+                track.reg(velocity_raw - 0x80) as u8
+            } else {
+                velocity_raw
+            };
+            let (slot, duration, gate) = if mode & 7 == 0 {
+                let gate_raw = read_u8(sequence, &mut track.pc, "note gate")?;
+                let gate = if gate_raw >= 0x80 {
+                    track.reg(gate_raw - 0x80) as u8
+                } else {
+                    gate_raw
+                };
+                let width = ((mode >> 3) & 3) as usize;
+                let mut duration = 0u32;
+                for _ in 0..width {
+                    duration =
+                        (duration << 8) | read_u8(sequence, &mut track.pc, "note duration")? as u32;
+                }
+                (0usize, Some(duration), gate)
+            } else {
+                let mut slot = (mode & 7) as usize;
+                if (mode >> 3) & 3 != 0 {
+                    slot = track.reg((slot - 1) as u8) as usize;
+                }
+                (slot.min(7), None, 100)
+            };
+            let bank = (track.registers[6] >> 8) as u8;
+            let program = track.registers[6] as u8;
+            let gate_ticks =
+                duration.map(|duration| (duration as u64 * gate as u64 / 100).max(1) as u32);
+            if let Ok((wave_bank, region)) = assets.instrument_region(bank, program, note, velocity)
+            {
+                if let Ok(wave) = assets.decoded_wave(wave_bank, region.wave_id) {
+                    let semitones = note as f32 - wave.root_key as f32 + track.pitch * 48.0;
+                    let step = wave.sample_rate as f64 / OUTPUT_RATE as f64
+                        * 2.0f64.powf(semitones as f64 / 12.0)
+                        * region.pitch as f64;
+                    let id = *next_voice_id;
+                    *next_voice_id += 1;
+                    if let Some(previous) = track.slots[slot].take() {
+                        if let Some(voice) = voices.iter_mut().find(|voice| voice.id == previous) {
+                            begin_release(voice, None);
+                        }
+                    }
+                    voices.push(Voice {
+                        id,
+                        wave,
+                        position: 0.0,
+                        step,
+                        volume: (velocity as f32 / 127.0).powi(2) * region.volume * track.volume,
+                        pan: track.pan.clamp(0.0, 1.0),
+                        release: region.release,
+                        release_samples: 0,
+                        release_total_samples: 0,
+                        release_start_gain: 1.0,
+                        releasing: false,
+                        age: 0,
+                        ticks_remaining: gate_ticks,
+                    });
+                    track.slots[slot] = Some(id);
+                }
+            }
+            if let Some(duration) = duration {
+                track.wait = duration.max(1);
+                return Ok(());
+            }
+        } else if flag & 0xf0 == 0x80 && flag & 7 == 0 {
+            track.wait = if flag == 0x80 {
+                read_u8(sequence, &mut track.pc, "wait")? as u32
+            } else {
+                read_be_value(sequence, &mut track.pc, 2, "wait")?
+            };
+            if track.wait > 0 {
+                return Ok(());
+            }
+        } else if flag & 0xf0 == 0x80 || flag == 0xf9 {
+            let mut slot = (flag & 0x0f) as usize;
+            let mut direct_release = None;
+            if flag == 0xf9 {
+                let encoded = read_u8(sequence, &mut track.pc, "registered note off")?;
+                slot = track.reg(encoded & 7) as usize;
+                if encoded & 0x80 != 0 {
+                    direct_release = Some(read_u8(sequence, &mut track.pc, "note release")?);
+                }
+            } else if flag & 8 != 0 {
+                slot -= 8;
+                direct_release = Some(read_u8(sequence, &mut track.pc, "note release")?);
+            }
+            if let Some(id) = track.slots[slot.min(7)].take() {
+                if let Some(voice) = voices.iter_mut().find(|voice| voice.id == id) {
+                    begin_release(
+                        voice,
+                        direct_release
+                            .filter(|release| *release != 0)
+                            .map(u16::from),
+                    );
+                }
+            }
+        } else if flag & 0xf0 == 0x90 {
+            parse_time_param(sequence, track, flag & 0x0f)?;
+        } else if flag & 0xf0 == 0xa0 {
+            parse_register_param(sequence, track, flag & 0x0f)?;
+        } else if flag & 0xf0 == 0xb0 {
+            let command = read_u8(sequence, &mut track.pc, "registered command")?;
+            let command = if flag & 8 != 0 {
+                track.reg(command) as u8
+            } else {
+                command
+            };
+            let mut override_types = 0u16;
+            if flag & 8 == 0 || flag & 7 != 0 {
+                let mask = read_u8(sequence, &mut track.pc, "registered argument mask")?;
+                for index in 0..=(flag & 7) {
+                    if mask & (0x80 >> index) != 0 {
+                        override_types |= 3 << (index * 2);
+                    }
+                }
+            }
+            if process_command(sequence, track, command, override_types, children, voices)? {
+                return Ok(());
+            }
+        } else if process_command(sequence, track, flag, 0, children, voices)? {
+            return Ok(());
+        }
+        if track.finished {
+            return Ok(());
+        }
+    }
+    Err("sequence command loop did not yield".to_string())
+}
+
+const COMMAND_ARGS: [(u16, u16); 64] = [
+    (0, 0),
+    (2, 0x0008),
+    (2, 0x0008),
+    (1, 0x0002),
+    (0, 0),
+    (0, 0),
+    (1, 0),
+    (1, 0x0002),
+    (0, 0),
+    (1, 0x0001),
+    (0, 0),
+    (2, 0),
+    (2, 0x000c),
+    (1, 0),
+    (1, 0),
+    (1, 0x0003),
+    (2, 0x0005),
+    (2, 0x000c),
+    (2, 0x000c),
+    (0, 0),
+    (1, 0),
+    (1, 0),
+    (1, 0),
+    (2, 0x0008),
+    (5, 0x0155),
+    (1, 0),
+    (1, 0),
+    (1, 0),
+    (1, 0x0001),
+    (2, 0x0004),
+    (1, 0),
+    (2, 0x0008),
+    (1, 0),
+    (0, 0),
+    (0, 0),
+    (0, 0),
+    (2, 0x0004),
+    (0, 0),
+    (0, 0),
+    (1, 0x0001),
+    (0, 0),
+    (0, 0),
+    (1, 0x0002),
+    (5, 0),
+    (4, 0x0055),
+    (1, 0x0002),
+    (1, 0x0002),
+    (3, 0),
+    (1, 0),
+    (1, 0),
+    (3, 0x0028),
+    (1, 0),
+    (0, 0),
+    (0, 0),
+    (0, 0),
+    (0, 0),
+    (0, 0),
+    (0, 0),
+    (1, 0x0001),
+    (0, 0),
+    (0, 0),
+    (1, 0x0001),
+    (1, 0x0001),
+    (0, 0),
+];
+
+fn process_command(
+    sequence: &[u8],
+    track: &mut Track,
+    command: u8,
+    override_types: u16,
+    children: &mut Vec<usize>,
+    voices: &mut [Voice],
+) -> Result<bool, String> {
+    if command == 0xc4 || command == 0xc8 {
+        let condition = read_u8(sequence, &mut track.pc, "branch condition")?;
+        let offset = if condition & 0x80 != 0 {
+            let register = read_u8(sequence, &mut track.pc, "branch register")?;
+            track.reg(register) as usize
+        } else {
+            read_be_value(sequence, &mut track.pc, 3, "branch offset")? as usize
+        };
+        if condition_matches(track.reg(3), condition) {
+            if command == 0xc4 {
+                track.call_stack.push(track.pc);
+            }
+            track.pc = offset;
+        }
+        return Ok(false);
+    }
+    let index = command
+        .checked_sub(0xc0)
+        .ok_or_else(|| format!("invalid sequence command 0x{command:02X}"))?
+        as usize;
+    let (count, mut types) = COMMAND_ARGS[index];
+    types |= override_types;
+    let mut args = [0u32; 8];
+    for value in args.iter_mut().take(count as usize) {
+        *value = match types & 3 {
+            0 => read_u8(sequence, &mut track.pc, "command argument")? as u32,
+            1 => read_be_value(sequence, &mut track.pc, 2, "command argument")?,
+            2 => read_be_value(sequence, &mut track.pc, 3, "command argument")?,
+            _ => {
+                let register = read_u8(sequence, &mut track.pc, "command register")?;
+                track.reg(register) as u32
+            }
+        };
+        types >>= 2;
+    }
+    match command {
+        0xc1 | 0xc2 => children.push(args[1] as usize),
+        0xc6 if condition_matches(track.reg(3), args[0] as u8) => {
+            if let Some(pc) = track.call_stack.pop() {
+                track.pc = pc;
+            } else {
+                track.finished = true;
+            }
+        }
+        0xc9 => track.loop_stack.push((track.pc, args[0] as u16)),
+        0xca => {
+            if let Some((pc, remaining)) = track.loop_stack.last_mut() {
+                if *remaining == 0 || *remaining > 1 {
+                    if *remaining > 1 {
+                        *remaining -= 1;
+                    }
+                    track.pc = *pc;
+                } else {
+                    track.loop_stack.pop();
+                }
+            }
+        }
+        0xcf | 0xea => {
+            track.wait = args[0];
+            return Ok(track.wait > 0);
+        }
+        0xd9 => track.transpose = args[0] as u8 as i8 as i16,
+        0xe7 => track.set_reg(3, 0),
+        0xe8 | 0xe9 => {
+            for voice in voices {
+                begin_release(voice, None);
+            }
+            track.slots = [None; 8];
+        }
+        0xfb => skip_printf(sequence, track)?,
+        0xfd => track.tempo = args[0].max(1) as u16,
+        0xfe => track.timebase = args[0].max(1) as u16,
+        0xff => track.finished = true,
+        _ => {}
+    }
+    Ok(track.finished)
+}
+
+fn parse_time_param(sequence: &[u8], track: &mut Track, mode: u8) -> Result<(), String> {
+    let target = read_u8(sequence, &mut track.pc, "time parameter")?;
+    let raw = match mode & 0x0c {
+        0 => {
+            let register = read_u8(sequence, &mut track.pc, "time parameter register")?;
+            track.reg(register) as i16
+        }
+        4 => read_u8(sequence, &mut track.pc, "time parameter value")? as i16,
+        8 => {
+            let byte = read_u8(sequence, &mut track.pc, "time parameter value")? as u16;
+            if byte & 0x80 != 0 {
+                (byte << 8) as i16
+            } else {
+                ((byte << 8) | (byte << 1)) as i16
+            }
+        }
+        _ => read_be_value(sequence, &mut track.pc, 2, "time parameter value")? as u16 as i16,
+    };
+    match mode & 3 {
+        1 => {
+            let _ = read_u8(sequence, &mut track.pc, "time duration register")?;
+        }
+        2 => {
+            let _ = read_u8(sequence, &mut track.pc, "time duration")?;
+        }
+        3 => {
+            let _ = read_be_value(sequence, &mut track.pc, 2, "time duration")?;
+        }
+        _ => {}
+    }
+    let value = raw as f32 / 32768.0;
+    match target {
+        0 => track.volume = value.max(0.0),
+        1 => track.pitch = value,
+        3 => track.pan = value,
+        _ => {}
+    }
+    Ok(())
+}
+
+fn parse_register_param(sequence: &[u8], track: &mut Track, mut mode: u8) -> Result<(), String> {
+    let mut operation = mode & 3;
+    let mut source_kind = mode & 0x0c;
+    if mode == 0x0b {
+        operation = 0x0b;
+        source_kind = 0;
+    }
+    if mode == 0x09 {
+        mode = read_u8(sequence, &mut track.pc, "extended register operation")?;
+        source_kind = mode & 0x0c;
+        operation = mode & 0xf0;
+    }
+    let destination = read_u8(sequence, &mut track.pc, "register destination")?;
+    let source = match source_kind {
+        0 => {
+            let reg = read_u8(sequence, &mut track.pc, "register source")?;
+            track.reg(reg) as i16 as i32
+        }
+        4 => read_u8(sequence, &mut track.pc, "register immediate")? as i32,
+        8 => {
+            let byte = read_u8(sequence, &mut track.pc, "register immediate")? as u16;
+            if byte & 0x80 != 0 {
+                (byte << 8) as i16 as i32
+            } else {
+                ((byte << 8) | (byte << 1)) as i16 as i32
+            }
+        }
+        _ => read_be_value(sequence, &mut track.pc, 2, "register immediate")? as u16 as i16 as i32,
+    };
+    let current = track.reg(destination) as i16 as i32;
+    let result = match operation {
+        0 => source,
+        1 => current.wrapping_add(source),
+        2 => current.wrapping_mul(source),
+        3 | 0x0b => current.wrapping_sub(source),
+        0x10 => {
+            if source < 0 {
+                ((current as u16) >> (-source).min(15)) as i32
+            } else {
+                ((current as u16) << source.min(15)) as i32
+            }
+        }
+        0x20 => {
+            if source < 0 {
+                current >> (-source).min(15)
+            } else {
+                current << source.min(15)
+            }
+        }
+        0x30 => current & source,
+        0x40 => current | source,
+        0x50 => current ^ source,
+        0x60 => -current,
+        _ => source,
+    };
+    track.set_reg(destination, result as u16);
+    Ok(())
+}
+
+fn skip_printf(sequence: &[u8], track: &mut Track) -> Result<(), String> {
+    let mut substitutions = 0usize;
+    loop {
+        let byte = read_u8(sequence, &mut track.pc, "printf string")?;
+        if byte == 0 {
+            break;
+        }
+        if byte == b'\\' {
+            let _ = read_u8(sequence, &mut track.pc, "printf escape")?;
+        }
+        if byte == b'%' {
+            let _ = read_u8(sequence, &mut track.pc, "printf format")?;
+            substitutions += 1;
+        }
+    }
+    for _ in 0..substitutions {
+        let _ = read_u8(sequence, &mut track.pc, "printf register")?;
+    }
+    Ok(())
+}
+
+fn condition_matches(value: u16, condition: u8) -> bool {
+    match condition & 0x0f {
+        0 => true,
+        1 => value == 0,
+        2 => value != 0,
+        3 => value == 1,
+        4 => value >= 0x8000,
+        5 => value < 0x8000,
+        _ => false,
+    }
+}
+
+fn mix_voices(output: &mut Vec<f32>, voices: &mut Vec<Voice>, frames: usize, max_frames: usize) {
+    let frames = frames.min(max_frames.saturating_sub(output.len() / 2));
+    for _ in 0..frames {
+        let mut left = 0.0f32;
+        let mut right = 0.0f32;
+        for voice in voices.iter_mut() {
+            let index = voice.position as usize;
+            if voice.wave.loop_range.is_none() && index >= voice.wave.samples.len() {
+                voice.releasing = true;
+                voice.release_samples = 0;
+                continue;
+            }
+            let attack = (voice.age as f32 / 240.0).min(1.0);
+            let release = if voice.releasing {
+                voice.release_start_gain
+                    * release_curve(
+                        voice.release.curve,
+                        voice.release_samples as f32 / voice.release_total_samples.max(1) as f32,
+                    )
+            } else {
+                attack
+            };
+            let sample = resample_voice(voice) * voice.volume * release;
+            left += sample * (1.0 - voice.pan).sqrt();
+            right += sample * voice.pan.sqrt();
+            voice.position += voice.step;
+            voice.age += 1;
+            if voice.releasing {
+                voice.release_samples = voice.release_samples.saturating_sub(1);
+            }
+        }
+        output.push(left.clamp(-1.0, 32767.0 / 32768.0));
+        output.push(right.clamp(-1.0, 32767.0 / 32768.0));
+        voices.retain(|voice| !voice.releasing || voice.release_samples > 0);
+    }
+    for voice in voices.iter_mut().filter(|voice| !voice.releasing) {
+        if let Some(remaining) = &mut voice.ticks_remaining {
+            *remaining = remaining.saturating_sub(1);
+            if *remaining == 0 {
+                begin_release(voice, None);
+            }
+        }
+    }
+}
+
+fn begin_release(voice: &mut Voice, direct: Option<u16>) {
+    if voice.releasing {
+        return;
+    }
+    if let Some(direct) = direct {
+        voice.release = ReleaseSpec::direct(direct);
+    }
+    voice.releasing = true;
+    voice.ticks_remaining = None;
+    voice.release_total_samples = voice.release.frames();
+    voice.release_samples = voice.release_total_samples;
+    voice.release_start_gain = (voice.age as f32 / 240.0).min(1.0);
+}
+
+fn release_curve(curve: u8, remaining: f32) -> f32 {
+    let remaining = remaining.clamp(0.0, 1.0);
+    match curve {
+        1 => remaining.sqrt(),
+        2 => remaining * remaining,
+        3 => {
+            const SAMPLE_CELL: [f32; 17] = [
+                1.0, 0.970489, 0.781274, 0.546281, 0.399792, 0.289315, 0.212104, 0.157476,
+                0.112613, 0.0817896, 0.0579852, 0.0436415, 0.0308237, 0.0237129, 0.0152593,
+                0.00915555, 0.0,
+            ];
+            let position = (1.0 - remaining) * 16.0;
+            let index = (position as usize).min(15);
+            let fraction = position - index as f32;
+            SAMPLE_CELL[index] + fraction * (SAMPLE_CELL[index + 1] - SAMPLE_CELL[index])
+        }
+        _ => remaining,
+    }
+}
+
+fn resample_voice(voice: &mut Voice) -> f32 {
+    if let Some((start, end)) = voice.wave.loop_range {
+        let index = voice.position as usize;
+        if index >= end {
+            let length = end.saturating_sub(start).max(1);
+            voice.position =
+                (start + index.saturating_sub(start) % length) as f64 + voice.position.fract();
+        }
+    }
+    let base = voice.position as usize;
+    let phase = ((voice.position.fract() * 4096.0) as usize >> 6).min(63);
+    let coefficients = &RESAMPLE_FILTER[phase * 4..phase * 4 + 4];
+    let mut result = 0.0f32;
+    for (tap, coefficient) in coefficients.iter().enumerate() {
+        result += wave_sample(&voice.wave, base + tap) * (2.0 * f32::from(*coefficient) / 65536.0);
+    }
+    result.clamp(-1.0, 32767.0 / 32768.0)
+}
+
+fn wave_sample(wave: &DecodedWave, mut index: usize) -> f32 {
+    if let Some((start, end)) = wave.loop_range {
+        if index >= end {
+            let length = end.saturating_sub(start).max(1);
+            index = start + index.saturating_sub(start) % length;
+        }
+    }
+    wave.samples.get(index).copied().unwrap_or(0.0)
+}
+fn sign_extend_8(value: u8) -> u16 {
+    value as i8 as i16 as u16
+}
+
+fn read_u8(bytes: &[u8], cursor: &mut usize, label: &str) -> Result<u8, String> {
+    let value = *bytes
+        .get(*cursor)
+        .ok_or_else(|| format!("{label} reads past end"))?;
+    *cursor += 1;
+    Ok(value)
+}
+
+fn read_be_value(
+    bytes: &[u8],
+    cursor: &mut usize,
+    width: usize,
+    label: &str,
+) -> Result<u32, String> {
+    let slice = checked_slice(bytes, *cursor, width, label)?;
+    *cursor += width;
+    Ok(slice
+        .iter()
+        .fold(0, |value, byte| (value << 8) | *byte as u32))
+}
+
+fn checked_slice<'a>(
+    bytes: &'a [u8],
+    offset: usize,
+    size: usize,
+    label: &str,
+) -> Result<&'a [u8], String> {
+    let end = offset
+        .checked_add(size)
+        .ok_or_else(|| format!("{label} range overflow"))?;
+    bytes.get(offset..end).ok_or_else(|| {
+        format!(
+            "{label} range 0x{offset:X}..0x{end:X} exceeds 0x{:X}",
+            bytes.len()
+        )
+    })
+}
+
+fn be_u16(bytes: &[u8], offset: usize, label: &str) -> Result<u16, String> {
+    let bytes = checked_slice(bytes, offset, 2, label)?;
+    Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
+}
+
+fn be_i16(bytes: &[u8], offset: usize, label: &str) -> Result<i16, String> {
+    Ok(be_u16(bytes, offset, label)? as i16)
+}
+
+fn be_u32(bytes: &[u8], offset: usize, label: &str) -> Result<u32, String> {
+    let bytes = checked_slice(bytes, offset, 4, label)?;
+    Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+fn be_f32(bytes: &[u8], offset: usize, label: &str) -> Result<f32, String> {
+    Ok(f32::from_bits(be_u32(bytes, offset, label)?))
+}
+
+fn c_string(bytes: &[u8]) -> String {
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn afc_zero_blocks_decode_to_silence() {
+        assert_eq!(decode_afc(&[0; 9], 16, AfcQuality::High), vec![0.0; 16]);
+        assert_eq!(decode_afc(&[0; 5], 16, AfcQuality::Low), vec![0.0; 16]);
+        let mut high = [0u8; 9];
+        high[0] = 0x10;
+        high[1] = 0x10;
+        assert_eq!(decode_afc(&high, 1, AfcQuality::High), vec![2.0 / 32768.0]);
+        let mut low = [0u8; 5];
+        low[0] = 0x10;
+        low[1] = 0x40;
+        assert_eq!(decode_afc(&low, 1, AfcQuality::Low), vec![8.0 / 32768.0]);
+    }
+
+    #[test]
+    fn condition_codes_match_jas_sequence_parser() {
+        assert!(condition_matches(0, 1));
+        assert!(condition_matches(2, 2));
+        assert!(condition_matches(1, 3));
+        assert!(condition_matches(0x8000, 4));
+        assert!(condition_matches(0x7fff, 5));
+    }
+
+    #[test]
+    fn wait_expiration_resumes_on_the_same_sequence_tick() {
+        let mut track = Track::new(0);
+        track.wait = 2;
+        assert!(!sequence_tick_ready(&mut track));
+        assert_eq!(track.wait, 1);
+        assert!(sequence_tick_ready(&mut track));
+        assert_eq!(track.wait, 0);
+    }
+
+    #[test]
+    fn jas_release_lengths_and_curves_are_preserved() {
+        assert_eq!(ReleaseSpec::direct(0).duration_units, 0x10);
+        assert_eq!(ReleaseSpec::direct(1000).frames(), 53_333);
+        assert_eq!(ReleaseSpec::direct(0xc258).curve, 3);
+
+        let table = [
+            0x00, 0x03, 0x02, 0x58, 0x00, 0x00, // sample-cell fade for 600 units
+            0x00, 0x0f, 0x00, 0x00, 0x00, 0x00, // end
+        ];
+        let release = parse_release_table(&table, 0).unwrap();
+        assert_eq!(release.duration_units, 600);
+        assert_eq!(release.frames(), OUTPUT_RATE as usize);
+        assert_eq!(release.curve, 3);
+        assert_eq!(release_curve(0, 0.5), 0.5);
+        assert!(release_curve(3, 0.5) < 0.12);
+    }
+
+    #[test]
+    #[ignore = "requires an extracted retail Sunshine base in SMS_BASE_ROOT"]
+    fn renders_real_sunshine_bgm() {
+        let root = std::env::var_os("SMS_BASE_ROOT").expect("SMS_BASE_ROOT");
+        let samples = render_bgm_preview(Path::new(&root), 0x8001_0023, 1.0).unwrap();
+        assert_eq!(samples.len(), OUTPUT_RATE as usize * 2);
+        assert!(samples.iter().any(|sample| sample.abs() > 0.0001));
+    }
+
+    #[test]
+    #[ignore = "requires an extracted retail Sunshine base in SMS_BASE_ROOT"]
+    fn renders_every_decomp_mapped_sunshine_bgm() {
+        let root = PathBuf::from(std::env::var_os("SMS_BASE_ROOT").expect("SMS_BASE_ROOT"));
+        let source = fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../src/MSound/MSoundBGM.cpp"),
+        )
+        .unwrap();
+        let mapping =
+            regex::Regex::new(r"(?s)case\s+(0x[0-9A-Fa-f]+)\s*:\s*return\s+(0x[0-9A-Fa-f]+)\s*;")
+                .unwrap();
+        let mut failures = Vec::new();
+        for captures in mapping.captures_iter(&source) {
+            let bgm_id = u32::from_str_radix(captures[1].trim_start_matches("0x"), 16).unwrap();
+            if bgm_id & 0xffff_0000 != 0x8001_0000 {
+                continue;
+            }
+            match render_bgm_preview(&root, bgm_id, 2.0) {
+                Ok(samples) if samples.iter().any(|sample| sample.abs() > 0.0001) => {}
+                Ok(_) => failures.push(format!("0x{bgm_id:08X}: silent")),
+                Err(error) => failures.push(format!("0x{bgm_id:08X}: {error}")),
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+}

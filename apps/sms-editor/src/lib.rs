@@ -33,6 +33,7 @@ use sms_scene::{
 use sms_schema::{ObjectDefinition, ObjectRegistry, ParticleBindingTarget, SchemaGenerator};
 
 mod audio_helpers;
+mod audio_preview;
 mod camera;
 mod direct_boot;
 mod document_commands;
@@ -53,6 +54,7 @@ mod ui_panels;
 mod viewport_ui;
 
 use audio_helpers::*;
+use audio_preview::*;
 use game_text::*;
 use model_assets::*;
 use music_library::*;
@@ -207,6 +209,7 @@ struct LoadedStage {
     skybox_warnings: Vec<String>,
     retail_music: Vec<RetailMusicEntry>,
     retail_sounds: Vec<RetailSoundEntry>,
+    retail_stage_audio: Vec<RetailStageAudioProfile>,
     music_warning: Option<String>,
 }
 
@@ -242,6 +245,7 @@ struct SceneScanResult {
     skybox_warnings: Vec<String>,
     retail_music: Vec<RetailMusicEntry>,
     retail_sounds: Vec<RetailSoundEntry>,
+    retail_stage_audio: Vec<RetailStageAudioProfile>,
     music_warning: Option<String>,
 }
 
@@ -768,6 +772,7 @@ struct SmsEditorApp {
     retail_skyboxes: Vec<RetailSkyboxEntry>,
     retail_music: Vec<RetailMusicEntry>,
     retail_sounds: Vec<RetailSoundEntry>,
+    retail_stage_audio: Vec<RetailStageAudioProfile>,
     model_preview: Option<ModelPreview>,
     gpu_viewport: Option<gpu_viewport::GpuViewportScene>,
     gpu_target_format: Option<eframe::wgpu::TextureFormat>,
@@ -836,6 +841,7 @@ struct SmsEditorApp {
     selected_audio_helper_id: Option<String>,
     audio_cube_edit_before: Option<StageArchiveEdits>,
     audio_cube_helpers_cache: Vec<AudioHelper>,
+    audio_preview_playback: Option<AudioPreviewPlayback>,
     outliner_filter: String,
     startup_camera_focus: Option<[f32; 3]>,
     route_mode: bool,
@@ -976,6 +982,7 @@ impl Default for SmsEditorApp {
             retail_skyboxes: Vec::new(),
             retail_music: Vec::new(),
             retail_sounds: Vec::new(),
+            retail_stage_audio: Vec::new(),
             model_preview: None,
             gpu_viewport: None,
             gpu_target_format: None,
@@ -1044,6 +1051,7 @@ impl Default for SmsEditorApp {
             selected_audio_helper_id: None,
             audio_cube_edit_before: None,
             audio_cube_helpers_cache: Vec::new(),
+            audio_preview_playback: None,
             outliner_filter: String::new(),
             route_mode: false,
             show_all_routes: true,
@@ -1389,8 +1397,13 @@ impl SmsEditorApp {
                     Ok(entries) => (entries, None),
                     Err(error) => (Vec::new(), Some(error)),
                 };
-                let retail_sounds = index_retail_sounds(Path::new(&task_base_root))
-                    .unwrap_or_default();
+                let retail_sounds =
+                    index_retail_sounds(Path::new(&task_base_root)).unwrap_or_default();
+                let retail_stage_audio = index_retail_stage_audio_profiles(
+                    Path::new(&repo_root),
+                    Path::new(&task_base_root),
+                )
+                .unwrap_or_default();
                 Ok(SceneScanResult {
                     archives,
                     labels,
@@ -1399,6 +1412,7 @@ impl SmsEditorApp {
                     skybox_warnings,
                     retail_music,
                     retail_sounds,
+                    retail_stage_audio,
                     music_warning,
                 })
             })();
@@ -1531,8 +1545,10 @@ impl SmsEditorApp {
                     Ok(entries) => (entries, None),
                     Err(error) => (Vec::new(), Some(error)),
                 };
-                let retail_sounds =
-                    index_retail_sounds(Path::new(&base_root)).unwrap_or_default();
+                let retail_sounds = index_retail_sounds(Path::new(&base_root)).unwrap_or_default();
+                let retail_stage_audio =
+                    index_retail_stage_audio_profiles(Path::new(&repo_root), Path::new(&base_root))
+                        .unwrap_or_default();
                 let scene = RenderScene::from_document(&document);
                 let preview = SmsEditorApp::build_model_preview(&document, visibility);
                 Ok(Box::new(LoadedStage {
@@ -1555,6 +1571,7 @@ impl SmsEditorApp {
                     skybox_warnings,
                     retail_music,
                     retail_sounds,
+                    retail_stage_audio,
                     music_warning,
                 }))
             })();
@@ -1635,6 +1652,7 @@ impl SmsEditorApp {
                             self.retail_skyboxes = scan.retail_skyboxes;
                             self.retail_music = scan.retail_music;
                             self.retail_sounds = scan.retail_sounds;
+                            self.retail_stage_audio = scan.retail_stage_audio;
                             self.last_scanned_base_root = base_root;
                             if self.stage_id.trim().is_empty() {
                                 if let Some(first) = self.scene_archives.first() {
@@ -1654,9 +1672,8 @@ impl SmsEditorApp {
                             self.log.push(format!(
                                 "Indexed {music_count} decomp-derived stage music choice(s)."
                             ));
-                            self.log.push(format!(
-                                "Indexed {sound_count} exact retail sound name(s)."
-                            ));
+                            self.log
+                                .push(format!("Indexed {sound_count} exact retail sound name(s)."));
                             for warning in scan.skybox_warnings {
                                 self.log.push(warning);
                             }
@@ -1823,6 +1840,7 @@ impl SmsEditorApp {
     }
 
     fn apply_loaded_stage(&mut self, loaded: LoadedStage) {
+        self.stop_audio_preview();
         let LoadedStage {
             base_root,
             requested_project_root,
@@ -1843,6 +1861,7 @@ impl SmsEditorApp {
             skybox_warnings,
             retail_music,
             retail_sounds,
+            retail_stage_audio,
             music_warning,
         } = loaded;
         if self.base_root.trim() != base_root {
@@ -1919,6 +1938,7 @@ impl SmsEditorApp {
         self.retail_skyboxes = retail_skyboxes;
         self.retail_music = retail_music;
         self.retail_sounds = retail_sounds;
+        self.retail_stage_audio = retail_stage_audio;
         self.last_scanned_base_root = self.base_root.trim().to_string();
         self.log.push(format!(
             "Opened stage '{}' with {} asset(s), {} model(s), {} collision file(s). You can add typed object classes with automatic dependencies from the content browser.",

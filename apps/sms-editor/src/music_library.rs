@@ -24,6 +24,15 @@ pub(super) struct RetailSoundEntry {
     pub(super) label: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RetailStageAudioProfile {
+    pub(super) stage_id: String,
+    pub(super) primary_bgm_id: Option<u32>,
+    pub(super) wave_scene_id: Option<u32>,
+    pub(super) secondary_bgm_id: Option<u32>,
+    pub(super) fade_event: u8,
+}
+
 pub(super) fn index_retail_music(
     repo_root: &Path,
     base_root: &Path,
@@ -188,6 +197,340 @@ pub(super) fn index_retail_sounds(base_root: &Path) -> Result<Vec<RetailSoundEnt
     extract_retail_sound_entries(&bytes)
 }
 
+pub(super) fn index_retail_stage_audio_profiles(
+    repo_root: &Path,
+    base_root: &Path,
+) -> Result<Vec<RetailStageAudioProfile>, String> {
+    let bgm_source_path = repo_root.join("src/MSound/MSoundBGM.cpp");
+    let stage_source_path = repo_root.join("src/System/MSoundMainSide.cpp");
+    let scene_by_bgm = extract_bgm_wave_scenes(
+        &fs::read_to_string(&bgm_source_path)
+            .map_err(|error| format!("read {}: {error}", bgm_source_path.display()))?,
+    )?;
+    let stage_source = fs::read_to_string(&stage_source_path)
+        .map_err(|error| format!("read {}: {error}", stage_source_path.display()))?;
+    let entries = load_stage_archive_entries(base_root)?;
+    let mut profiles = Vec::new();
+    for entry in entries {
+        let Some(stage_id) = Path::new(&entry.archive_name)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+        else {
+            continue;
+        };
+        let Some(state) =
+            evaluate_stage_audio_source(&stage_source, entry.area_index, entry.scenario_index)
+        else {
+            continue;
+        };
+        profiles.push(RetailStageAudioProfile {
+            stage_id: stage_id.to_ascii_lowercase(),
+            primary_bgm_id: state.primary_bgm_id,
+            wave_scene_id: state
+                .primary_bgm_id
+                .and_then(|bgm_id| scene_by_bgm.get(&bgm_id).copied()),
+            secondary_bgm_id: state.secondary_bgm_id,
+            fade_event: state.fade_event,
+        });
+    }
+    profiles.sort_by(|left, right| left.stage_id.cmp(&right.stage_id));
+    profiles.dedup_by(|left, right| left.stage_id == right.stage_id);
+    Ok(profiles)
+}
+
+fn load_stage_archive_entries(
+    base_root: &Path,
+) -> Result<Vec<sms_formats::JDramaScenarioArchiveEntry>, String> {
+    let candidates = [
+        base_root.join("files/data/stageArc.bin"),
+        base_root.join("data/stageArc.bin"),
+        base_root.join("stageArc.bin"),
+    ];
+    let path = candidates
+        .into_iter()
+        .find(|path| path.is_file())
+        .ok_or_else(|| "could not locate the extracted stageArc.bin".to_string())?;
+    parse_jdrama_scenario_archive_entries(
+        &fs::read(&path).map_err(|error| format!("read {}: {error}", path.display()))?,
+    )
+    .map_err(|error| format!("parse {}: {error}", path.display()))
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct EvaluatedStageAudio {
+    primary_bgm_id: Option<u32>,
+    secondary_bgm_id: Option<u32>,
+    fade_event: u8,
+}
+
+fn evaluate_stage_audio_source(source: &str, map: u32, area: u32) -> Option<EvaluatedStageAudio> {
+    let function = source.find("void MSMainProc::setMSoundEnterStage")?;
+    let open = source[function..].find('{')? + function;
+    let close = matching_delimiter(source, open, b'{', b'}')?;
+    let mut state = EvaluatedStageAudio::default();
+    evaluate_audio_block(&source[open + 1..close], map, area, &mut state);
+    Some(state)
+}
+
+fn evaluate_audio_block(block: &str, map: u32, area: u32, state: &mut EvaluatedStageAudio) -> bool {
+    let mut cursor = 0;
+    while cursor < block.len() {
+        cursor = skip_cpp_space_and_comments(block, cursor);
+        if cursor >= block.len() {
+            break;
+        }
+        if keyword_at(block, cursor, "break") {
+            return true;
+        }
+        if keyword_at(block, cursor, "case") || keyword_at(block, cursor, "default") {
+            cursor = block[cursor..]
+                .find(':')
+                .map_or(block.len(), |offset| cursor + offset + 1);
+            continue;
+        }
+        if keyword_at(block, cursor, "switch") {
+            let Some(paren) = block[cursor..].find('(').map(|offset| cursor + offset) else {
+                break;
+            };
+            let Some(paren_end) = matching_delimiter(block, paren, b'(', b')') else {
+                break;
+            };
+            let selector = block[paren + 1..paren_end].trim();
+            let body_start = skip_cpp_space_and_comments(block, paren_end + 1);
+            if block.as_bytes().get(body_start) != Some(&b'{') {
+                cursor = paren_end + 1;
+                continue;
+            }
+            let Some(body_end) = matching_delimiter(block, body_start, b'{', b'}') else {
+                break;
+            };
+            let value = match selector {
+                "map" => Some(map),
+                "area" => Some(area),
+                _ => None,
+            };
+            if let Some(value) = value {
+                if let Some(case_start) = switch_case_start(&block[body_start + 1..body_end], value)
+                {
+                    evaluate_audio_block(
+                        &block[body_start + 1 + case_start..body_end],
+                        map,
+                        area,
+                        state,
+                    );
+                }
+            }
+            cursor = body_end + 1;
+            continue;
+        }
+        if keyword_at(block, cursor, "if") {
+            let Some(paren) = block[cursor..].find('(').map(|offset| cursor + offset) else {
+                break;
+            };
+            let Some(paren_end) = matching_delimiter(block, paren, b'(', b')') else {
+                break;
+            };
+            let mut condition = evaluate_area_condition(&block[paren + 1..paren_end], area);
+            let mut branch_start = skip_cpp_space_and_comments(block, paren_end + 1);
+            let Some((branch, mut after_branch)) = cpp_statement(block, branch_start) else {
+                break;
+            };
+            let mut selected = false;
+            if condition == Some(true) {
+                evaluate_audio_block(branch, map, area, state);
+                selected = true;
+            }
+            loop {
+                let else_at = skip_cpp_space_and_comments(block, after_branch);
+                if !keyword_at(block, else_at, "else") {
+                    cursor = after_branch;
+                    break;
+                }
+                branch_start = skip_cpp_space_and_comments(block, else_at + 4);
+                if keyword_at(block, branch_start, "if") {
+                    let Some(next_paren) = block[branch_start..]
+                        .find('(')
+                        .map(|offset| branch_start + offset)
+                    else {
+                        cursor = branch_start + 2;
+                        break;
+                    };
+                    let Some(next_paren_end) = matching_delimiter(block, next_paren, b'(', b')')
+                    else {
+                        cursor = next_paren + 1;
+                        break;
+                    };
+                    condition =
+                        evaluate_area_condition(&block[next_paren + 1..next_paren_end], area);
+                    branch_start = skip_cpp_space_and_comments(block, next_paren_end + 1);
+                } else {
+                    condition = Some(true);
+                }
+                let Some((next_branch, next_after)) = cpp_statement(block, branch_start) else {
+                    cursor = branch_start;
+                    break;
+                };
+                if !selected && condition == Some(true) {
+                    evaluate_audio_block(next_branch, map, area, state);
+                    selected = true;
+                }
+                after_branch = next_after;
+            }
+            continue;
+        }
+        let end = block[cursor..]
+            .find(';')
+            .map_or(block.len(), |offset| cursor + offset + 1);
+        apply_audio_statement(&block[cursor..end], state);
+        cursor = end;
+    }
+    false
+}
+
+fn apply_audio_statement(statement: &str, state: &mut EvaluatedStageAudio) {
+    let bgm_assignment =
+        Regex::new(r"base\s*\+\s*(0x[0-9A-Fa-f]+)").expect("static BGM assignment regex is valid");
+    for (field, destination) in [
+        (
+            "stageBgmSilent",
+            &mut state.secondary_bgm_id as &mut Option<u32>,
+        ),
+        ("stageBgm", &mut state.primary_bgm_id),
+    ] {
+        let marker = format!("MSStageInfo::{field}");
+        let Some(start) = statement.find(&marker) else {
+            continue;
+        };
+        if statement
+            .as_bytes()
+            .get(start + marker.len())
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        {
+            continue;
+        }
+        let Some(equal) = statement[start + marker.len()..].find('=') else {
+            continue;
+        };
+        let rhs = statement[start + marker.len() + equal + 1..].trim();
+        *destination = if rhs.starts_with("cMSBgmNone") {
+            None
+        } else {
+            bgm_assignment
+                .captures(rhs)
+                .and_then(|captures| parse_hex(&captures[1]).ok())
+                .map(|offset| BGM_BASE + offset)
+        };
+        return;
+    }
+    if let Some(start) = statement.find("MSStageInfo::fadeEvent") {
+        if let Some(equal) = statement[start..].find('=') {
+            let rhs = statement[start + equal + 1..]
+                .trim()
+                .trim_end_matches(';')
+                .trim();
+            if let Ok(value) = rhs.parse::<u8>() {
+                state.fade_event = value;
+            }
+        }
+    }
+}
+
+fn evaluate_area_condition(condition: &str, area: u32) -> Option<bool> {
+    let comparison = Regex::new(r"^\s*area\s*(==|!=)\s*(\d+)\s*$")
+        .expect("static area condition regex is valid");
+    let captures = comparison.captures(condition)?;
+    let expected = captures[2].parse::<u32>().ok()?;
+    Some(if &captures[1] == "==" {
+        area == expected
+    } else {
+        area != expected
+    })
+}
+
+fn cpp_statement(source: &str, start: usize) -> Option<(&str, usize)> {
+    if source.as_bytes().get(start) == Some(&b'{') {
+        let end = matching_delimiter(source, start, b'{', b'}')?;
+        Some((&source[start + 1..end], end + 1))
+    } else {
+        let end = source[start..].find(';')? + start;
+        Some((&source[start..end + 1], end + 1))
+    }
+}
+
+fn switch_case_start(block: &str, value: u32) -> Option<usize> {
+    let case = Regex::new(r"(?m)^\s*case\s+(\d+)\s*:").expect("static switch case regex is valid");
+    let mut depth = 0_i32;
+    for captures in case.captures_iter(block) {
+        let matched = captures.get(0)?;
+        for byte in block.as_bytes()[..matched.start()].iter().rev() {
+            match byte {
+                b'}' => depth += 1,
+                b'{' => depth -= 1,
+                _ => {}
+            }
+        }
+        if depth == 0 && captures[1].parse::<u32>().ok()? == value {
+            return Some(matched.end());
+        }
+        depth = 0;
+    }
+    None
+}
+
+fn keyword_at(source: &str, offset: usize, keyword: &str) -> bool {
+    source.get(offset..offset + keyword.len()) == Some(keyword)
+        && source
+            .as_bytes()
+            .get(offset + keyword.len())
+            .is_none_or(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_')
+}
+
+fn skip_cpp_space_and_comments(source: &str, mut offset: usize) -> usize {
+    loop {
+        while source
+            .as_bytes()
+            .get(offset)
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
+            offset += 1;
+        }
+        if source
+            .get(offset..)
+            .is_some_and(|tail| tail.starts_with("//"))
+        {
+            offset = source[offset..]
+                .find('\n')
+                .map_or(source.len(), |end| offset + end + 1);
+            continue;
+        }
+        if source
+            .get(offset..)
+            .is_some_and(|tail| tail.starts_with("/*"))
+        {
+            offset = source[offset + 2..]
+                .find("*/")
+                .map_or(source.len(), |end| offset + 2 + end + 2);
+            continue;
+        }
+        return offset;
+    }
+}
+
+fn matching_delimiter(source: &str, open: usize, open_byte: u8, close_byte: u8) -> Option<usize> {
+    let mut depth = 0_u32;
+    for (relative, byte) in source.as_bytes()[open..].iter().copied().enumerate() {
+        if byte == open_byte {
+            depth += 1;
+        } else if byte == close_byte {
+            depth = depth.checked_sub(1)?;
+            if depth == 0 {
+                return Some(open + relative);
+            }
+        }
+    }
+    None
+}
+
 fn load_retail_sound_assignment_bytes(base_root: &Path) -> Result<Vec<u8>, String> {
     let candidates = [
         base_root.join("files/AudioRes/mSound.asn"),
@@ -219,7 +562,10 @@ fn extract_retail_sound_entries(bytes: &[u8]) -> Result<Vec<RetailSoundEntry>, S
         if !(symbol.starts_with("MSD_SE_") || symbol.starts_with("MSD_XX_")) {
             continue;
         }
-        let sound_id = u32::from(u16::from_be_bytes([record[NAME_SIZE], record[NAME_SIZE + 1]]));
+        let sound_id = u32::from(u16::from_be_bytes([
+            record[NAME_SIZE],
+            record[NAME_SIZE + 1],
+        ]));
         let entry = RetailSoundEntry {
             sound_id,
             symbol: symbol.to_string(),
@@ -290,6 +636,7 @@ fn friendly_bgm_name(symbol: &str) -> String {
         "MONTE_NIGHT" => "Pianta Village Night",
         "TIME_IVENT" => "Timed Event",
         "MONTE_RESCUE" => "Pianta Rescue",
+        "MERRY_GO_ROUND" => "Merry-Go-Round",
         "CAMERA_KAGE" => "Shadow Mario Camera",
         "GAMEOVER" => "Game Over",
         "BOSSHANA_2ND3RD" => "Polluted Piranha (2nd/3rd)",
@@ -367,6 +714,7 @@ impl SmsEditorApp {
                 .push(format!("Could not save stage music selection: {error}"));
             return;
         }
+        self.rebuild_audio_cube_helpers_cache();
         self.log.push(match music {
             Some(music) => format!(
                 "Set stage '{stage_id}' music to BGM 0x{:08X} (wave scene 0x{:X}).",
@@ -473,7 +821,11 @@ mod tests {
     fn indexes_real_retail_sound_catalog() {
         let base_root = std::env::var_os("SMS_BASE_ROOT").expect("SMS_BASE_ROOT");
         let entries = index_retail_sounds(Path::new(&base_root)).unwrap();
-        assert!(entries.len() >= 1_500, "found only {} sounds", entries.len());
+        assert!(
+            entries.len() >= 1_500,
+            "found only {} sounds",
+            entries.len()
+        );
         assert_eq!(
             entries
                 .iter()
@@ -481,5 +833,24 @@ mod tests {
                 .map(|entry| entry.symbol.as_str()),
             Some("MSD_SE_EV_GLOBAL_SEA_L")
         );
+    }
+
+    #[test]
+    #[ignore = "requires SMS_DECOMP_ROOT and SMS_BASE_ROOT"]
+    fn evaluates_real_pinna_crossfade_assignments() {
+        let repo_root = std::env::var_os("SMS_DECOMP_ROOT").expect("SMS_DECOMP_ROOT");
+        let base_root = std::env::var_os("SMS_BASE_ROOT").expect("SMS_BASE_ROOT");
+        let profiles =
+            index_retail_stage_audio_profiles(Path::new(&repo_root), Path::new(&base_root))
+                .unwrap();
+        let pinna = profiles
+            .iter()
+            .find(|profile| {
+                profile.primary_bgm_id == Some(0x8001_0005)
+                    && profile.secondary_bgm_id == Some(0x8001_0023)
+            })
+            .unwrap_or_else(|| panic!("no Pinna crossfade profile in {profiles:#?}"));
+        assert_eq!(pinna.wave_scene_id, Some(0x204));
+        assert_eq!(pinna.fade_event, 2);
     }
 }

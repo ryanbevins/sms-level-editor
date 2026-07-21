@@ -154,6 +154,8 @@ impl SmsEditorApp {
         let scene_labels = self.scene_labels.clone();
         let retail_skyboxes = self.retail_skyboxes.clone();
         let retail_music = self.retail_music.clone();
+        let retail_sounds = self.retail_sounds.clone();
+        let retail_stage_audio = self.retail_stage_audio.clone();
         let existing_object_authoring_catalog_cache = self
             .reusable_object_authoring_catalog_cache(Path::new(&base_root), self.registry.as_ref());
         let existing_registry = self.registry.clone();
@@ -265,6 +267,8 @@ impl SmsEditorApp {
                     retail_skyboxes,
                     skybox_warnings: Vec::new(),
                     retail_music,
+                    retail_sounds,
+                    retail_stage_audio,
                     music_warning: None,
                 }))
             })();

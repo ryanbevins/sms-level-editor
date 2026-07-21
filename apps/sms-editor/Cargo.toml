@@ -12,6 +12,7 @@ eframe.workspace = true
 egui.workspace = true
 rfd = "0.17.2"
 regex.workspace = true
+rodio = "0.22.2"
 serde.workspace = true
 serde_json.workspace = true
 sms-authoring.workspace = true

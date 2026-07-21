@@ -12,10 +12,16 @@ use sms_formats::{
 use sms_scene::StageDocument;
 
 use crate::direct_boot::{
-    patch_sms_direct_boot_dol, patch_sms_stage_music_dol, RuntimeStageMusicOverride,
+    patch_sms_direct_boot_dol, patch_sms_sound_assignments_dol, patch_sms_stage_music_dol,
+    RuntimeSoundAssignment, RuntimeSoundAssignmentKind, RuntimeStageMusicOverride,
     RuntimeStageTarget,
 };
-use crate::project::{normalized_absolute_with_missing_tail, path_is_same_or_child, OpenProject};
+#[cfg(test)]
+use crate::project::ProjectSoundAssignment;
+use crate::project::{
+    normalized_absolute_with_missing_tail, path_is_same_or_child, OpenProject,
+    ProjectSoundAssignmentKind,
+};
 
 const MANAGED_BUILD_MARKER_NAME: &str = ".smsbuild-owner.toml";
 const MANAGED_BUILD_MARKER_KIND: &str = "sms-editor-managed-build";
@@ -197,60 +203,65 @@ fn install_managed_stage_music(
     run: &ManagedRunMirrorOutcome,
     cancelled: &AtomicBool,
 ) -> Result<(), String> {
-    if project.descriptor.stage_music.is_empty() {
+    if project.descriptor.stage_music.is_empty() && project.descriptor.sound_assignments.is_empty()
+    {
         return Ok(());
     }
     check_cancelled(cancelled)?;
-    let stage_table = find_case_insensitive_path(
-        &run.run_root,
-        &["files", "data", "stageArc.bin"],
-        "runtime stage archive table",
-    )?;
-    let entries =
-        parse_jdrama_scenario_archive_entries(&fs::read(&stage_table).map_err(|error| {
-            format!(
-                "Could not read runtime stage archive table '{}': {error}",
-                stage_table.display()
-            )
-        })?)
-        .map_err(|error| {
-            format!(
-                "Could not parse runtime stage archive table '{}': {error}",
-                stage_table.display()
-            )
-        })?;
     let mut overrides = Vec::new();
-    for (stage_id, music) in &project.descriptor.stage_music {
-        let matching = entries
-            .iter()
-            .filter(|entry| {
-                runtime_archive_stem(&entry.archive_name)
-                    .is_some_and(|stem| stem.eq_ignore_ascii_case(stage_id))
-            })
-            .collect::<Vec<_>>();
-        if matching.is_empty() {
-            return Err(format!(
-                "Stage music override '{}' is not mapped by the packaged stageArc.bin",
-                stage_id
-            ));
-        }
-        for entry in matching {
-            overrides.push(RuntimeStageMusicOverride {
-                area_index: u8::try_from(entry.area_index).map_err(|_| {
-                    format!(
-                        "Stage music area {} for '{}' does not fit Sunshine's u8 game sequence",
-                        entry.area_index, stage_id
-                    )
-                })?,
-                scenario_index: u8::try_from(entry.scenario_index).map_err(|_| {
-                    format!(
-                        "Stage music scenario {} for '{}' does not fit Sunshine's u8 game sequence",
-                        entry.scenario_index, stage_id
-                    )
-                })?,
-                bgm_id: music.bgm_id,
-                wave_scene_id: music.wave_scene_id,
-            });
+    if !project.descriptor.stage_music.is_empty() {
+        let stage_table = find_case_insensitive_path(
+            &run.run_root,
+            &["files", "data", "stageArc.bin"],
+            "runtime stage archive table",
+        )?;
+        let entries =
+            parse_jdrama_scenario_archive_entries(&fs::read(&stage_table).map_err(|error| {
+                format!(
+                    "Could not read runtime stage archive table '{}': {error}",
+                    stage_table.display()
+                )
+            })?)
+            .map_err(|error| {
+                format!(
+                    "Could not parse runtime stage archive table '{}': {error}",
+                    stage_table.display()
+                )
+            })?;
+        for (stage_id, music) in &project.descriptor.stage_music {
+            let matching = entries
+                .iter()
+                .filter(|entry| {
+                    runtime_archive_stem(&entry.archive_name)
+                        .is_some_and(|stem| stem.eq_ignore_ascii_case(stage_id))
+                })
+                .collect::<Vec<_>>();
+            if matching.is_empty() {
+                return Err(format!(
+                    "Stage music override '{}' is not mapped by the packaged stageArc.bin",
+                    stage_id
+                ));
+            }
+            for entry in matching {
+                overrides.push(RuntimeStageMusicOverride {
+                    area_index: u8::try_from(entry.area_index).map_err(|_| {
+                        format!(
+                            "Stage music area {} for '{}' does not fit Sunshine's u8 game sequence",
+                            entry.area_index, stage_id
+                        )
+                    })?,
+                    scenario_index: u8::try_from(entry.scenario_index).map_err(|_| {
+                        format!(
+                            "Stage music scenario {} for '{}' does not fit Sunshine's u8 game sequence",
+                            entry.scenario_index, stage_id
+                        )
+                    })?,
+                    bgm_id: music.bgm_id,
+                    wave_scene_id: music.wave_scene_id,
+                    secondary_bgm_id: music.secondary_bgm_id,
+                    secondary_wave_scene_id: music.secondary_wave_scene_id,
+                });
+            }
         }
     }
     overrides.sort_by_key(|override_| (override_.area_index, override_.scenario_index));
@@ -261,14 +272,39 @@ fn install_managed_stage_music(
             run.run_main_dol.display()
         )
     })?;
-    let patched = patch_sms_stage_music_dol(&source_dol, &overrides).map_err(|error| {
-        format!(
-            "Could not install packaged stage music into '{}': {error}",
-            run.run_main_dol.display()
-        )
-    })?;
+    let sound_assignments = project
+        .descriptor
+        .sound_assignments
+        .values()
+        .map(|assignment| RuntimeSoundAssignment {
+            kind: match assignment.kind {
+                ProjectSoundAssignmentKind::MapStatic => RuntimeSoundAssignmentKind::MapStatic,
+                ProjectSoundAssignmentKind::Graph => RuntimeSoundAssignmentKind::Graph,
+            },
+            source_name: assignment.source_name.clone(),
+            original_sound_id: assignment.original_sound_id,
+            sound_id: assignment.sound_id,
+        })
+        .collect::<Vec<_>>();
+    let mut patched_bytes = patch_sms_sound_assignments_dol(&source_dol, &sound_assignments)
+        .map_err(|error| {
+            format!(
+                "Could not install packaged sound helper assignments into '{}': {error}",
+                run.run_main_dol.display()
+            )
+        })?;
+    if !overrides.is_empty() {
+        patched_bytes = patch_sms_stage_music_dol(&patched_bytes, &overrides)
+            .map_err(|error| {
+                format!(
+                    "Could not install packaged stage music into '{}': {error}",
+                    run.run_main_dol.display()
+                )
+            })?
+            .bytes;
+    }
     check_cancelled(cancelled)?;
-    atomic_write_if_changed_with_cancel(&run.run_main_dol, &patched.bytes, cancelled).map_err(
+    atomic_write_if_changed_with_cancel(&run.run_main_dol, &patched_bytes, cancelled).map_err(
         |error| {
             if is_cancelled_error(&error.to_string()) {
                 error.to_string()
@@ -2339,7 +2375,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires SMS_BASE_ROOT with an extracted retail game"]
-    fn normal_managed_package_installs_music_without_direct_boot() {
+    fn normal_managed_package_installs_audio_without_direct_boot() {
         let base_root = PathBuf::from(std::env::var_os("SMS_BASE_ROOT").expect("SMS_BASE_ROOT"));
         let source_dol = base_root.join("sys/main.dol");
         let source_stage_table = base_root.join("files/data/stageArc.bin");
@@ -2364,6 +2400,17 @@ mod tests {
             ProjectStageMusic {
                 bgm_id: 0x8001_0002,
                 wave_scene_id: 0x202,
+                secondary_bgm_id: Some(0x8001_0002),
+                secondary_wave_scene_id: Some(0x202),
+            },
+        );
+        descriptor.sound_assignments.insert(
+            "map_static:SoundObjRiver".to_string(),
+            ProjectSoundAssignment {
+                kind: ProjectSoundAssignmentKind::MapStatic,
+                source_name: "SoundObjRiver".to_string(),
+                original_sound_id: 0x500f,
+                sound_id: 0x5000,
             },
         );
         let project = OpenProject {

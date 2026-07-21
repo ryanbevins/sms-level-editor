@@ -3217,6 +3217,8 @@ fn completed_stage_load_is_discarded_when_the_project_path_changed() {
         retail_skyboxes: Vec::new(),
         skybox_warnings: Vec::new(),
         retail_music: Vec::new(),
+        retail_sounds: Vec::new(),
+        retail_stage_audio: Vec::new(),
         music_warning: None,
     };
 
@@ -3258,6 +3260,8 @@ fn completed_stage_load_adopts_the_resolved_project_folder() {
         retail_skyboxes: Vec::new(),
         skybox_warnings: Vec::new(),
         retail_music: Vec::new(),
+        retail_sounds: Vec::new(),
+        retail_stage_audio: Vec::new(),
         music_warning: None,
     };
 
@@ -3299,6 +3303,8 @@ fn completed_stage_load_is_discarded_when_the_selected_stage_changed() {
         retail_skyboxes: Vec::new(),
         skybox_warnings: Vec::new(),
         retail_music: Vec::new(),
+        retail_sounds: Vec::new(),
+        retail_stage_audio: Vec::new(),
         music_warning: None,
     };
 
