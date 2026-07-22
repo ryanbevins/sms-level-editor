@@ -3236,7 +3236,8 @@ fn preview_triangle_ranges_for_model_index(
 mod tests {
     use super::*;
     use sms_formats::{
-        JDramaDocument, JDramaField, JDramaFieldValue, JDramaRecord, JDramaRecordPayload, PrmFile,
+        decode_bti_texture, J3dFile, JDramaDocument, JDramaField, JDramaFieldValue, JDramaRecord,
+        JDramaRecordPayload, PrmFile,
     };
 
     fn command_test_document(objects: Vec<SceneObject>) -> StageDocument {
@@ -4207,6 +4208,7 @@ mod tests {
         let mut document =
             StageDocument::open_authored_project_stage(&base_root, "goopmap0", &project_root)
                 .expect("open authored goopmap0 project stage");
+        document.set_registry(registry.clone());
 
         let repair =
             repair_authored_catalog_resources(&mut document, std::slice::from_ref(&template));
@@ -4219,6 +4221,32 @@ mod tests {
         let reopened = sms_scene::SourceFreeStageArchive::parse(&rebuilt)
             .expect("reopen repaired stage archive");
         assert!(reopened.resource(b"map/pollution/h_ma_rak.bti").is_some());
+        let StageResourceDocument::Texture(texture) = reopened
+            .resource(b"map/pollution/h_ma_rak.bti")
+            .expect("runtime pollution texture")
+        else {
+            panic!("runtime pollution resource is a BTI");
+        };
+        let expected = decode_bti_texture(texture.encode().expect("encode runtime BTI"))
+            .expect("decode runtime BTI");
+        let StageResourceDocument::Model(model) = reopened
+            .resource(b"pakkun/pakun.bmd")
+            .expect("Pakkun model")
+        else {
+            panic!("Pakkun resource is a model");
+        };
+        let model = J3dFile::parse(model.to_bytes().expect("encode baked Pakkun model"))
+            .expect("parse baked Pakkun model");
+        let baked = model
+            .texture_previews()
+            .expect("decode baked Pakkun textures")
+            .into_iter()
+            .find(|texture| texture.name == "H_ma_rak_dummy")
+            .expect("Pakkun dummy texture remains named for runtime replacement");
+        assert_eq!(baked.width, expected.width);
+        assert_eq!(baked.height, expected.height);
+        assert_eq!(baked.format, expected.format);
+        assert_eq!(baked.rgba, expected.rgba);
     }
 
     #[test]

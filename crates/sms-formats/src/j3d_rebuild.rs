@@ -12,7 +12,7 @@ use encoding_rs::SHIFT_JIS;
 use serde::{Deserialize, Serialize};
 
 use crate::binary::{be_f32, be_i16, be_u16, be_u32, checked_slice, require_len, require_magic};
-use crate::{FormatError, Result};
+use crate::{BtiFile, FormatError, Result};
 
 const FORMAT: &str = "J3D rebuild";
 const RETAIL_PADDING: &[u8] = b"This is padding data to alignment.";
@@ -601,6 +601,141 @@ impl J3dRebuildDocument {
         canonical.canonicalize_geometry_layout_in_place()?;
         *self = canonical;
         Ok(())
+    }
+
+    /// Replaces every TEX1 texture with the requested name using a detached
+    /// BTI and grows the texture section when the imported dummy allocation is
+    /// smaller than the runtime texture. The name table is retained so the
+    /// game's normal `SMS_ChangeTextureAll` call remains valid and idempotent.
+    pub fn replace_named_texture_from_bti(
+        &mut self,
+        texture_name: &str,
+        texture: &BtiFile,
+    ) -> Result<usize> {
+        let mut replacement = self.clone();
+        let count = replacement.replace_named_texture_from_bti_in_place(texture_name, texture)?;
+        *self = replacement;
+        Ok(count)
+    }
+
+    fn replace_named_texture_from_bti_in_place(
+        &mut self,
+        texture_name: &str,
+        texture: &BtiFile,
+    ) -> Result<usize> {
+        texture.encode()?;
+        let palette_entry_count = u16::try_from(texture.palette_entries.len()).map_err(|_| {
+            unsupported(format!(
+                "BTI palette for {texture_name:?} has too many entries: {}",
+                texture.palette_entries.len()
+            ))
+        })?;
+        let encoded_palette = if texture.palette_entries.is_empty() {
+            None
+        } else {
+            Some(
+                texture
+                    .palette_entries
+                    .iter()
+                    .flat_map(|entry| entry.to_be_bytes())
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        let mut replacement_count = 0;
+        for section in &mut self.sections {
+            let J3dRebuildSectionData::Textures(textures) = &mut section.data else {
+                continue;
+            };
+            let matching_indices = textures
+                .names
+                .entries
+                .iter()
+                .enumerate()
+                .filter_map(|(index, entry)| (entry.name == texture_name).then_some(index))
+                .collect::<Vec<_>>();
+            for index in matching_indices {
+                let record = textures.textures.get_mut(index).ok_or_else(|| {
+                    unsupported(format!(
+                        "TEX1 name {texture_name:?} has no texture record at index {index}"
+                    ))
+                })?;
+                let header_base = checked_geometry_add(
+                    textures.header_offset as usize,
+                    record.header_relative_offset as usize,
+                    "TEX1 replacement header",
+                )?;
+                let mut cursor = align_geometry(
+                    section.declared_size as usize,
+                    0x20,
+                    "TEX1 replacement data",
+                )?;
+
+                record.encoded_palette = if let Some(palette) = &encoded_palette {
+                    cursor = align_geometry(cursor, 0x20, "TEX1 replacement palette")?;
+                    let offset = checked_geometry_u32(cursor, "TEX1 replacement palette offset")?;
+                    cursor =
+                        checked_geometry_add(cursor, palette.len(), "TEX1 replacement palette")?;
+                    record.palette_offset = checked_geometry_u32(
+                        (offset as usize).checked_sub(header_base).ok_or_else(|| {
+                            unsupported("TEX1 replacement palette precedes its header".to_string())
+                        })?,
+                        "TEX1 relative palette offset",
+                    )?;
+                    Some(J3dTextureBlock {
+                        absolute_section_offset: offset,
+                        bytes: palette.clone(),
+                    })
+                } else {
+                    record.palette_offset = 0;
+                    None
+                };
+
+                cursor = align_geometry(cursor, 0x20, "TEX1 replacement image")?;
+                record.image_offset = checked_geometry_u32(
+                    cursor.checked_sub(header_base).ok_or_else(|| {
+                        unsupported("TEX1 replacement image precedes its header".to_string())
+                    })?,
+                    "TEX1 relative image offset",
+                )?;
+                record.encoded_mip_levels.clear();
+                for level in &texture.encoded_mip_levels {
+                    let offset = checked_geometry_u32(cursor, "TEX1 replacement mip offset")?;
+                    record.encoded_mip_levels.push(J3dTextureBlock {
+                        absolute_section_offset: offset,
+                        bytes: level.clone(),
+                    });
+                    cursor = checked_geometry_add(cursor, level.len(), "TEX1 replacement mip")?;
+                }
+
+                record.format = texture.format;
+                record.transparency = texture.transparency;
+                record.width = texture.width;
+                record.height = texture.height;
+                record.wrap_s = texture.wrap_s;
+                record.wrap_t = texture.wrap_t;
+                record.palette_enabled = texture.palette_enabled;
+                record.palette_format = texture.palette_format;
+                record.palette_entry_count = palette_entry_count;
+                record.mipmap_enabled = texture.mipmap_enabled;
+                record.edge_lod = texture.edge_lod;
+                record.bias_clamp = texture.bias_clamp;
+                record.max_anisotropy = texture.max_anisotropy;
+                record.min_filter = texture.min_filter;
+                record.mag_filter = texture.mag_filter;
+                record.min_lod = texture.min_lod;
+                record.max_lod = texture.max_lod;
+                record.mipmap_count = texture.mipmap_count;
+                record.reserved_19 = texture.reserved_19;
+                record.lod_bias = texture.lod_bias;
+                section.declared_size = checked_geometry_u32(
+                    align_geometry(cursor, 0x20, "TEX1 replacement section")?,
+                    "TEX1 replacement section",
+                )?;
+                replacement_count += 1;
+            }
+        }
+        Ok(replacement_count)
     }
 
     fn canonicalize_geometry_layout_in_place(&mut self) -> Result<()> {
@@ -3209,6 +3344,121 @@ fn encode_mdl3(out: &mut [u8], data: &J3dMaterialDisplayListSection) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn synthetic_dummy_texture_document() -> J3dRebuildDocument {
+        let name = "H_ma_rak_dummy";
+        J3dRebuildDocument {
+            file_type: *b"bmt3",
+            version_tag: *b"SVR3",
+            reserved_words: [u32::MAX; 3],
+            declared_section_count: 1,
+            sections: vec![J3dRebuildSection {
+                declared_size: 0x80,
+                data: J3dRebuildSectionData::Textures(J3dTextureSection {
+                    texture_count: 1,
+                    reserved: u16::MAX,
+                    header_offset: 0x20,
+                    name_table_offset: 0x40,
+                    textures: vec![J3dTextureRecord {
+                        header_relative_offset: 0,
+                        format: 0,
+                        transparency: 0,
+                        width: 8,
+                        height: 8,
+                        wrap_s: 0,
+                        wrap_t: 0,
+                        palette_enabled: 0,
+                        palette_format: 0,
+                        palette_entry_count: 0,
+                        palette_offset: 0,
+                        mipmap_enabled: 0,
+                        edge_lod: 0,
+                        bias_clamp: 0,
+                        max_anisotropy: 0,
+                        min_filter: 0,
+                        mag_filter: 0,
+                        min_lod: 0,
+                        max_lod: 0,
+                        mipmap_count: 1,
+                        reserved_19: 0,
+                        lod_bias: 0,
+                        image_offset: 0x40,
+                        encoded_mip_levels: vec![J3dTextureBlock {
+                            absolute_section_offset: 0x60,
+                            bytes: vec![0; 32],
+                        }],
+                        encoded_palette: None,
+                    }],
+                    names: J3dNameTable {
+                        reserved: u16::MAX,
+                        entries: vec![J3dNameEntry {
+                            hash: j3d_name_hash(name.as_bytes()),
+                            string_offset: 8,
+                            name: name.to_string(),
+                        }],
+                    },
+                }),
+                padding: Vec::new(),
+            }],
+        }
+    }
+
+    fn synthetic_runtime_bti() -> BtiFile {
+        BtiFile {
+            allocation_size: 0xa0,
+            format: 0,
+            transparency: 1,
+            width: 16,
+            height: 16,
+            wrap_s: 1,
+            wrap_t: 1,
+            palette_enabled: 0,
+            palette_format: 0,
+            palette_entries: Vec::new(),
+            palette_offset: 0,
+            mipmap_enabled: 0,
+            edge_lod: 0,
+            bias_clamp: 0,
+            max_anisotropy: 0,
+            min_filter: 1,
+            mag_filter: 1,
+            min_lod: 0,
+            max_lod: 0,
+            mipmap_count: 1,
+            reserved_19: 0,
+            lod_bias: 0,
+            image_offset: 0x20,
+            encoded_mip_levels: vec![(0..128).map(|value| value as u8).collect()],
+        }
+    }
+
+    #[test]
+    fn named_runtime_texture_replacement_grows_and_reparses_tex1() {
+        let mut document = synthetic_dummy_texture_document();
+        let original_size = document.to_bytes().expect("encode dummy model").len();
+        let texture = synthetic_runtime_bti();
+
+        assert_eq!(
+            document
+                .replace_named_texture_from_bti("H_ma_rak_dummy", &texture)
+                .expect("replace dummy texture"),
+            1
+        );
+        let encoded = document.to_bytes().expect("encode replaced model");
+        assert!(encoded.len() > original_size);
+        let reopened = J3dRebuildDocument::parse(&encoded).expect("reparse replaced model");
+        let J3dRebuildSectionData::Textures(textures) = &reopened.sections[0].data else {
+            panic!("synthetic model has TEX1");
+        };
+        assert_eq!(textures.names.entries[0].name, "H_ma_rak_dummy");
+        assert_eq!(textures.textures[0].width, 16);
+        assert_eq!(textures.textures[0].height, 16);
+        assert_eq!(
+            textures.textures[0].encoded_mip_levels[0].bytes,
+            (0..128).map(|value| value as u8).collect::<Vec<_>>()
+        );
+        assert_eq!(reopened.to_bytes().expect("re-encode replacement"), encoded);
+    }
 
     fn synthetic_geometry_document(vertex_count: usize) -> J3dRebuildDocument {
         let positions = (0..vertex_count)

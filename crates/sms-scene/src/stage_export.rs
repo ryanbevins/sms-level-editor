@@ -14,7 +14,8 @@ use sms_formats::{
 
 use crate::{
     ObjectRegistry, PlacementAddress, PlacementBinding, Result, SceneError, SceneObject,
-    SourceFreeStageArchive, StageDocument, StageObjectPlacement, StageResourceDocument,
+    SourceFreeStageArchive, StageDocument, StageObjectPlacement, StageOrigin,
+    StageResourceDocument,
 };
 
 const WORLD_COLLISION_PATH: &[u8] = b"map/map.col";
@@ -350,6 +351,7 @@ impl StageDocument {
         let baseline = archive.encode()?;
 
         apply_resource_edits(&mut archive, edits)?;
+        apply_runtime_texture_replacements(&mut archive, &self.objects, self.registry.as_ref())?;
         reconcile_scene_lighting(&mut archive, &self.lighting)?;
         let inserted_placement_roots = apply_placement_inserts(&mut archive, edits)?;
         reconcile_scene_objects(
@@ -373,6 +375,81 @@ impl StageDocument {
             changed,
         })
     }
+}
+
+fn apply_runtime_texture_replacements(
+    archive: &mut SourceFreeStageArchive,
+    objects: &[SceneObject],
+    registry: Option<&ObjectRegistry>,
+) -> Result<()> {
+    // Retail-derived stages already exercise the engine's stock absolute
+    // resource lookup. Blank/custom archives also bake the declared binding so
+    // their first runtime frame cannot expose the model's tiny black dummy.
+    if !matches!(archive.origin(), StageOrigin::Blank { .. }) {
+        return Ok(());
+    }
+    let Some(registry) = registry else {
+        return Ok(());
+    };
+    let factories = objects
+        .iter()
+        .map(|object| object.factory_name.as_str())
+        .collect::<BTreeSet<_>>();
+    let replacements = factories
+        .into_iter()
+        .flat_map(|factory| registry.runtime_texture_replacements_for(factory))
+        .map(|replacement| {
+            (
+                replacement.dummy_texture_name.clone(),
+                replacement.resource_path.clone(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+
+    for (dummy_texture_name, resource_path) in replacements {
+        let archive_path = runtime_texture_archive_path(&resource_path);
+        let texture = archive
+            .resources()
+            .iter()
+            .find_map(|resource| {
+                let matches = String::from_utf8_lossy(&resource.raw_path)
+                    .replace('\\', "/")
+                    .eq_ignore_ascii_case(&archive_path);
+                if !matches {
+                    return None;
+                }
+                match &resource.document {
+                    StageResourceDocument::Texture(texture) => Some(texture.clone()),
+                    _ => None,
+                }
+            })
+            .ok_or_else(|| {
+                stage_export_error(format!(
+                    "runtime texture {resource_path:?} for dummy {dummy_texture_name:?} is missing from the stage archive"
+                ))
+            })?;
+
+        for resource in archive.resources_mut() {
+            let StageResourceDocument::Model(model) = &mut resource.document else {
+                continue;
+            };
+            model
+                .replace_named_texture_from_bti(&dummy_texture_name, &texture)
+                .map_err(|source| SceneError::StageResource {
+                    path: display_raw_path(&resource.raw_path),
+                    source,
+                })?;
+        }
+    }
+    Ok(())
+}
+
+fn runtime_texture_archive_path(resource_path: &str) -> String {
+    let normalized = resource_path.trim_start_matches('/').replace('\\', "/");
+    normalized
+        .strip_prefix("scene/")
+        .unwrap_or(&normalized)
+        .to_string()
 }
 
 fn reconcile_scene_lighting(
