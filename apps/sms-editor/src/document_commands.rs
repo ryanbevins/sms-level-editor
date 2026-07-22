@@ -1992,6 +1992,48 @@ impl SmsEditorApp {
             .as_mut()
             .map(|document| repair_authored_catalog_resources(document, &templates))
             .unwrap_or_default();
+        let runtime_goop_source = self
+            .document
+            .as_ref()
+            .and_then(|document| document.goop_authoring.as_ref())
+            .and_then(|authoring| {
+                authoring
+                    .layers
+                    .iter()
+                    .filter_map(|layer| layer.style_source.as_ref())
+                    .next()
+            })
+            .cloned();
+        let runtime_goop_repair = runtime_goop_source
+            .and_then(|source| {
+                self.scene_archives
+                    .iter()
+                    .find(|archive| archive.stage_id == source.stage_id)
+                    .map(|archive| (source, archive.path.clone()))
+            })
+            .map(|(source, archive_path)| {
+                self.document
+                    .as_mut()
+                    .map(|document| {
+                        sync_runtime_actor_goop_textures_from_source(
+                            document,
+                            &source,
+                            &archive_path,
+                        )
+                    })
+                    .unwrap_or(Ok(0))
+            })
+            .transpose();
+        let runtime_goop_writes = match runtime_goop_repair {
+            Ok(Some(writes)) => writes,
+            Ok(None) => 0,
+            Err(error) => {
+                self.log.push(format!(
+                    "Could not repair the scene-wide actor goop texture: {error}"
+                ));
+                0
+            }
+        };
 
         for error in repair.errors {
             self.log.push(format!(
@@ -2000,6 +2042,7 @@ impl SmsEditorApp {
         }
         if repair.resource_writes == 0
             && repair.runtime_links_added == 0
+            && runtime_goop_writes == 0
             && migrated_shines.is_empty()
         {
             return;
@@ -2029,6 +2072,11 @@ impl SmsEditorApp {
                 "Reconciled {} decomp-derived runtime actor link(s) for existing authored class(es): {}. Select required targets in the inspector and save before launching.",
                 repair.runtime_links_added,
                 repair.repaired_factories.join(", ")
+            ));
+        }
+        if runtime_goop_writes > 0 {
+            self.log.push(format!(
+                "Updated {runtime_goop_writes} scene-wide actor goop texture(s) from the primary goop style. Save the project before launching."
             ));
         }
         if !migrated_shines.is_empty() {

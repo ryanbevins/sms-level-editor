@@ -10,7 +10,7 @@ use sms_scene::{
     generate_floor_depth_map, generate_floor_pollution_model, whole_terrain_region,
     GoopAuthoringDocument, GoopBehavior, GoopLayerAuthoring, GoopLayerOrigin, GoopPlane,
     GoopRenderTriangle, GoopStyleSource, GoopTerrainTriangle, SourceFreeStageArchive,
-    StageArchiveEdits, GOOP_AUTHORING_FORMAT_VERSION, GOOP_CELL_SIZE,
+    StageArchiveEdits, StageResourceDocument, GOOP_AUTHORING_FORMAT_VERSION, GOOP_CELL_SIZE,
     GOOP_DEPTH_WORLD_UNITS_PER_CODE, GOOP_MAX_LAYERS,
 };
 
@@ -721,6 +721,7 @@ impl SmsEditorApp {
                 !template.compatible,
             )
             .map_err(|error| error.to_string())?;
+            let active_material_name = pollution_material_name(&generated_model)?;
             let authoring = document
                 .ensure_goop_authoring()
                 .map_err(|error| error.to_string())?;
@@ -774,7 +775,8 @@ impl SmsEditorApp {
             document
                 .compile_goop_authoring()
                 .map_err(|error| error.to_string())?;
-            copy_template_animations(document, &template, &target_stem)?;
+            copy_template_animations(document, &template, &target_stem, &active_material_name)?;
+            sync_runtime_actor_goop_textures(document, &template)?;
             Ok(())
         })();
         if let Err(error) = result {
@@ -1055,12 +1057,12 @@ impl SmsEditorApp {
     }
 
     fn refresh_live_goop_preview(&mut self) {
+        self.refresh_live_goop_preview_for_layer(self.selected_goop_layer);
+    }
+
+    fn refresh_live_goop_preview_for_layer(&mut self, layer_index: usize) {
         let Some((width, height, mask)) = self.document.as_ref().and_then(|document| {
-            let layer = document
-                .goop_authoring
-                .as_ref()?
-                .layers
-                .get(self.selected_goop_layer)?;
+            let layer = document.goop_authoring.as_ref()?.layers.get(layer_index)?;
             let (width, height) = layer.dimensions().ok()?;
             Some((width, height, layer.mask().ok()?))
         }) else {
@@ -1069,11 +1071,7 @@ impl SmsEditorApp {
         let Some(texture_indices) = self
             .model_preview
             .as_ref()
-            .and_then(|preview| {
-                preview
-                    .pollution_texture_indices
-                    .get(&self.selected_goop_layer)
-            })
+            .and_then(|preview| preview.pollution_texture_indices.get(&layer_index))
             .cloned()
         else {
             return;
@@ -1118,7 +1116,7 @@ impl SmsEditorApp {
         }
         let spans = coalesce_pixel_changes(stroke.changed);
         if let Some(document) = &mut self.document {
-            if let Err(error) = document.compile_goop_authoring() {
+            if let Err(error) = document.compile_goop_layer_mask(stroke.layer) {
                 self.log
                     .push(format!("Could not compile painted goop mask: {error}"));
                 return;
@@ -1128,7 +1126,7 @@ impl SmsEditorApp {
             layer: stroke.layer,
             spans,
         });
-        self.finish_goop_document_change("Painted goop mask");
+        self.finish_goop_pixel_change("Painted goop mask");
     }
 
     fn push_goop_undo(&mut self, record: GoopUndoRecord) {
@@ -1243,6 +1241,14 @@ impl SmsEditorApp {
                 return;
             }
         };
+        let active_material_name = match pollution_material_name(&generated_model) {
+            Ok(name) => name,
+            Err(error) => {
+                self.log
+                    .push(format!("Could not apply the selected goop style: {error}"));
+                return;
+            }
+        };
 
         let Some(document) = &mut self.document else {
             return;
@@ -1274,7 +1280,9 @@ impl SmsEditorApp {
             document
                 .compile_goop_authoring()
                 .map_err(|error| error.to_string())?;
-            copy_template_animations(document, &template, &target_stem)
+            copy_template_animations(document, &template, &target_stem, &active_material_name)?;
+            sync_runtime_actor_goop_textures(document, &template)?;
+            Ok(())
         })();
         if let Err(error) = result {
             document.goop_authoring = before;
@@ -1297,9 +1305,18 @@ impl SmsEditorApp {
         let Some(record) = self.goop_undo_stack.pop_back() else {
             return false;
         };
+        let pixel_layer = match &record {
+            GoopUndoRecord::Pixels { layer, .. } => Some(*layer),
+            GoopUndoRecord::Snapshot(_) => None,
+        };
         self.apply_goop_undo_record(&record, false);
         self.goop_redo_stack.push_back(record);
-        self.finish_goop_document_change("Undo goop edit");
+        if let Some(layer) = pixel_layer {
+            self.refresh_live_goop_preview_for_layer(layer);
+            self.finish_goop_pixel_change("Undo goop edit");
+        } else {
+            self.finish_goop_document_change("Undo goop edit");
+        }
         true
     }
 
@@ -1307,9 +1324,18 @@ impl SmsEditorApp {
         let Some(record) = self.goop_redo_stack.pop_back() else {
             return false;
         };
+        let pixel_layer = match &record {
+            GoopUndoRecord::Pixels { layer, .. } => Some(*layer),
+            GoopUndoRecord::Snapshot(_) => None,
+        };
         self.apply_goop_undo_record(&record, true);
         self.goop_undo_stack.push_back(record);
-        self.finish_goop_document_change("Redo goop edit");
+        if let Some(layer) = pixel_layer {
+            self.refresh_live_goop_preview_for_layer(layer);
+            self.finish_goop_pixel_change("Redo goop edit");
+        } else {
+            self.finish_goop_document_change("Redo goop edit");
+        }
         true
     }
 
@@ -1335,7 +1361,7 @@ impl SmsEditorApp {
                     }
                 }
                 let _ = target.set_mask(&mask);
-                let _ = document.compile_goop_authoring();
+                let _ = document.compile_goop_layer_mask(*layer);
             }
             GoopUndoRecord::Snapshot(snapshot) => {
                 document.goop_authoring = if forward {
@@ -1356,6 +1382,15 @@ impl SmsEditorApp {
         self.document_dirty = true;
         self.flush_document_change();
         self.rebuild_model_preview_from_document();
+        self.log.push(format!("{label}."));
+    }
+
+    fn finish_goop_pixel_change(&mut self, label: &str) {
+        self.document_dirty = true;
+        // Painting changes only already-validated mask bytes. The live texture
+        // upload is authoritative until save, so do not serialize the complete
+        // overlay, revalidate every stage resource, or rebuild the full scene
+        // preview at the end of each stroke.
         self.log.push(format!("{label}."));
     }
 
@@ -1926,75 +1961,110 @@ fn rebuild_goop_document(
     terrain_fingerprint: u64,
     cancelled: &AtomicBool,
 ) -> Result<(), String> {
-    let Some(authoring) = &mut document.goop_authoring else {
-        return Ok(());
-    };
-    for layer in authoring
-        .layers
-        .iter_mut()
-        .filter(|layer| layer.origin == GoopLayerOrigin::Generated)
+    let mut animation_jobs = Vec::new();
     {
-        if cancelled.load(Ordering::Acquire) {
-            return Err("goop rebuild cancelled".to_string());
-        }
-        let old_mask = layer.mask().map_err(|error| error.to_string())?;
-        let (width, height) = layer.dimensions().map_err(|error| error.to_string())?;
-        let (offset, depth) = generate_floor_depth_map(
-            collision_triangles,
-            layer.region,
-            layer.runtime.width_log2,
-            layer.runtime.height_log2,
-        )
-        .map_err(|error| error.to_string())?;
-        layer.runtime.vertical_offset = offset;
-        layer.runtime.depth_map = depth;
-        let mut reprojected = old_mask;
-        for y in 0..height {
-            for x in 0..width {
-                if !layer.valid_cell(x, y) {
-                    reprojected[y * width + x] = 0;
+        let Some(authoring) = &mut document.goop_authoring else {
+            return Ok(());
+        };
+        for layer in authoring
+            .layers
+            .iter_mut()
+            .filter(|layer| layer.origin == GoopLayerOrigin::Generated)
+        {
+            if cancelled.load(Ordering::Acquire) {
+                return Err("goop rebuild cancelled".to_string());
+            }
+            let old_mask = layer.mask().map_err(|error| error.to_string())?;
+            let (width, height) = layer.dimensions().map_err(|error| error.to_string())?;
+            let (offset, depth) = generate_floor_depth_map(
+                collision_triangles,
+                layer.region,
+                layer.runtime.width_log2,
+                layer.runtime.height_log2,
+            )
+            .map_err(|error| error.to_string())?;
+            layer.runtime.vertical_offset = offset;
+            layer.runtime.depth_map = depth;
+            let mut reprojected = old_mask;
+            for y in 0..height {
+                for x in 0..width {
+                    if !layer.valid_cell(x, y) {
+                        reprojected[y * width + x] = 0;
+                    }
                 }
             }
-        }
-        layer
-            .set_mask(&reprojected)
-            .map_err(|error| error.to_string())?;
-        let source = layer
-            .style_source
-            .as_ref()
-            .ok_or_else(|| format!("layer {} has no retail style provenance", layer.id))?;
-        let template = templates
-            .iter()
-            .find(|template| {
-                template.stage_id == source.stage_id && template.layer_index == source.layer_index
-            })
-            .ok_or_else(|| format!("retail template {} is unavailable", source.display_name))?;
-        let model = read_stage_asset_bytes(&template.model_asset_path)
-            .and_then(J3dRebuildDocument::parse)
-            .map_err(|error| error.to_string())?;
-        layer.generated_model = Some(
-            generate_floor_pollution_model(
+            layer
+                .set_mask(&reprojected)
+                .map_err(|error| error.to_string())?;
+            let source = layer
+                .style_source
+                .as_ref()
+                .ok_or_else(|| format!("layer {} has no retail style provenance", layer.id))?;
+            let template = templates
+                .iter()
+                .find(|template| {
+                    template.stage_id == source.stage_id
+                        && template.layer_index == source.layer_index
+                })
+                .ok_or_else(|| format!("retail template {} is unavailable", source.display_name))?;
+            let model = read_stage_asset_bytes(&template.model_asset_path)
+                .and_then(J3dRebuildDocument::parse)
+                .map_err(|error| error.to_string())?;
+            let generated_model = generate_floor_pollution_model(
                 &model,
                 render_triangles,
                 &layer.runtime,
                 source.forced_incompatible,
             )
-            .map_err(|error| error.to_string())?,
-        );
+            .map_err(|error| error.to_string())?;
+            let active_material_name = pollution_material_name(&generated_model)?;
+            layer.generated_model = Some(generated_model);
+            animation_jobs.push((
+                template.clone(),
+                layer.resource_stem.clone(),
+                active_material_name,
+            ));
+        }
+        authoring.terrain_fingerprint = terrain_fingerprint;
+        authoring.format_version = GOOP_AUTHORING_FORMAT_VERSION;
+        authoring.stale = false;
     }
-    authoring.terrain_fingerprint = terrain_fingerprint;
-    authoring.format_version = GOOP_AUTHORING_FORMAT_VERSION;
-    authoring.stale = false;
     document
         .compile_goop_authoring()
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    for (template, target_stem, active_material_name) in animation_jobs {
+        copy_template_animations(document, &template, &target_stem, &active_material_name)?;
+        sync_runtime_actor_goop_textures(document, &template)?;
+    }
+    Ok(())
+}
+
+fn pollution_material_name(model: &J3dRebuildDocument) -> Result<String, String> {
+    model
+        .sections
+        .iter()
+        .find_map(|section| match &section.data {
+            J3dRebuildSectionData::Materials(materials) => materials
+                .names
+                .as_ref()
+                .and_then(|names| names.entries.first())
+                .map(|entry| entry.name.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| "generated goop model has no active material name".to_string())
 }
 
 fn copy_template_animations(
     document: &mut StageDocument,
     template: &RetailGoopTemplate,
     target_stem: &str,
+    active_material_name: &str,
 ) -> Result<(), String> {
+    for extension in GOOP_TEMPLATE_ANIMATION_EXTENSIONS {
+        document
+            .archive_edits
+            .remove_resource(format!("map/pollution/{target_stem}.{extension}").into_bytes());
+    }
     let bytes = fs::read(&template.archive_path).map_err(|error| error.to_string())?;
     let archive = SourceFreeStageArchive::parse(&bytes).map_err(|error| error.to_string())?;
     for resource in archive.resources() {
@@ -2010,13 +2080,145 @@ fn copy_template_animations(
             .and_then(|value| value.to_str())
             .is_some_and(|value| value.eq_ignore_ascii_case(&template.resource_stem));
         if stem_matches && GOOP_TEMPLATE_ANIMATION_EXTENSIONS.contains(&extension.as_str()) {
+            let mut animation = resource.document.clone();
+            if let StageResourceDocument::Animation(value) = &mut animation {
+                if value
+                    .retain_material_bindings_named(active_material_name)
+                    .map_err(|error| error.to_string())?
+                    .is_some_and(|retained| retained == 0)
+                {
+                    continue;
+                }
+            }
             document.upsert_authored_resource(
                 format!("map/pollution/{target_stem}.{extension}").into_bytes(),
-                resource.document.clone(),
+                animation,
             );
         }
     }
     Ok(())
+}
+
+/// Copies decomp-declared, stage-global actor textures from the retail scene
+/// that supplies this document's primary goop style. The declarations decide
+/// which resources are needed; no actor or model filename is special-cased.
+pub(super) fn sync_runtime_actor_goop_textures(
+    document: &mut StageDocument,
+    template: &RetailGoopTemplate,
+) -> Result<usize, String> {
+    let Some(primary_style) = document
+        .goop_authoring
+        .as_ref()
+        .and_then(|authoring| {
+            authoring
+                .layers
+                .iter()
+                .filter_map(|layer| layer.style_source.as_ref())
+                .next()
+        })
+        .cloned()
+    else {
+        return Ok(0);
+    };
+    if primary_style.stage_id != template.stage_id
+        || primary_style.layer_index != template.layer_index
+    {
+        return Ok(0);
+    }
+    sync_runtime_actor_goop_textures_from_source(document, &primary_style, &template.archive_path)
+}
+
+pub(super) fn sync_runtime_actor_goop_textures_from_source(
+    document: &mut StageDocument,
+    primary_style: &GoopStyleSource,
+    source_archive_path: &Path,
+) -> Result<usize, String> {
+    let Some(registry) = document.registry.as_ref() else {
+        return Ok(0);
+    };
+    let factories = document
+        .objects
+        .iter()
+        .map(|object| object.factory_name.as_str())
+        .collect::<BTreeSet<_>>();
+    let resource_paths = factories
+        .into_iter()
+        .flat_map(|factory| registry.runtime_texture_replacements_for(factory))
+        .map(|replacement| replacement.resource_path.clone())
+        .collect::<BTreeSet<_>>();
+    if resource_paths.is_empty() {
+        return Ok(0);
+    }
+
+    let bytes = fs::read(source_archive_path).map_err(|error| error.to_string())?;
+    let archive = SourceFreeStageArchive::parse(&bytes).map_err(|error| error.to_string())?;
+    let mut writes = 0;
+    for resource_path in resource_paths {
+        let archive_path = runtime_texture_archive_path(&resource_path);
+        let source = archive
+            .resources()
+            .iter()
+            .find(|resource| {
+                String::from_utf8_lossy(&resource.raw_path)
+                    .replace('\\', "/")
+                    .eq_ignore_ascii_case(&archive_path)
+            })
+            .ok_or_else(|| {
+                format!(
+                    "retail goop style {} does not provide declared runtime texture {resource_path}",
+                    primary_style.display_name
+                )
+            })?;
+        if !matches!(source.document, StageResourceDocument::Texture(_)) {
+            return Err(format!(
+                "retail goop style {} provides {resource_path}, but it is not a BTI texture",
+                primary_style.display_name
+            ));
+        }
+        let raw_path = archive_path.into_bytes();
+        let aliases = document
+            .stage_archive
+            .iter()
+            .flat_map(|archive| archive.resources())
+            .map(|resource| resource.raw_path.clone())
+            .chain(
+                document
+                    .archive_edits
+                    .resources
+                    .iter()
+                    .map(|edit| edit.raw_resource_path.clone()),
+            )
+            .filter(|candidate| {
+                candidate != &raw_path
+                    && String::from_utf8_lossy(candidate)
+                        .replace('\\', "/")
+                        .eq_ignore_ascii_case(&String::from_utf8_lossy(&raw_path))
+            })
+            .collect::<BTreeSet<_>>();
+        for alias in aliases {
+            document.archive_edits.remove_resource(alias);
+            writes += 1;
+        }
+        if document
+            .effective_resource_clone(&raw_path)
+            .map_err(|error| error.to_string())?
+            .as_ref()
+            == Some(&source.document)
+        {
+            continue;
+        }
+        document.upsert_authored_resource(raw_path, source.document.clone());
+        writes += 1;
+    }
+    Ok(writes)
+}
+
+fn runtime_texture_archive_path(resource_path: &str) -> String {
+    let normalized = resource_path.trim_start_matches('/').replace('\\', "/");
+    normalized
+        .strip_prefix("scene/")
+        .unwrap_or(&normalized)
+        .to_string()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2235,6 +2437,138 @@ mod tests {
             semantic_type: semantic_type.to_string(),
             compatible: true,
         }
+    }
+
+    fn synthetic_runtime_texture(fill: u8) -> sms_formats::BtiFile {
+        sms_formats::BtiFile {
+            allocation_size: 0xa0,
+            format: 0,
+            transparency: 1,
+            width: 16,
+            height: 16,
+            wrap_s: 1,
+            wrap_t: 1,
+            palette_enabled: 0,
+            palette_format: 0,
+            palette_entries: Vec::new(),
+            palette_offset: 0,
+            mipmap_enabled: 0,
+            edge_lod: 0,
+            bias_clamp: 0,
+            max_anisotropy: 0,
+            min_filter: 1,
+            mag_filter: 1,
+            min_lod: 0,
+            max_lod: 0,
+            mipmap_count: 1,
+            reserved_19: 0,
+            lod_bias: 0,
+            image_offset: 0x20,
+            encoded_mip_levels: vec![vec![fill; 128]],
+        }
+    }
+
+    fn write_runtime_texture_template(
+        directory: &Path,
+        stage_id: &str,
+        fill: u8,
+    ) -> RetailGoopTemplate {
+        let archive_path = directory.join(format!("{stage_id}.szs"));
+        let mut archive = SourceFreeStageArchive::new_for_blank(stage_id, 1).unwrap();
+        archive
+            .insert_resource(
+                b"map/pollution/H_ma_rak.bti".to_vec(),
+                StageResourceDocument::Texture(synthetic_runtime_texture(fill)),
+            )
+            .unwrap();
+        fs::write(&archive_path, archive.encode().unwrap()).unwrap();
+        RetailGoopTemplate {
+            archive_path,
+            ..retail_template(stage_id, 0, GoopBehavior::Normal, "Normal")
+        }
+    }
+
+    #[test]
+    fn primary_goop_style_supplies_declared_actor_texture_without_model_tables() {
+        let temp = tempfile::tempdir().unwrap();
+        let primary = write_runtime_texture_template(temp.path(), "monte0", 0x44);
+        let secondary = write_runtime_texture_template(temp.path(), "bianco0", 0x99);
+        let mut layer = editable_layer();
+        layer.style_source = Some(GoopStyleSource {
+            stage_id: primary.stage_id.clone(),
+            layer_index: primary.layer_index,
+            display_name: "Monte / pollution00".to_string(),
+            behavior_code: 0,
+            forced_incompatible: false,
+        });
+        let registry = ObjectRegistry {
+            runtime_texture_replacements: vec![sms_schema::RuntimeTextureReplacementDefinition {
+                factory_name: "Mario".to_string(),
+                dummy_texture_name: "H_ma_rak_dummy".to_string(),
+                resource_path: "/scene/map/pollution/H_ma_rak.bti".to_string(),
+                source_file: "src/Player/MarioDraw.cpp".to_string(),
+            }],
+            ..ObjectRegistry::default()
+        };
+        let mut document = StageDocument {
+            stage_id: "custom0".to_string(),
+            base_root: temp.path().to_path_buf(),
+            assets: Vec::new(),
+            objects: vec![SceneObject::new("mario", "Mario")],
+            changed_files: BTreeMap::new(),
+            stage_archive: None,
+            stage_archive_source_path: None,
+            archive_edits: StageArchiveEdits::default(),
+            registry: Some(registry),
+            route_authoring: None,
+            goop_authoring: Some(GoopAuthoringDocument {
+                layers: vec![layer],
+                ..Default::default()
+            }),
+            load_issues: Vec::new(),
+            lighting: Default::default(),
+            actor_previews: BTreeMap::new(),
+            loaded_project: None,
+        };
+        document.insert_authored_resource(
+            b"map/pollution/h_ma_rak.bti".to_vec(),
+            StageResourceDocument::Texture(synthetic_runtime_texture(0x11)),
+        );
+
+        assert_eq!(
+            sync_runtime_actor_goop_textures(&mut document, &primary).unwrap(),
+            2
+        );
+        let remaining_paths = document
+            .archive_edits
+            .resources
+            .iter()
+            .filter(|edit| {
+                String::from_utf8_lossy(&edit.raw_resource_path)
+                    .eq_ignore_ascii_case("map/pollution/H_ma_rak.bti")
+            })
+            .map(|edit| edit.raw_resource_path.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(remaining_paths, [b"map/pollution/H_ma_rak.bti".to_vec()]);
+        let Some(StageResourceDocument::Texture(texture)) = document
+            .effective_resource_clone(b"map/pollution/H_ma_rak.bti")
+            .unwrap()
+        else {
+            panic!("primary style did not install the declared runtime texture");
+        };
+        assert_eq!(texture.encoded_mip_levels[0], vec![0x44; 128]);
+
+        assert_eq!(
+            sync_runtime_actor_goop_textures(&mut document, &secondary).unwrap(),
+            0
+        );
+        let Some(StageResourceDocument::Texture(texture)) = document
+            .effective_resource_clone(b"map/pollution/H_ma_rak.bti")
+            .unwrap()
+        else {
+            panic!("secondary style removed the primary runtime texture");
+        };
+        assert_eq!(texture.encoded_mip_levels[0], vec![0x44; 128]);
     }
 
     #[test]
@@ -2663,6 +2997,149 @@ mod tests {
             }
         }
         assert_eq!(goop_invalid_marker_surface_y(&layer, 3, 1), None);
+    }
+
+    #[test]
+    #[ignore = "requires SMS_BASE_ROOT with extracted retail stage archives"]
+    fn every_retail_goop_animation_survives_material_filter_and_reparse() {
+        let root = std::env::var_os("SMS_BASE_ROOT")
+            .expect("set SMS_BASE_ROOT to an extracted retail game root");
+        let archives =
+            sms_formats::discover_scene_archives(root).expect("discover retail scene archives");
+        let (templates, warnings) = index_retail_goop_templates(&archives);
+        assert!(!templates.is_empty(), "no goop templates: {warnings:#?}");
+        let mut checked = 0;
+        for template in templates {
+            let model = read_stage_asset_bytes(&template.model_asset_path)
+                .and_then(J3dRebuildDocument::parse)
+                .expect("parse retail goop model");
+            let material_name = pollution_material_name(&model).expect("material-zero name");
+            let bytes = fs::read(&template.archive_path).expect("read retail stage archive");
+            let archive = SourceFreeStageArchive::parse(&bytes).unwrap_or_else(|error| {
+                panic!("parse {}: {error}", template.archive_path.display())
+            });
+            for resource in archive.resources() {
+                let path = String::from_utf8_lossy(&resource.raw_path).replace('\\', "/");
+                let candidate = Path::new(&path);
+                let is_template_animation = candidate
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|value| value.eq_ignore_ascii_case(&template.resource_stem))
+                    && candidate
+                        .extension()
+                        .and_then(|value| value.to_str())
+                        .is_some_and(|value| {
+                            GOOP_TEMPLATE_ANIMATION_EXTENSIONS
+                                .iter()
+                                .any(|extension| value.eq_ignore_ascii_case(extension))
+                        });
+                let StageResourceDocument::Animation(animation) = &resource.document else {
+                    continue;
+                };
+                if !is_template_animation {
+                    continue;
+                }
+                let mut filtered = (**animation).clone();
+                if filtered
+                    .retain_material_bindings_named(&material_name)
+                    .expect("filter retail goop animation")
+                    .is_some_and(|retained| retained == 0)
+                {
+                    continue;
+                }
+                let encoded = filtered.encode().expect("encode filtered goop animation");
+                sms_formats::J3dAnimationRebuildDocument::parse(&encoded).unwrap_or_else(|error| {
+                    panic!("reparse {}!/{}: {error}", template.stage_id, path)
+                });
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "retail goop census found no bound animations");
+    }
+
+    #[test]
+    #[ignore = "requires SMS_BASE_ROOT and SMS_PROJECT_ROOT with authored goopmap0"]
+    fn authored_project_migrates_case_alias_and_bakes_primary_actor_goop_texture() {
+        let base_root = std::env::var_os("SMS_BASE_ROOT")
+            .map(PathBuf::from)
+            .expect("set SMS_BASE_ROOT");
+        let project_root = std::env::var_os("SMS_PROJECT_ROOT")
+            .map(PathBuf::from)
+            .expect("set SMS_PROJECT_ROOT");
+        let mut document =
+            StageDocument::open_authored_project_stage(&base_root, "goopmap0", &project_root)
+                .expect("open authored goopmap0");
+        let style = document
+            .goop_authoring
+            .as_ref()
+            .and_then(|goop| {
+                goop.layers
+                    .iter()
+                    .find_map(|layer| layer.style_source.clone())
+            })
+            .expect("primary goop style");
+        let archive = sms_formats::discover_scene_archives(&base_root)
+            .expect("discover retail stages")
+            .into_iter()
+            .find(|archive| archive.stage_id == style.stage_id)
+            .expect("primary style archive");
+        document.registry = Some(ObjectRegistry {
+            runtime_texture_replacements: ["Mario", "StayPakkun"]
+                .into_iter()
+                .map(
+                    |factory_name| sms_schema::RuntimeTextureReplacementDefinition {
+                        factory_name: factory_name.to_string(),
+                        dummy_texture_name: "H_ma_rak_dummy".to_string(),
+                        resource_path: "/scene/map/pollution/H_ma_rak.bti".to_string(),
+                        source_file: "regression".to_string(),
+                    },
+                )
+                .collect(),
+            ..ObjectRegistry::default()
+        });
+
+        sync_runtime_actor_goop_textures_from_source(&mut document, &style, &archive.path)
+            .expect("migrate runtime texture aliases");
+        let aliases = document
+            .archive_edits
+            .resources
+            .iter()
+            .filter(|edit| {
+                String::from_utf8_lossy(&edit.raw_resource_path)
+                    .eq_ignore_ascii_case("map/pollution/H_ma_rak.bti")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(aliases.len(), 1);
+        assert_eq!(aliases[0].raw_resource_path, b"map/pollution/H_ma_rak.bti");
+
+        let rebuilt = SourceFreeStageArchive::parse(
+            &document
+                .build_stage_archive()
+                .expect("build migrated authored stage"),
+        )
+        .expect("reopen migrated authored stage");
+        let StageResourceDocument::Texture(texture) = rebuilt
+            .resource(b"map/pollution/H_ma_rak.bti")
+            .expect("canonical actor goop texture")
+        else {
+            panic!("actor goop resource is not a texture");
+        };
+        let expected = sms_formats::decode_bti_texture(texture.encode().unwrap()).unwrap();
+        let StageResourceDocument::Model(model) =
+            rebuilt.resource(b"pakkun/pakun.bmd").expect("Pakkun model")
+        else {
+            panic!("Pakkun resource is not a model");
+        };
+        let baked = J3dFile::parse(model.to_bytes().unwrap())
+            .unwrap()
+            .texture_previews()
+            .unwrap()
+            .into_iter()
+            .find(|texture| texture.name == "H_ma_rak_dummy")
+            .expect("baked Pakkun actor goop texture");
+        assert_eq!(baked.width, expected.width);
+        assert_eq!(baked.height, expected.height);
+        assert_eq!(baked.rgba, expected.rgba);
     }
 
     #[test]

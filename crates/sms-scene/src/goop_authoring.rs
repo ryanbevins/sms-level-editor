@@ -21,7 +21,7 @@ pub const GOOP_DEPTH_WORLD_UNITS_PER_CODE: f32 = 40.0;
 pub const GOOP_MIN_MUTABLE_DEPTH: u8 = 1;
 pub const GOOP_MAX_LAYERS: usize = 20;
 pub const GOOP_MAX_DIMENSION: usize = 1024;
-pub const GOOP_AUTHORING_FORMAT_VERSION: u32 = 7;
+pub const GOOP_AUTHORING_FORMAT_VERSION: u32 = 9;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -580,7 +580,7 @@ pub fn terrain_fingerprint(model: &[u8], collision: &[u8]) -> u64 {
 }
 
 /// Builds a source-free floor pollution model while retaining the template's
-/// complete MAT3 state and every TEX1 texture after texture zero.
+/// active material-zero MAT3 state and every TEX1 texture after texture zero.
 pub fn generate_floor_pollution_model(
     template: &J3dRebuildDocument,
     triangles: &[GoopRenderTriangle],
@@ -670,6 +670,7 @@ pub fn generate_floor_pollution_model(
         },
     )?;
     let detail_uv_gradients = template_detail_uv_gradients(template)?;
+    retain_material_zero_only(&mut material_section)?;
     redirect_detail_tex_gens(&mut material_section, &detail_uv_gradients)?;
 
     let mut vertices = Vec::new();
@@ -753,6 +754,68 @@ pub fn generate_floor_pollution_model(
     let bytes = generated.to_bytes()?;
     J3dRebuildDocument::parse(&bytes)?;
     Ok(generated)
+}
+
+fn retain_material_zero_only(material_section: &mut sms_formats::J3dRebuildSection) -> Result<()> {
+    const INDIRECT_MATERIAL_RECORD_SIZE: usize = 0x138;
+    let J3dRebuildSectionData::Materials(materials) = &mut material_section.data else {
+        return Err(SceneError::StageExport(
+            "goop template material section is not MAT3".to_string(),
+        ));
+    };
+    let material_zero_init = materials
+        .tables
+        .iter()
+        .find(|table| table.kind == J3dMaterialTableKind::MaterialRemap)
+        .and_then(|table| match &table.allocation {
+            J3dScalarArray::Unsigned16(remap) => remap.first().copied(),
+            _ => None,
+        })
+        .map(usize::from)
+        .ok_or_else(|| {
+            SceneError::StageExport("goop template MAT3 has no material-zero remap".to_string())
+        })?;
+    let active_record = materials
+        .material_init_records
+        .get(material_zero_init)
+        .cloned()
+        .ok_or_else(|| {
+            SceneError::StageExport(format!(
+                "goop template material-zero remap {material_zero_init} is out of bounds"
+            ))
+        })?;
+
+    materials.material_count = 1;
+    materials.material_init_records = vec![active_record];
+    let remap = materials
+        .tables
+        .iter_mut()
+        .find(|table| table.kind == J3dMaterialTableKind::MaterialRemap)
+        .expect("material-zero remap was found above");
+    remap.allocation = J3dScalarArray::Unsigned16(vec![0]);
+    if let Some(names) = &mut materials.names {
+        names.entries.truncate(1);
+    }
+
+    if let Some(indirect) = materials
+        .tables
+        .iter_mut()
+        .find(|table| table.kind == J3dMaterialTableKind::IndirectInit)
+    {
+        let J3dScalarArray::Unsigned8(bytes) = &mut indirect.allocation else {
+            return Err(SceneError::StageExport(
+                "goop template MAT3 indirect-material bank is malformed".to_string(),
+            ));
+        };
+        if bytes.len() < INDIRECT_MATERIAL_RECORD_SIZE {
+            return Err(SceneError::StageExport(format!(
+                "goop template MAT3 indirect-material bank has {} bytes, expected at least {INDIRECT_MATERIAL_RECORD_SIZE}",
+                bytes.len()
+            )));
+        }
+        bytes.truncate(INDIRECT_MATERIAL_RECORD_SIZE);
+    }
+    Ok(())
 }
 
 fn triangle_normal_y(vertices: [[f32; 3]; 3]) -> f32 {
@@ -1563,6 +1626,32 @@ impl StageDocument {
         Ok(())
     }
 
+    /// Updates only the bitmap resource changed by an interactive paint stroke.
+    ///
+    /// The layer layout, YMP metadata, and generated model are unchanged while
+    /// painting, so recompiling every authored goop resource here would clone
+    /// and re-index the complete stage overlay on mouse release.
+    pub fn compile_goop_layer_mask(&mut self, layer_index: usize) -> Result<()> {
+        let (resource_stem, bitmap) = self
+            .goop_authoring
+            .as_ref()
+            .and_then(|authoring| authoring.layers.get(layer_index))
+            .and_then(|layer| {
+                layer
+                    .bitmap
+                    .as_ref()
+                    .map(|bitmap| (layer.resource_stem.clone(), bitmap.clone()))
+            })
+            .ok_or_else(|| {
+                SceneError::StageExport(format!("goop layer {layer_index} has no editable bitmap"))
+            })?;
+        self.archive_edits.upsert_resource(
+            format!("map/pollution/{resource_stem}.bmp").into_bytes(),
+            StageResourceDocument::Bitmap(bitmap),
+        );
+        Ok(())
+    }
+
     pub fn effective_terrain_fingerprint(&self) -> Result<u64> {
         let model = self
             .effective_resource_clone(b"map/map/map.bmd")?
@@ -1706,6 +1795,65 @@ mod tests {
             map_offset: 0,
             depth_map: vec![depth; width * height],
         }
+    }
+
+    #[test]
+    fn paint_stroke_compiles_only_its_bitmap_without_serializing_the_overlay() {
+        let region = GoopRegion {
+            min_x: 0.0,
+            min_z: 0.0,
+            max_x: 320.0,
+            max_z: 160.0,
+        };
+        let mut layer = GoopLayerAuthoring {
+            id: "painted".to_string(),
+            runtime_index: 0,
+            origin: GoopLayerOrigin::Generated,
+            plane: GoopPlane::Floor,
+            behavior: GoopBehavior::Normal,
+            visible: true,
+            region,
+            runtime: floor_runtime(region, 3, 2, 0.0, 1),
+            bitmap: Some(BmpFile::new_pollution_mask(8, 4, vec![0; 32]).unwrap()),
+            generated_model: None,
+            style_source: None,
+            resource_stem: "pollution00".to_string(),
+            metadata_dirty: false,
+        };
+        let mut painted = vec![0; 32];
+        painted[11] = 192;
+        layer.set_mask(&painted).unwrap();
+        let mut document = StageDocument {
+            stage_id: "test".to_string(),
+            base_root: std::path::PathBuf::new(),
+            assets: Vec::new(),
+            objects: Vec::new(),
+            changed_files: std::collections::BTreeMap::new(),
+            stage_archive: None,
+            stage_archive_source_path: None,
+            archive_edits: Default::default(),
+            registry: None,
+            route_authoring: None,
+            goop_authoring: Some(GoopAuthoringDocument {
+                layers: vec![layer],
+                ..Default::default()
+            }),
+            load_issues: Vec::new(),
+            lighting: Default::default(),
+            actor_previews: std::collections::BTreeMap::new(),
+            loaded_project: None,
+        };
+
+        document.compile_goop_layer_mask(0).unwrap();
+
+        assert!(document.changed_files.is_empty());
+        assert_eq!(document.archive_edits.resources.len(), 1);
+        let edit = &document.archive_edits.resources[0];
+        assert_eq!(edit.raw_resource_path, b"map/pollution/pollution00.bmp");
+        let StageResourceDocument::Bitmap(bitmap) = &edit.document else {
+            panic!("paint stroke compiled a non-bitmap resource");
+        };
+        assert_eq!(bitmap.top_down_indices().unwrap(), painted);
     }
 
     #[test]
@@ -2059,7 +2207,7 @@ mod tests {
     }
 
     #[test]
-    fn pollution_model_separates_normalized_mask_uvs_from_repeating_detail_uvs() {
+    fn pollution_model_prunes_orphan_materials_and_separates_detail_uvs() {
         let encode_texture = |name: &str| {
             GxEncodedTexture::encode_rgba(
                 name,
@@ -2192,19 +2340,18 @@ mod tests {
             .iter()
             .find(|material| material.material_index == 0)
             .unwrap();
+        assert_eq!(preview.materials.len(), 1);
+        assert_eq!(material.name, "goop-material-zero");
+        assert!(preview
+            .triangles
+            .iter()
+            .all(|triangle| triangle.material_index == Some(0)));
         assert_eq!(material.tex_gens[0].source, 4);
         assert_eq!(material.tex_gens[0].matrix, 60);
         assert_eq!(material.texture_indices[1], Some(1));
         assert_eq!(material.texture_indices[2], Some(2));
         assert_eq!(material.tex_gens[1].source, 5);
         assert_eq!(material.tex_gens[2].source, 6);
-        let unrelated_material = preview
-            .materials
-            .iter()
-            .find(|material| material.material_index == 1)
-            .unwrap();
-        assert_eq!(unrelated_material.tex_gens[1].source, 4);
-        assert_eq!(unrelated_material.tex_gens[2].source, 4);
         for slot in [1, 2] {
             let detail_span = preview
                 .triangles

@@ -349,6 +349,197 @@ impl J3dAnimationRebuildDocument {
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         self.encode()
     }
+
+    /// Retains only material-animation bindings whose J3D material name
+    /// exactly matches `material_name`.
+    ///
+    /// Joint animations do not bind materials and return `None`. Material
+    /// animations return the number of surviving bindings. Texture-SRT value
+    /// banks are compacted and the surviving key-table offsets are rewritten so
+    /// removed bindings cannot leave non-padding bytes outside the typed model.
+    pub fn retain_material_bindings_named(&mut self, material_name: &str) -> Result<Option<usize>> {
+        match &mut self.section {
+            J3dAnimationSection::JointKey(_) => Ok(None),
+            J3dAnimationSection::TexturePattern(value) => {
+                require_equal(
+                    value.material_remap.len(),
+                    value.tables.len(),
+                    "pattern remap count",
+                )?;
+                require_equal(
+                    value.material_names.entries.len(),
+                    value.tables.len(),
+                    "pattern name count",
+                )?;
+                let keep = matching_material_indices(&value.material_names, material_name);
+                value.tables = select_indices(&value.tables, &keep);
+                value.material_remap = select_indices(&value.material_remap, &keep);
+                value.material_names.entries = select_indices(&value.material_names.entries, &keep);
+                Ok(Some(keep.len()))
+            }
+            J3dAnimationSection::TextureSrt(value) => {
+                let primary = retain_srt_material_bindings(&mut value.primary, material_name)?;
+                let post = retain_srt_material_bindings(&mut value.post, material_name)?;
+                Ok(Some(primary + post))
+            }
+            J3dAnimationSection::MaterialColor(value) => {
+                require_equal(
+                    value.material_remap.len(),
+                    value.tables.len(),
+                    "color remap count",
+                )?;
+                require_equal(
+                    value.material_names.entries.len(),
+                    value.tables.len(),
+                    "color name count",
+                )?;
+                let keep = matching_material_indices(&value.material_names, material_name);
+                value.tables = select_indices(&value.tables, &keep);
+                value.material_remap = select_indices(&value.material_remap, &keep);
+                value.material_names.entries = select_indices(&value.material_names.entries, &keep);
+                Ok(Some(keep.len()))
+            }
+            J3dAnimationSection::TevRegister(value) => {
+                let color =
+                    retain_tev_material_bindings(&mut value.color_registers, material_name)?;
+                let konst =
+                    retain_tev_material_bindings(&mut value.konst_registers, material_name)?;
+                Ok(Some(color + konst))
+            }
+        }
+    }
+}
+
+fn matching_material_indices(names: &J3dAnimationNameTable, material_name: &str) -> Vec<usize> {
+    names
+        .entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| (entry.name == material_name).then_some(index))
+        .collect()
+}
+
+fn select_indices<T: Clone>(values: &[T], indices: &[usize]) -> Vec<T> {
+    indices.iter().map(|index| values[*index].clone()).collect()
+}
+
+fn retain_srt_material_bindings(
+    value: &mut J3dTextureSrtSet,
+    material_name: &str,
+) -> Result<usize> {
+    if !value.tables.len().is_multiple_of(3) {
+        return Err(unsupported("SRT table count must be divisible by 3"));
+    }
+    let binding_count = value.tables.len() / 3;
+    require_equal(value.material_remap.len(), binding_count, "SRT remap count")?;
+    require_equal(
+        value.material_names.entries.len(),
+        binding_count,
+        "SRT name count",
+    )?;
+    require_equal(
+        value.texture_matrix_ids.len(),
+        binding_count,
+        "SRT matrix ID count",
+    )?;
+    require_equal(value.centers.len(), binding_count, "SRT center count")?;
+
+    let keep = matching_material_indices(&value.material_names, material_name);
+    value.tables = keep
+        .iter()
+        .flat_map(|index| value.tables[index * 3..index * 3 + 3].iter().cloned())
+        .collect();
+    value.material_remap = select_indices(&value.material_remap, &keep);
+    value.material_names.entries = select_indices(&value.material_names.entries, &keep);
+    value.texture_matrix_ids = select_indices(&value.texture_matrix_ids, &keep);
+    value.centers = select_indices(&value.centers, &keep);
+    compact_srt_value_banks(value)?;
+    Ok(keep.len())
+}
+
+fn compact_srt_value_banks(value: &mut J3dTextureSrtSet) -> Result<()> {
+    let scales = std::mem::take(&mut value.scales);
+    value.scales =
+        compact_transform_value_bank(&mut value.tables, &scales, |table| &mut table.scale)?;
+    let rotations = std::mem::take(&mut value.rotations);
+    value.rotations =
+        compact_transform_value_bank(&mut value.tables, &rotations, |table| &mut table.rotation)?;
+    let translations = std::mem::take(&mut value.translations);
+    value.translations = compact_transform_value_bank(&mut value.tables, &translations, |table| {
+        &mut table.translation
+    })?;
+    Ok(())
+}
+
+fn compact_transform_value_bank<T: Clone>(
+    tables: &mut [J3dTransformKeyTable],
+    source: &[T],
+    component: fn(&mut J3dTransformKeyTable) -> &mut J3dKeyTable,
+) -> Result<Vec<T>> {
+    let mut compacted = Vec::new();
+    let mut relocated = std::collections::BTreeMap::new();
+    for transform in tables {
+        let table = component(transform);
+        let value_count = key_table_value_count(*table)?;
+        if value_count == 0 {
+            table.value_offset = 0;
+            continue;
+        }
+        let start = usize::from(table.value_offset);
+        let end = start
+            .checked_add(value_count)
+            .ok_or_else(|| invalid(start, source.len()))?;
+        let values = source
+            .get(start..end)
+            .ok_or_else(|| invalid(end, source.len()))?;
+        let new_offset = if let Some(offset) = relocated.get(&(start, value_count)) {
+            *offset
+        } else {
+            let offset = to_u16(compacted.len(), "compacted SRT value offset")?;
+            compacted.extend_from_slice(values);
+            relocated.insert((start, value_count), offset);
+            offset
+        };
+        table.value_offset = new_offset;
+    }
+    Ok(compacted)
+}
+
+fn key_table_value_count(table: J3dKeyTable) -> Result<usize> {
+    let stride = match table.key_count {
+        0 => return Ok(0),
+        1 => 1,
+        _ if table.tangent_type == 0 => 3,
+        _ if table.tangent_type == 1 => 4,
+        _ => {
+            return Err(unsupported(format!(
+                "unsupported tangent type {}",
+                table.tangent_type
+            )));
+        }
+    };
+    Ok(usize::from(table.key_count) * stride)
+}
+
+fn retain_tev_material_bindings(
+    value: &mut J3dTevRegisterSet,
+    material_name: &str,
+) -> Result<usize> {
+    require_equal(
+        value.material_remap.len(),
+        value.tables.len(),
+        "TEV remap count",
+    )?;
+    require_equal(
+        value.material_names.entries.len(),
+        value.tables.len(),
+        "TEV name count",
+    )?;
+    let keep = matching_material_indices(&value.material_names, material_name);
+    value.tables = select_indices(&value.tables, &keep);
+    value.material_remap = select_indices(&value.material_remap, &keep);
+    value.material_names.entries = select_indices(&value.material_names.entries, &keep);
+    Ok(keep.len())
 }
 
 fn parse_ank1(bytes: &[u8], coverage: &mut Coverage) -> Result<J3dJointKeyAnimationSection> {
@@ -1002,19 +1193,7 @@ fn validate_color_tables<'a>(
 }
 
 fn validate_key_table(table: J3dKeyTable, bank_len: usize) -> Result<()> {
-    let stride = match table.key_count {
-        0 => return Ok(()),
-        1 => 1,
-        _ if table.tangent_type == 0 => 3,
-        _ if table.tangent_type == 1 => 4,
-        _ => {
-            return Err(unsupported(format!(
-                "unsupported tangent type {}",
-                table.tangent_type
-            )));
-        }
-    };
-    let end = table.value_offset as usize + table.key_count as usize * stride;
+    let end = usize::from(table.value_offset) + key_table_value_count(table)?;
     if end > bank_len {
         return Err(invalid(end, bank_len));
     }
@@ -1161,25 +1340,14 @@ impl Coverage {
                 .position(|covered| *covered)
                 .map_or(self.bytes.len(), |length| offset + length);
             let data = &source[offset..end];
-            let style = if data.iter().all(|byte| *byte == 0) {
-                Some(J3dAnimationPaddingStyle::Zero)
-            } else if data.iter().all(|byte| *byte == 0xFF) {
-                Some(J3dAnimationPaddingStyle::Ff)
-            } else if data
-                .iter()
-                .enumerate()
-                .all(|(index, byte)| *byte == RETAIL_PADDING[index % RETAIL_PADDING.len()])
-            {
-                Some(J3dAnimationPaddingStyle::RetailPhrase)
-            } else {
-                None
-            };
-            if let Some(style) = style {
-                padding.push(J3dAnimationPaddingRegion {
-                    section_offset: to_u32(offset, "padding offset")?,
-                    length: to_u32(end - offset, "padding length")?,
-                    style,
-                });
+            if let Some(segments) = canonical_padding_segments(data) {
+                for (relative_offset, length, style) in segments {
+                    padding.push(J3dAnimationPaddingRegion {
+                        section_offset: to_u32(offset + relative_offset, "padding offset")?,
+                        length: to_u32(length, "padding length")?,
+                        style,
+                    });
+                }
             } else if allow_ttk1_residue && offset.is_multiple_of(4) {
                 residue.push(J3dTextureSrtResidueRegion {
                     section_offset: to_u32(offset, "TTK1 creator residue offset")?,
@@ -1194,6 +1362,48 @@ impl Coverage {
         }
         Ok((padding, residue))
     }
+}
+
+fn canonical_padding_segments(
+    data: &[u8],
+) -> Option<Vec<(usize, usize, J3dAnimationPaddingStyle)>> {
+    let mut segments = Vec::new();
+    let mut offset = 0;
+    while offset < data.len() {
+        let (length, style) = if data[offset] == 0 {
+            (
+                data[offset..].iter().take_while(|byte| **byte == 0).count(),
+                J3dAnimationPaddingStyle::Zero,
+            )
+        } else if data[offset] == 0xFF {
+            (
+                data[offset..]
+                    .iter()
+                    .take_while(|byte| **byte == 0xFF)
+                    .count(),
+                J3dAnimationPaddingStyle::Ff,
+            )
+        } else if data[offset] == RETAIL_PADDING[0] {
+            (
+                data[offset..]
+                    .iter()
+                    .enumerate()
+                    .take_while(|(index, byte)| {
+                        **byte == RETAIL_PADDING[index % RETAIL_PADDING.len()]
+                    })
+                    .count(),
+                J3dAnimationPaddingStyle::RetailPhrase,
+            )
+        } else {
+            return None;
+        };
+        if length == 0 {
+            return None;
+        }
+        segments.push((offset, length, style));
+        offset += length;
+    }
+    Some(segments)
 }
 
 fn parse_header_tag(bytes: &[u8]) -> Result<J3dAnimationHeaderTag> {
@@ -1517,6 +1727,117 @@ mod tests {
     }
 
     #[test]
+    fn uncovered_padding_can_change_canonical_style_without_becoming_residue() {
+        let mut source = vec![0; 0x80];
+        source[0x70..0x80].copy_from_slice(&RETAIL_PADDING[..0x10]);
+        let coverage = Coverage::new(source.len());
+        let (padding, residue) = coverage
+            .classify_uncovered(&source, 0x60, true)
+            .expect("split adjacent canonical padding styles");
+        assert!(residue.is_empty());
+        assert_eq!(padding.len(), 2);
+        assert_eq!(padding[0].section_offset, 0x60);
+        assert_eq!(padding[0].length, 0x10);
+        assert_eq!(padding[0].style, J3dAnimationPaddingStyle::Zero);
+        assert_eq!(padding[1].section_offset, 0x70);
+        assert_eq!(padding[1].length, 0x10);
+        assert_eq!(padding[1].style, J3dAnimationPaddingStyle::RetailPhrase);
+    }
+
+    #[test]
+    fn texture_srt_filter_removes_bindings_for_pruned_model_materials() {
+        let transform_table = |marker| J3dTransformKeyTable {
+            scale: J3dKeyTable {
+                key_count: 1,
+                value_offset: marker / 3,
+                tangent_type: marker,
+            },
+            rotation: J3dKeyTable {
+                key_count: 1,
+                value_offset: marker / 3,
+                tangent_type: marker,
+            },
+            translation: J3dKeyTable {
+                key_count: 1,
+                value_offset: marker / 3,
+                tangent_type: marker,
+            },
+        };
+        let names = ["orphan-a", "active", "orphan-b"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| J3dAnimationNameEntry {
+                relative_offset: 0x20 + index as u16 * 0x10,
+                name: name.to_string(),
+            })
+            .collect();
+        let primary = J3dTextureSrtSet {
+            tables: (0..9).map(transform_table).collect(),
+            material_remap: vec![10, 11, 12],
+            material_names: J3dAnimationNameTable { entries: names },
+            texture_matrix_ids: vec![0, 1, 2],
+            centers: vec![[0.0; 3], [1.0; 3], [2.0; 3]],
+            scales: vec![1.0, 2.0, 3.0],
+            rotations: vec![10, 20, 30],
+            translations: vec![100.0, 200.0, 300.0],
+            offsets: [0; 8],
+        };
+        let post = J3dTextureSrtSet {
+            tables: Vec::new(),
+            material_remap: Vec::new(),
+            material_names: J3dAnimationNameTable {
+                entries: Vec::new(),
+            },
+            texture_matrix_ids: Vec::new(),
+            centers: Vec::new(),
+            scales: Vec::new(),
+            rotations: Vec::new(),
+            translations: Vec::new(),
+            offsets: [0; 8],
+        };
+        let mut animation = J3dAnimationRebuildDocument {
+            header_tag: J3dAnimationHeaderTag::Svr1,
+            layout: J3dAnimationLayout {
+                actual_section_size: 0x200,
+                declared_section_size: 0x200,
+                padding: Vec::new(),
+            },
+            section: J3dAnimationSection::TextureSrt(J3dTextureSrtAnimationSection {
+                attribute: 0,
+                rotation_shift: 0,
+                max_frame: 30,
+                primary,
+                post,
+                reconstruction: J3dTextureSrtReconstructionMetadata::default(),
+            }),
+        };
+
+        assert_eq!(
+            animation
+                .retain_material_bindings_named("active")
+                .expect("filter valid SRT animation"),
+            Some(1)
+        );
+        let J3dAnimationSection::TextureSrt(filtered) = &animation.section else {
+            panic!("animation changed section kind");
+        };
+        assert_eq!(filtered.primary.tables.len(), 3);
+        assert_eq!(filtered.primary.tables[0].scale.tangent_type, 3);
+        assert_eq!(filtered.primary.material_remap, [11]);
+        assert_eq!(filtered.primary.material_names.entries[0].name, "active");
+        assert_eq!(filtered.primary.texture_matrix_ids, [1]);
+        assert_eq!(filtered.primary.centers, [[1.0; 3]]);
+        assert_eq!(filtered.primary.scales, [2.0]);
+        assert_eq!(filtered.primary.rotations, [20]);
+        assert_eq!(filtered.primary.translations, [200.0]);
+        assert!(filtered.primary.tables.iter().all(|table| {
+            table.scale.value_offset == 0
+                && table.rotation.value_offset == 0
+                && table.translation.value_offset == 0
+        }));
+    }
+
+    #[test]
     fn ttk1_creator_word_is_transparent_typed_reconstruction_metadata() {
         for word in [0, 1, 0x5468_6973, 0x8015_0C68, 0x8015_14A8, u32::MAX] {
             let metadata = J3dTextureSrtCreatorWord(word);
@@ -1604,6 +1925,31 @@ mod tests {
         assert!(!texture_srt.reconstruction.residue_regions.is_empty());
         original.fill(0);
         assert_eq!(document.encode().expect("rebuild local BTK"), expected);
+
+        let material_name = texture_srt
+            .primary
+            .material_names
+            .entries
+            .first()
+            .or_else(|| texture_srt.post.material_names.entries.first())
+            .expect("local BTK has a material binding")
+            .name
+            .clone();
+        let mut filtered = document.clone();
+        let retained = filtered
+            .retain_material_bindings_named(&material_name)
+            .expect("filter local BTK")
+            .expect("BTK is a material animation");
+        assert!(retained > 0);
+        let filtered_bytes = filtered.encode().expect("encode filtered local BTK");
+        let mut reparsed = J3dAnimationRebuildDocument::parse(&filtered_bytes)
+            .expect("reparse filtered local BTK");
+        assert_eq!(
+            reparsed
+                .retain_material_bindings_named(&material_name)
+                .expect("refilter reparsed local BTK"),
+            Some(retained)
+        );
     }
 
     #[test]

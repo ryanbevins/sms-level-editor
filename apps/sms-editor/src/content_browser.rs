@@ -121,6 +121,7 @@ impl ContentKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum ContentItemId {
     GameFolder(Vec<String>),
+    StageFolder(String),
     Stage {
         stage_id: String,
         project_scope: Option<String>,
@@ -143,6 +144,9 @@ impl ContentItemId {
     pub(super) fn stable_key(&self) -> String {
         match self {
             Self::GameFolder(path) => format!("game:folder:{}", path.join("/")),
+            Self::StageFolder(group) => {
+                format!("game:stage-folder:{}", group.to_ascii_lowercase())
+            }
             Self::Stage {
                 stage_id,
                 project_scope,
@@ -248,6 +252,13 @@ impl ContentItemSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct GameStageFolderSummary {
+    group: String,
+    title: String,
+    stage_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RawFilterKey {
     revision: u64,
     node: ContentNode,
@@ -288,6 +299,7 @@ struct ContentBrowserLocation {
     node: ContentNode,
     raw_kind_filter: Option<GameResourceKind>,
     game_file_path: Vec<String>,
+    game_stage_group: Option<String>,
     model_folder: Option<String>,
 }
 
@@ -307,6 +319,7 @@ pub(super) struct ContentBrowserState {
     raw_filter_cache: Option<RawFilterCache>,
     raw_directory_cache: Option<RawDirectoryCache>,
     game_file_path: Vec<String>,
+    game_stage_group: Option<String>,
     location_back: Vec<ContentBrowserLocation>,
     location_forward: Vec<ContentBrowserLocation>,
     preview_item: Option<ContentItemId>,
@@ -339,6 +352,7 @@ impl Default for ContentBrowserState {
             raw_filter_cache: None,
             raw_directory_cache: None,
             game_file_path: Vec::new(),
+            game_stage_group: None,
             location_back: Vec::new(),
             location_forward: Vec::new(),
             preview_item: None,
@@ -349,6 +363,7 @@ impl Default for ContentBrowserState {
 #[derive(Debug, Clone)]
 enum ContentBrowserCommand {
     OpenGameFolder(Vec<String>),
+    OpenStageFolder(String),
     OpenStage(String),
     ArmObject(String),
     SpawnObject(String),
@@ -475,6 +490,7 @@ impl SmsEditorApp {
             node: self.content_browser.node,
             raw_kind_filter: self.content_browser.raw_kind_filter,
             game_file_path: self.content_browser.game_file_path.clone(),
+            game_stage_group: self.content_browser.game_stage_group.clone(),
             model_folder: self.model_folder_filter.clone(),
         }
     }
@@ -483,6 +499,7 @@ impl SmsEditorApp {
         self.content_browser.node = location.node;
         self.content_browser.raw_kind_filter = location.raw_kind_filter;
         self.content_browser.game_file_path = location.game_file_path;
+        self.content_browser.game_stage_group = location.game_stage_group;
         self.model_folder_filter = location.model_folder;
         self.content_browser.source_filter = None;
         self.content_browser.type_filter = None;
@@ -507,6 +524,13 @@ impl SmsEditorApp {
         let mut location = self.current_content_location();
         location.node = ContentNode::GameFiles;
         location.game_file_path = path;
+        self.navigate_content_to(location);
+    }
+
+    fn navigate_game_stages_to(&mut self, group: Option<String>) {
+        let mut location = self.current_content_location();
+        location.node = ContentNode::GameStages;
+        location.game_stage_group = group;
         self.navigate_content_to(location);
     }
 
@@ -569,18 +593,26 @@ impl SmsEditorApp {
             {
                 self.navigate_content_forward();
             }
-            if self.content_browser.node == ContentNode::GameFiles
+            let can_navigate_up = match self.content_browser.node {
+                ContentNode::GameFiles => !self.content_browser.game_file_path.is_empty(),
+                ContentNode::GameStages => self.content_browser.game_stage_group.is_some(),
+                _ => false,
+            };
+            if can_navigate_up
                 && ui
-                    .add_enabled(
-                        !self.content_browser.game_file_path.is_empty(),
-                        egui::Button::new("Up"),
-                    )
+                    .button("Up")
                     .on_hover_text("Open the parent folder")
                     .clicked()
             {
-                let mut parent = self.content_browser.game_file_path.clone();
-                parent.pop();
-                self.navigate_game_files_to(parent);
+                match self.content_browser.node {
+                    ContentNode::GameFiles => {
+                        let mut parent = self.content_browser.game_file_path.clone();
+                        parent.pop();
+                        self.navigate_game_files_to(parent);
+                    }
+                    ContentNode::GameStages => self.navigate_game_stages_to(None),
+                    _ => {}
+                }
             }
             if compact {
                 egui::ComboBox::from_id_salt("content-browser-node")
@@ -619,6 +651,46 @@ impl SmsEditorApp {
                                 }
                             }
                         });
+                }
+                if self.content_browser.node == ContentNode::GameStages {
+                    let folders = self.game_stage_folders();
+                    let selected = self
+                        .content_browser
+                        .game_stage_group
+                        .as_deref()
+                        .and_then(|group| {
+                            folders
+                                .iter()
+                                .find(|folder| folder.group.eq_ignore_ascii_case(group))
+                        })
+                        .map_or("All Levels", |folder| folder.title.as_str());
+                    let mut next_group = None;
+                    egui::ComboBox::from_id_salt("content-browser-stage-folder")
+                        .selected_text(selected)
+                        .show_ui(ui, |ui| {
+                            if ui
+                                .selectable_label(
+                                    self.content_browser.game_stage_group.is_none(),
+                                    "All Levels",
+                                )
+                                .clicked()
+                            {
+                                next_group = Some(None);
+                            }
+                            for folder in &folders {
+                                let active = self
+                                    .content_browser
+                                    .game_stage_group
+                                    .as_deref()
+                                    .is_some_and(|group| group.eq_ignore_ascii_case(&folder.group));
+                                if ui.selectable_label(active, &folder.title).clicked() {
+                                    next_group = Some(Some(folder.group.clone()));
+                                }
+                            }
+                        });
+                    if let Some(group) = next_group {
+                        self.navigate_game_stages_to(group);
+                    }
                 }
             } else {
                 ui.add_sized(
@@ -843,6 +915,16 @@ impl SmsEditorApp {
     }
 
     fn content_browser_breadcrumb(&self) -> String {
+        if self.content_browser.node == ContentNode::GameStages {
+            if let Some(group) = self.content_browser.game_stage_group.as_deref() {
+                let title = self
+                    .game_stage_folders()
+                    .into_iter()
+                    .find(|folder| folder.group.eq_ignore_ascii_case(group))
+                    .map_or_else(|| humanize_stage_group(group), |folder| folder.title);
+                return format!("{} / {title}", self.content_browser.node.breadcrumb());
+            }
+        }
         if self.content_browser.node != ContentNode::GameFiles
             || self.content_browser.game_file_path.is_empty()
         {
@@ -981,6 +1063,39 @@ impl SmsEditorApp {
                             ] {
                                 if source_tree_node(ui, self.content_browser.node, node, 8.0) {
                                     next = Some(node);
+                                }
+                            }
+                            if self.content_browser.node == ContentNode::GameStages {
+                                let folders = self.game_stage_folders();
+                                if ui
+                                    .selectable_label(
+                                        self.content_browser.game_stage_group.is_none(),
+                                        "      All Levels",
+                                    )
+                                    .clicked()
+                                {
+                                    self.navigate_game_stages_to(None);
+                                }
+                                for folder in folders {
+                                    let selected = self
+                                        .content_browser
+                                        .game_stage_group
+                                        .as_deref()
+                                        .is_some_and(|group| {
+                                            group.eq_ignore_ascii_case(&folder.group)
+                                        });
+                                    if ui
+                                        .selectable_label(
+                                            selected,
+                                            format!(
+                                                "      {}  {}",
+                                                folder.title, folder.stage_count
+                                            ),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.navigate_game_stages_to(Some(folder.group));
+                                    }
                                 }
                             }
                             if self.content_browser.node == ContentNode::GameFiles {
@@ -1457,16 +1572,31 @@ impl SmsEditorApp {
     }
 
     fn filtered_content_items(&self) -> Vec<ContentItemSummary> {
-        let mut items = self.all_content_items();
         let query = self.content_browser.query.trim().to_ascii_lowercase();
+        let browsing_stage_folders = self.content_browser.node == ContentNode::GameStages
+            && self.content_browser.game_stage_group.is_none()
+            && query.is_empty();
+        let mut items = if browsing_stage_folders {
+            self.game_stage_folders()
+                .into_iter()
+                .map(game_stage_folder_content_item)
+                .collect()
+        } else {
+            self.all_content_items()
+        };
         items.retain(|item| {
-            self.content_item_in_current_node(item)
-                && content_item_matches_facets(
+            let matches_facets = if matches!(&item.id, ContentItemId::StageFolder(_)) {
+                self.content_browser.source_filter != Some(ContentSource::Project)
+            } else {
+                content_item_matches_facets(
                     item,
                     self.content_browser.source_filter,
                     self.content_browser.type_filter,
                     self.content_browser.capability_filter,
                 )
+            };
+            self.content_item_in_current_node(item)
+                && matches_facets
                 && query_matches(&item.search_text, &query)
         });
 
@@ -1505,6 +1635,36 @@ impl SmsEditorApp {
             }),
         }
         items
+    }
+
+    fn game_stage_folders(&self) -> Vec<GameStageFolderSummary> {
+        let mut groups = BTreeMap::<String, (usize, Option<String>)>::new();
+        for archive in self
+            .scene_archives
+            .iter()
+            .filter(|archive| archive.size_bytes != 0)
+        {
+            let group = retail_stage_folder_key(archive);
+            let entry = groups.entry(group).or_default();
+            entry.0 += 1;
+            if entry.1.is_none() {
+                entry.1 = self
+                    .scene_labels
+                    .get(&archive.stage_id.to_ascii_lowercase())
+                    .and_then(|label| label.stage_name.clone())
+                    .filter(|name| !name.trim().is_empty());
+            }
+        }
+        groups
+            .into_iter()
+            .map(
+                |(group, (stage_count, localized_name))| GameStageFolderSummary {
+                    title: localized_name.unwrap_or_else(|| humanize_stage_group(&group)),
+                    group,
+                    stage_count,
+                },
+            )
+            .collect()
     }
 
     fn all_content_items(&self) -> Vec<ContentItemSummary> {
@@ -1765,7 +1925,24 @@ impl SmsEditorApp {
             }
             ContentNode::ProjectModels => item.kind == ContentKind::Model,
             ContentNode::GameStages => {
-                item.kind == ContentKind::Stage && item.source == ContentSource::Game
+                if let ContentItemId::StageFolder(_) = &item.id {
+                    return self.content_browser.game_stage_group.is_none();
+                }
+                if item.kind != ContentKind::Stage || item.source != ContentSource::Game {
+                    return false;
+                }
+                let Some(selected_group) = self.content_browser.game_stage_group.as_deref() else {
+                    return true;
+                };
+                let ContentItemId::Stage { stage_id, .. } = &item.id else {
+                    return false;
+                };
+                self.scene_archives
+                    .iter()
+                    .find(|archive| archive.stage_id.eq_ignore_ascii_case(stage_id))
+                    .is_some_and(|archive| {
+                        retail_stage_folder_key(archive).eq_ignore_ascii_case(selected_group)
+                    })
             }
             ContentNode::GameObjects => item.kind == ContentKind::Object,
             ContentNode::GameSkyboxes => item.kind == ContentKind::Skybox,
@@ -1837,6 +2014,7 @@ impl SmsEditorApp {
         let mut location = self.current_content_location();
         location.node = node;
         location.model_folder = None;
+        location.game_stage_group = None;
         if node == ContentNode::GameFiles {
             location.raw_kind_filter = None;
         } else {
@@ -2226,6 +2404,9 @@ impl SmsEditorApp {
     fn run_content_browser_command(&mut self, command: ContentBrowserCommand) {
         match command {
             ContentBrowserCommand::OpenGameFolder(path) => self.navigate_game_files_to(path),
+            ContentBrowserCommand::OpenStageFolder(group) => {
+                self.navigate_game_stages_to(Some(group))
+            }
             ContentBrowserCommand::OpenStage(stage_id) => self.request_open_stage(stage_id),
             ContentBrowserCommand::ArmObject(factory_name) => {
                 if self.can_spawn_factory(&factory_name) {
@@ -2391,6 +2572,11 @@ impl SmsEditorApp {
             ContentItemId::GameFolder(path) => {
                 if ui.button("Open Folder").clicked() {
                     command = Some(ContentBrowserCommand::OpenGameFolder(path.clone()));
+                }
+            }
+            ContentItemId::StageFolder(group) => {
+                if ui.button("Open Folder").clicked() {
+                    command = Some(ContentBrowserCommand::OpenStageFolder(group.clone()));
                 }
             }
             ContentItemId::Stage { stage_id, .. } => {
@@ -2631,6 +2817,13 @@ impl SmsEditorApp {
         if let ContentItemId::GameFolder(path) = id {
             return Some(game_folder_content_item(path));
         }
+        if let ContentItemId::StageFolder(group) = id {
+            return self
+                .game_stage_folders()
+                .into_iter()
+                .find(|folder| folder.group.eq_ignore_ascii_case(group))
+                .map(game_stage_folder_content_item);
+        }
         if let ContentItemId::GameFile(raw_id) = id {
             return self.raw_metadata_by_id(raw_id).map(raw_content_item);
         }
@@ -2827,6 +3020,9 @@ fn safe_default_command(item: &ContentItemSummary) -> Option<ContentBrowserComma
     match &item.id {
         ContentItemId::GameFolder(path) => {
             Some(ContentBrowserCommand::OpenGameFolder(path.clone()))
+        }
+        ContentItemId::StageFolder(group) => {
+            Some(ContentBrowserCommand::OpenStageFolder(group.clone()))
         }
         ContentItemId::Stage { stage_id, .. } => {
             Some(ContentBrowserCommand::OpenStage(stage_id.clone()))
@@ -3527,6 +3723,55 @@ fn game_folder_content_item(path: &[String]) -> ContentItemSummary {
     }
 }
 
+fn retail_stage_folder_key(archive: &SceneArchiveInfo) -> String {
+    archive
+        .group
+        .split('_')
+        .next()
+        .filter(|group| !group.is_empty())
+        .unwrap_or(&archive.stage_id)
+        .to_ascii_lowercase()
+}
+
+fn humanize_stage_group(group: &str) -> String {
+    group
+        .split(['_', '-', ' '])
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut characters = part.chars();
+            let Some(first) = characters.next() else {
+                return String::new();
+            };
+            format!("{}{}", first.to_uppercase(), characters.as_str())
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn game_stage_folder_content_item(folder: GameStageFolderSummary) -> ContentItemSummary {
+    let stage_word = if folder.stage_count == 1 {
+        "stage"
+    } else {
+        "stages"
+    };
+    ContentItemSummary {
+        id: ContentItemId::StageFolder(folder.group.clone()),
+        kind: ContentKind::Folder,
+        source: ContentSource::Game,
+        title: folder.title.clone(),
+        subtitle: format!("{} {stage_word}", folder.stage_count),
+        detail: "Original game levels".to_string(),
+        search_text: format!("{} {} levels stages", folder.group, folder.title)
+            .to_ascii_lowercase(),
+        capabilities: ContentCapabilities {
+            open: true,
+            inspect: true,
+            ..ContentCapabilities::default()
+        },
+        selected_in_scene: false,
+    }
+}
+
 fn raw_content_item(metadata: &GameFileMetadata) -> ContentItemSummary {
     let title = metadata
         .display_path
@@ -3849,6 +4094,63 @@ fn paint_content_thumbnail(
 #[cfg(test)]
 mod unified_browser_tests {
     use super::*;
+
+    fn retail_stage(stage_id: &str, group: &str) -> SceneArchiveInfo {
+        SceneArchiveInfo {
+            stage_id: stage_id.to_string(),
+            group: group.to_string(),
+            relative_path: format!("files/data/scene/{stage_id}.szs").into(),
+            path: format!("C:/game/files/data/scene/{stage_id}.szs").into(),
+            size_bytes: 1,
+        }
+    }
+
+    #[test]
+    fn game_stage_folders_group_regular_and_special_area_stages() {
+        let mut app = SmsEditorApp {
+            scene_archives: vec![
+                retail_stage("bianco0", "bianco"),
+                retail_stage("pinna0", "pinna"),
+                retail_stage("pinna_ex0", "pinna_ex"),
+            ],
+            ..SmsEditorApp::default()
+        };
+        app.scene_labels.insert(
+            "pinna0".to_string(),
+            SceneArchiveLabel {
+                stage_name: Some("Pinna Park".to_string()),
+                scenario_names: Vec::new(),
+            },
+        );
+
+        let folders = app.game_stage_folders();
+        let pinna = folders
+            .iter()
+            .find(|folder| folder.group == "pinna")
+            .expect("Pinna Park folder");
+        assert_eq!(pinna.title, "Pinna Park");
+        assert_eq!(pinna.stage_count, 2);
+
+        app.content_browser.node = ContentNode::GameStages;
+        let root_items = app.filtered_content_items();
+        assert_eq!(
+            root_items
+                .iter()
+                .filter(|item| matches!(&item.id, ContentItemId::StageFolder(_)))
+                .count(),
+            2
+        );
+
+        app.content_browser.game_stage_group = Some("pinna".to_string());
+        let pinna_items = app.filtered_content_items();
+        assert_eq!(pinna_items.len(), 2);
+        assert!(pinna_items.iter().all(|item| {
+            matches!(
+                &item.id,
+                ContentItemId::Stage { stage_id, .. } if stage_id.starts_with("pinna")
+            )
+        }));
+    }
 
     #[test]
     fn project_stage_ids_are_project_scoped() {

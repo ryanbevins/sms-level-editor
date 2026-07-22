@@ -351,7 +351,16 @@ impl StageDocument {
         let baseline = archive.encode()?;
 
         apply_resource_edits(&mut archive, edits)?;
-        apply_runtime_texture_replacements(&mut archive, &self.objects, self.registry.as_ref())?;
+        let has_goop = self
+            .goop_authoring
+            .as_ref()
+            .is_some_and(|authoring| !authoring.layers.is_empty());
+        apply_runtime_texture_replacements(
+            &mut archive,
+            &self.objects,
+            self.registry.as_ref(),
+            has_goop,
+        )?;
         reconcile_scene_lighting(&mut archive, &self.lighting)?;
         let inserted_placement_roots = apply_placement_inserts(&mut archive, edits)?;
         reconcile_scene_objects(
@@ -381,6 +390,7 @@ fn apply_runtime_texture_replacements(
     archive: &mut SourceFreeStageArchive,
     objects: &[SceneObject],
     registry: Option<&ObjectRegistry>,
+    has_goop: bool,
 ) -> Result<()> {
     // Retail-derived stages already exercise the engine's stock absolute
     // resource lookup. Blank/custom archives also bake the declared binding so
@@ -407,21 +417,31 @@ fn apply_runtime_texture_replacements(
         .collect::<BTreeSet<_>>();
 
     for (dummy_texture_name, resource_path) in replacements {
+        // A global actor such as Mario can consume the declared texture even
+        // when its model is not stored in the stage archive. A blank stage with
+        // no pollution layers cannot exercise that lookup and should not be
+        // forced to carry an otherwise-unused resource.
+        if !has_goop {
+            continue;
+        }
         let archive_path = runtime_texture_archive_path(&resource_path);
-        let texture = archive
-            .resources()
-            .iter()
-            .find_map(|resource| {
-                let matches = String::from_utf8_lossy(&resource.raw_path)
-                    .replace('\\', "/")
-                    .eq_ignore_ascii_case(&archive_path);
-                if !matches {
-                    return None;
-                }
-                match &resource.document {
-                    StageResourceDocument::Texture(texture) => Some(texture.clone()),
-                    _ => None,
-                }
+        let mut candidates = archive.resources().iter().filter_map(|resource| {
+            let StageResourceDocument::Texture(texture) = &resource.document else {
+                return None;
+            };
+            Some((
+                String::from_utf8_lossy(&resource.raw_path).replace('\\', "/"),
+                texture,
+            ))
+        });
+        let texture = candidates
+            .clone()
+            .find_map(|(path, texture)| (path == archive_path).then(|| texture.clone()))
+            .or_else(|| {
+                candidates.find_map(|(path, texture)| {
+                    path.eq_ignore_ascii_case(&archive_path)
+                        .then(|| texture.clone())
+                })
             })
             .ok_or_else(|| {
                 stage_export_error(format!(
@@ -2432,6 +2452,45 @@ mod tests {
         AuthoredPlacement, AuthoredPlacementDependency, AuthoredPlacementDependencyTarget,
         PlacementBinding, SceneRuntimeReferenceBinding, Transform,
     };
+
+    #[test]
+    fn runtime_texture_binding_without_goop_needs_no_texture_resource() {
+        let mut archive = SourceFreeStageArchive::new_for_blank("custom0", 1).unwrap();
+        let objects = vec![SceneObject::new("mario", "Mario")];
+        let registry = ObjectRegistry {
+            runtime_texture_replacements: vec![sms_schema::RuntimeTextureReplacementDefinition {
+                factory_name: "Mario".to_string(),
+                dummy_texture_name: "H_ma_rak_dummy".to_string(),
+                resource_path: "/scene/map/pollution/H_ma_rak.bti".to_string(),
+                source_file: "src/Player/MarioDraw.cpp".to_string(),
+            }],
+            ..ObjectRegistry::default()
+        };
+
+        apply_runtime_texture_replacements(&mut archive, &objects, Some(&registry), false)
+            .expect("a stage without goop does not need an unused global texture");
+        assert!(archive.resources().is_empty());
+    }
+
+    #[test]
+    fn global_actor_runtime_texture_is_required_when_custom_stage_has_goop() {
+        let mut archive = SourceFreeStageArchive::new_for_blank("custom0", 1).unwrap();
+        let objects = vec![SceneObject::new("mario", "Mario")];
+        let registry = ObjectRegistry {
+            runtime_texture_replacements: vec![sms_schema::RuntimeTextureReplacementDefinition {
+                factory_name: "Mario".to_string(),
+                dummy_texture_name: "H_ma_rak_dummy".to_string(),
+                resource_path: "/scene/map/pollution/H_ma_rak.bti".to_string(),
+                source_file: "src/Player/MarioDraw.cpp".to_string(),
+            }],
+            ..ObjectRegistry::default()
+        };
+
+        let error =
+            apply_runtime_texture_replacements(&mut archive, &objects, Some(&registry), true)
+                .expect_err("a custom stage with goop must carry Mario's declared runtime texture");
+        assert!(error.to_string().contains("H_ma_rak.bti"));
+    }
 
     #[test]
     fn runtime_actor_link_binds_the_selected_arbitrary_shine_instance() {

@@ -1242,6 +1242,22 @@ fn resolve_resources(
             ),
             true,
         )?;
+        // The source RARC may spell a path with different case than the
+        // absolute runtime lookup in the decomp. Preserve the source payload,
+        // but install it at the exact runtime identity so case aliases cannot
+        // coexist and resolve to different textures later.
+        let canonical_path = runtime_reference_archive_path(&replacement.resource_path);
+        if let Some(mut resource) = out
+            .iter()
+            .find(|resource| {
+                normalized_path(&resource.raw_resource_path) == normalize_text_path(&canonical_path)
+            })
+            .cloned()
+        {
+            out.remove(&resource);
+            resource.raw_resource_path = canonical_path.into_bytes();
+            out.insert(resource);
+        }
     }
 
     resolve_runtime_map_obj_dependencies(
@@ -2087,6 +2103,12 @@ fn is_under_folder(raw: &[u8], folder: &str) -> bool {
 fn normalize_runtime_reference(path: &str) -> String {
     let path = normalize_text_path(path);
     path.strip_prefix("scene/").unwrap_or(&path).to_string()
+}
+
+fn runtime_reference_archive_path(path: &str) -> String {
+    let path = path.replace('\\', "/");
+    let path = path.trim_matches('/');
+    path.strip_prefix("scene/").unwrap_or(path).to_string()
 }
 
 fn normalized_path(path: &[u8]) -> String {
