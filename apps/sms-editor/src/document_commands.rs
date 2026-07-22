@@ -4182,6 +4182,46 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires SMS_BASE_ROOT, SMS_PROJECT_ROOT, and the neighboring SMS decomp"]
+    fn authored_project_stay_pakkun_repairs_and_exports_its_pollution_texture() {
+        let base_root = std::env::var_os("SMS_BASE_ROOT")
+            .map(PathBuf::from)
+            .expect("set SMS_BASE_ROOT to the extracted game root");
+        let project_root = std::env::var_os("SMS_PROJECT_ROOT")
+            .map(PathBuf::from)
+            .expect("set SMS_PROJECT_ROOT to the Graffito project data root");
+        let decomp_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let registry = sms_schema::SchemaGenerator::new(decomp_root)
+            .generate()
+            .expect("generate decomp schema");
+        let archives = sms_formats::discover_scene_archives(&base_root)
+            .expect("discover retail scene archives");
+        let catalog = sms_scene::ObjectAuthoringCatalog::build_with_base_root(
+            &archives, &registry, &base_root,
+        )
+        .catalog;
+        let template = catalog
+            .find("StayPakkun")
+            .expect("StayPakkun authoring template")
+            .clone();
+        let mut document =
+            StageDocument::open_authored_project_stage(&base_root, "goopmap0", &project_root)
+                .expect("open authored goopmap0 project stage");
+
+        let repair =
+            repair_authored_catalog_resources(&mut document, std::slice::from_ref(&template));
+
+        assert!(repair.errors.is_empty(), "{:?}", repair.errors);
+        assert!(document.has_effective_resource(b"map/pollution/h_ma_rak.bti"));
+        let rebuilt = document
+            .build_stage_archive()
+            .expect("build repaired stage");
+        let reopened = sms_scene::SourceFreeStageArchive::parse(&rebuilt)
+            .expect("reopen repaired stage archive");
+        assert!(reopened.resource(b"map/pollution/h_ma_rak.bti").is_some());
+    }
+
+    #[test]
     fn catalog_preflight_reuses_existing_runtime_path_without_overwrite() {
         let raw_resource_path = b"mapobj/shared.prm".to_vec();
         let catalog_resource = empty_parameter_document();

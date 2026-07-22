@@ -1230,6 +1230,19 @@ fn resolve_resources(
             }
         }
     }
+    for replacement in registry.runtime_texture_replacements_for(&candidate.factory_name) {
+        add_stage_reference(
+            &mut out,
+            sources,
+            &candidate.source_stage,
+            &replacement.resource_path,
+            &format!(
+                "{} runtime texture {}",
+                candidate.factory_name, replacement.dummy_texture_name
+            ),
+            true,
+        )?;
+    }
 
     resolve_runtime_map_obj_dependencies(
         &mut out,
@@ -2111,7 +2124,7 @@ mod tests {
         MapObjModelOverrideDefinition, MapObjResourceDefinition, NpcActorDefinition,
         NpcPartDefinition, NpcPartModelDefinition, NpcResourceFolderDefinition,
         ObjectResourceBinding, ObjectResourceRole, ParticleBindingTarget,
-        ParticleResourceDefinition, SchemaSource,
+        ParticleResourceDefinition, RuntimeTextureReplacementDefinition, SchemaSource,
     };
 
     fn field(name: &str, value: JDramaFieldValue) -> JDramaField {
@@ -3255,6 +3268,12 @@ mod tests {
                     source_file: "fixture.cpp".into(),
                 },
             ],
+            runtime_texture_replacements: vec![RuntimeTextureReplacementDefinition {
+                factory_name: "FixtureEnemy".into(),
+                dummy_texture_name: "H_ma_rak_dummy".into(),
+                resource_path: "/scene/map/pollution/H_ma_rak.bti".into(),
+                source_file: "fixture.cpp".into(),
+            }],
             ..ObjectRegistry::default()
         };
         let manager = fields(
@@ -3289,6 +3308,7 @@ mod tests {
                 "effects/actor.jpa",
                 "effects/manager.jpa",
                 "map/scene.ral",
+                "map/pollution/H_ma_rak.bti",
             ],
         );
         let foreign = CatalogSource {
@@ -3311,6 +3331,7 @@ mod tests {
                 "effects/manager.jpa",
                 "managers/manager.bmd",
                 "managers/manager.btk",
+                "map/pollution/H_ma_rak.bti",
                 "map/scene.ral",
             ]
         );
@@ -3773,6 +3794,29 @@ mod tests {
             }),
             "HamuKuri template omitted the mushroom1up instantiated by its manager's loadAfter"
         );
+    }
+
+    #[test]
+    #[ignore = "requires SMS_BASE_ROOT with extracted retail stages and the neighboring SMS decomp"]
+    fn retail_stay_pakkun_closes_over_its_stage_pollution_texture() {
+        let base_root = std::env::var_os("SMS_BASE_ROOT")
+            .map(PathBuf::from)
+            .expect("set SMS_BASE_ROOT to the extracted game's root");
+        let decomp_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let archives = sms_formats::discover_scene_archives(&base_root)
+            .expect("discover extracted retail stage archives");
+        let registry = sms_schema::SchemaGenerator::new(decomp_root)
+            .generate()
+            .expect("generate the decomp-derived object registry");
+        let build = ObjectAuthoringCatalog::build_with_base_root(&archives, &registry, &base_root);
+        let stay_pakkun = build
+            .catalog
+            .find("StayPakkun")
+            .expect("StayPakkun retail template");
+
+        assert!(stay_pakkun.resources.iter().any(|resource| {
+            normalized_path(&resource.raw_resource_path) == "map/pollution/h_ma_rak.bti"
+        }));
     }
 
     fn resources(archive: &str, paths: &[&str]) -> Vec<ObjectAuthoringResource> {

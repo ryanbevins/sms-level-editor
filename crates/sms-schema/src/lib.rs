@@ -129,6 +129,14 @@ pub struct ObjectRegistry {
     /// Decomp-derived primary model resources for actor factory names.
     #[serde(default)]
     pub object_resources: Vec<ObjectResourceBinding>,
+    /// Stage-local textures installed into actor model dummy slots at runtime.
+    ///
+    /// These bindings are extracted from `SMS_ChangeTextureAll` callsites and
+    /// inherited through the registered actor class hierarchy. Authoring uses
+    /// them as required resource dependencies; preview uses the same metadata
+    /// to reproduce the runtime substitution.
+    #[serde(default)]
+    pub runtime_texture_replacements: Vec<RuntimeTextureReplacementDefinition>,
     /// Runtime models selected by the exact JDrama object name.
     #[serde(default)]
     pub named_object_models: Vec<NamedObjectModelDefinition>,
@@ -254,6 +262,15 @@ impl ObjectRegistry {
     pub fn primary_object_resource(&self, factory_name: &str) -> Option<&ObjectResourceBinding> {
         self.object_resources_for(factory_name)
             .find(|definition| definition.role == ObjectResourceRole::Primary)
+    }
+
+    pub fn runtime_texture_replacements_for<'a>(
+        &'a self,
+        factory_name: &'a str,
+    ) -> impl Iterator<Item = &'a RuntimeTextureReplacementDefinition> + 'a {
+        self.runtime_texture_replacements
+            .iter()
+            .filter(move |definition| definition.factory_name == factory_name)
     }
 
     pub fn find_named_object_model(
@@ -427,6 +444,15 @@ pub struct ObjectResourceBinding {
     pub model_name: String,
     pub resource_base: Option<String>,
     pub load_flags: u32,
+    pub source_file: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct RuntimeTextureReplacementDefinition {
+    pub factory_name: String,
+    pub dummy_texture_name: String,
+    /// Exact stage-local path passed to JKR at runtime, normally under `/scene`.
+    pub resource_path: String,
     pub source_file: String,
 }
 
@@ -1002,6 +1028,8 @@ impl SchemaGenerator {
         let mut runtime_map_obj_dependencies = BTreeMap::<String, Vec<(String, String)>>::new();
         let mut runtime_name_references =
             BTreeMap::<String, Vec<ExtractedRuntimeNameReference>>::new();
+        let mut runtime_texture_replacements =
+            BTreeMap::<String, Vec<ExtractedRuntimeTextureReplacement>>::new();
         let mut inheritance = BTreeMap::<String, String>::new();
         let mut tev_color_bindings = Vec::new();
         let mut init_tev_colors = BTreeMap::new();
@@ -1117,6 +1145,14 @@ impl SchemaGenerator {
                     .or_default()
                     .extend(references);
             }
+            for (class_name, replacements) in
+                extract_runtime_texture_replacements(text, &source_file)
+            {
+                runtime_texture_replacements
+                    .entry(class_name)
+                    .or_default()
+                    .extend(replacements);
+            }
         }
 
         // A few retail-only manager subclasses are declared beside their
@@ -1160,6 +1196,20 @@ impl SchemaGenerator {
                     required: reference.required,
                     record_name: reference.record_name,
                     source_file: reference.source_file,
+                }),
+            );
+            registry.runtime_texture_replacements.extend(
+                inherited_actor_models_union(
+                    &object.class_name,
+                    &runtime_texture_replacements,
+                    &inheritance,
+                )
+                .into_iter()
+                .map(|replacement| RuntimeTextureReplacementDefinition {
+                    factory_name: object.factory_name.clone(),
+                    dummy_texture_name: replacement.dummy_texture_name,
+                    resource_path: replacement.resource_path,
+                    source_file: replacement.source_file,
                 }),
             );
         }
@@ -3608,6 +3658,75 @@ fn extract_model_gate_named_models(
         .collect()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ExtractedRuntimeTextureReplacement {
+    dummy_texture_name: String,
+    resource_path: String,
+    source_file: String,
+}
+
+fn extract_runtime_texture_replacements(
+    text: &str,
+    source_file: &str,
+) -> Vec<(String, Vec<ExtractedRuntimeTextureReplacement>)> {
+    let constants = extract_cpp_string_constants(text);
+    let method_re =
+        Regex::new(r"void\s+([A-Za-z_][A-Za-z0-9_]*)::[A-Za-z_][A-Za-z0-9_]*\s*\([^)]*\)\s*\{")
+            .expect("valid runtime texture method regex");
+    let resource_re = Regex::new(
+        r#"(?s)([A-Za-z_][A-Za-z0-9_]*)\s*=\s*[^;]*?(?:JKRFileLoader::getGlbResource|JKRGetResource)\s*\(\s*("[^"]+"|[A-Za-z_][A-Za-z0-9_]*)\s*\)"#,
+    )
+    .expect("valid runtime texture resource regex");
+    let replacement_re = Regex::new(
+        r#"(?s)SMS_ChangeTextureAll\s*\([^;]*?,\s*("[^"]+"|[A-Za-z_][A-Za-z0-9_]*)\s*,\s*\*?\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)"#,
+    )
+    .expect("valid runtime texture replacement regex");
+    let resolve_string =
+        |token: &str| parse_cpp_string(token).or_else(|| constants.get(token.trim()).cloned());
+    let mut by_class = BTreeMap::<String, BTreeSet<ExtractedRuntimeTextureReplacement>>::new();
+
+    for method in method_re.captures_iter(text) {
+        let Some(whole_match) = method.get(0) else {
+            continue;
+        };
+        let Some(body) = braced_body(text, whole_match.end() - 1) else {
+            continue;
+        };
+        let resources = resource_re
+            .captures_iter(body)
+            .filter_map(|captures| {
+                let resource_path = resolve_string(&captures[2])?;
+                resource_path
+                    .replace('\\', "/")
+                    .trim_matches('/')
+                    .to_ascii_lowercase()
+                    .starts_with("scene/")
+                    .then_some((captures[1].to_string(), resource_path))
+            })
+            .collect::<BTreeMap<_, _>>();
+        for replacement in replacement_re.captures_iter(body) {
+            let (Some(dummy_texture_name), Some(resource_path)) = (
+                resolve_string(&replacement[1]),
+                resources.get(&replacement[2]).cloned(),
+            ) else {
+                continue;
+            };
+            by_class.entry(method[1].to_string()).or_default().insert(
+                ExtractedRuntimeTextureReplacement {
+                    dummy_texture_name,
+                    resource_path,
+                    source_file: source_file.to_string(),
+                },
+            );
+        }
+    }
+
+    by_class
+        .into_iter()
+        .map(|(class_name, replacements)| (class_name, replacements.into_iter().collect()))
+        .collect()
+}
+
 fn extract_enemy_named_models(
     text: &str,
     source_file: &str,
@@ -4113,6 +4232,8 @@ fn dedup_registry(registry: &mut ObjectRegistry) -> Result<()> {
             && a.resource_base == b.resource_base
             && a.load_flags == b.load_flags
     });
+    registry.runtime_texture_replacements.sort();
+    registry.runtime_texture_replacements.dedup();
     registry.named_object_models.sort_by(|a, b| {
         a.factory_name
             .cmp(&b.factory_name)
@@ -4526,6 +4647,34 @@ fn validate_registry(registry: &ObjectRegistry) -> Result<()> {
                 detail: format!(
                     "factory {} has a model resource without a name or provenance",
                     resource.factory_name
+                ),
+            });
+        }
+    }
+    for replacement in &registry.runtime_texture_replacements {
+        if !objects.contains_key(replacement.factory_name.as_str()) {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!(
+                    "runtime texture replacement {} has no registered factory {}",
+                    replacement.dummy_texture_name, replacement.factory_name
+                ),
+            });
+        }
+        let normalized_path = replacement
+            .resource_path
+            .replace('\\', "/")
+            .trim_matches('/')
+            .to_ascii_lowercase();
+        if replacement.dummy_texture_name.is_empty()
+            || replacement.source_file.is_empty()
+            || !normalized_path.starts_with("scene/")
+        {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!(
+                    "factory {} has an invalid runtime texture replacement {:?} -> {:?}",
+                    replacement.factory_name,
+                    replacement.dummy_texture_name,
+                    replacement.resource_path
                 ),
             });
         }
@@ -6085,6 +6234,39 @@ mod tests {
     }
 
     #[test]
+    fn runtime_texture_replacements_are_extracted_and_inherited_by_actor_subclasses() {
+        let source = r#"
+            static const char cDirtyFileName[] = "/scene/map/pollution/H_ma_rak.bti";
+            static const char cDirtyTexName[] = "H_ma_rak_dummy";
+
+            void TPakkun::init(TLiveManager* manager) {
+                ResTIMG* image = (ResTIMG*)JKRFileLoader::getGlbResource(cDirtyFileName);
+                if (image) {
+                    SMS_ChangeTextureAll(getMActor()->getModel()->getModelData(),
+                                         cDirtyTexName, *image);
+                }
+            }
+        "#;
+        let extracted = extract_runtime_texture_replacements(source, "src/Enemy/pakkun.cpp")
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            extracted["TPakkun"],
+            [ExtractedRuntimeTextureReplacement {
+                dummy_texture_name: "H_ma_rak_dummy".to_string(),
+                resource_path: "/scene/map/pollution/H_ma_rak.bti".to_string(),
+                source_file: "src/Enemy/pakkun.cpp".to_string(),
+            }]
+        );
+
+        let inheritance = BTreeMap::from([("TStayPakkun".to_string(), "TPakkun".to_string())]);
+        assert_eq!(
+            inherited_actor_models_union("TStayPakkun", &extracted, &inheritance),
+            extracted["TPakkun"]
+        );
+    }
+
+    #[test]
     fn map_obj_resource_lookup_is_exact_and_rejects_duplicate_identities() {
         let resource = MapObjResourceDefinition {
             resource_name: "WoodBox".to_string(),
@@ -6213,6 +6395,23 @@ mod tests {
             .iter()
             .any(|object| object.factory_name == "H_ma_rak_dummy"));
         assert!(!registry.object_resources.is_empty());
+        assert_eq!(
+            registry
+                .runtime_texture_replacements_for("StayPakkun")
+                .map(|replacement| {
+                    (
+                        replacement.dummy_texture_name.as_str(),
+                        replacement.resource_path.as_str(),
+                        replacement.source_file.as_str(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            [(
+                "H_ma_rak_dummy",
+                "/scene/map/pollution/H_ma_rak.bti",
+                "src/Enemy/pakkun.cpp",
+            )]
+        );
         // MapObjInit declares 363 records, but retail lookup contains 359
         // resources plus its terminator. Three unregistered declarations must
         // not leak into the generated registry.

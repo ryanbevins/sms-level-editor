@@ -1226,10 +1226,130 @@ fn gatekeeper_uses_retail_sleep_and_texture_animations() {
 #[test]
 fn gatekeeper_replaces_its_dummy_with_the_stage_pollution_texture() {
     assert_eq!(
-        actor_runtime_texture_replacements("GateKeeper"),
-        [("Q_kepper_dummy_128IA4", "/map/pollution/h_ma_rak.bti")]
+        actor_runtime_texture_replacements("GateKeeper", None),
+        [(
+            "Q_kepper_dummy_128IA4".to_string(),
+            "/map/pollution/h_ma_rak.bti".to_string()
+        )]
     );
-    assert!(actor_runtime_texture_replacements("gatekeeper").is_empty());
+    assert!(actor_runtime_texture_replacements("gatekeeper", None).is_empty());
+}
+
+#[test]
+fn pakkun_family_uses_the_decomp_runtime_pollution_texture_binding() {
+    let registry = ObjectRegistry {
+        runtime_texture_replacements: ["Pakkun", "StayPakkun"]
+            .into_iter()
+            .map(
+                |factory_name| sms_schema::RuntimeTextureReplacementDefinition {
+                    factory_name: factory_name.to_string(),
+                    dummy_texture_name: "H_ma_rak_dummy".to_string(),
+                    resource_path: "/scene/map/pollution/H_ma_rak.bti".to_string(),
+                    source_file: "src/Enemy/pakkun.cpp".to_string(),
+                },
+            )
+            .collect(),
+        ..ObjectRegistry::default()
+    };
+    let expected = [(
+        "H_ma_rak_dummy".to_string(),
+        "/map/pollution/h_ma_rak.bti".to_string(),
+    )];
+
+    assert_eq!(
+        actor_runtime_texture_replacements("Pakkun", Some(&registry)),
+        expected
+    );
+    assert_eq!(
+        actor_runtime_texture_replacements("StayPakkun", Some(&registry)),
+        expected
+    );
+    assert!(actor_runtime_texture_replacements("BossPakkun", Some(&registry)).is_empty());
+}
+
+#[test]
+fn stay_pakkun_preview_replaces_every_dummy_with_the_stage_goop_texture() {
+    fn texture(name: &str, value: u8) -> sms_formats::J3dTexturePreview {
+        sms_formats::J3dTexturePreview {
+            name: name.to_string(),
+            width: 1,
+            height: 1,
+            format: 6,
+            wrap_s: 0,
+            wrap_t: 0,
+            min_filter: 0,
+            mag_filter: 0,
+            mipmap_enabled: false,
+            do_edge_lod: false,
+            bias_clamp: false,
+            max_anisotropy: 0,
+            min_lod: 0.0,
+            max_lod: 0.0,
+            lod_bias: 0.0,
+            mipmap_count: 1,
+            rgba: vec![value; 4],
+            mips: Vec::new(),
+        }
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let texture_path = root.path().join("map/pollution/H_ma_rak.bti");
+    std::fs::create_dir_all(texture_path.parent().unwrap()).unwrap();
+    let stage_rgba = vec![
+        0x12, 0x34, 0x56, 0x78, 0x21, 0x43, 0x65, 0x87, 0x9a, 0xbc, 0xde, 0xf0, 0xaa, 0x55, 0x11,
+        0xee,
+    ];
+    let image = sms_formats::RgbaImage::new(2, 2, stage_rgba.clone()).unwrap();
+    let encoded = sms_formats::GxEncodedTexture::encode_rgba(
+        "H_ma_rak",
+        &image,
+        sms_formats::GxTextureEncodeOptions {
+            encoding: sms_formats::GxTextureEncoding::Exact(sms_formats::GxTextureFormat::Rgba8),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    std::fs::write(&texture_path, encoded.to_bti().unwrap().encode().unwrap()).unwrap();
+
+    let mut document = test_document(Vec::new());
+    document.base_root = root.path().to_path_buf();
+    document.registry = Some(ObjectRegistry {
+        runtime_texture_replacements: vec![sms_schema::RuntimeTextureReplacementDefinition {
+            factory_name: "StayPakkun".to_string(),
+            dummy_texture_name: "H_ma_rak_dummy".to_string(),
+            resource_path: "/scene/map/pollution/H_ma_rak.bti".to_string(),
+            source_file: "src/Enemy/pakkun.cpp".to_string(),
+        }],
+        ..ObjectRegistry::default()
+    });
+    document.assets.push(StageAsset {
+        path: texture_path,
+        kind: StageAssetKind::Texture,
+    });
+    let mut preview = sms_formats::J3dGeometryPreview {
+        positions: Vec::new(),
+        triangles: Vec::new(),
+        textures: vec![
+            texture("H_ma_rak_dummy", 1),
+            texture("unrelated", 2),
+            texture("H_MA_RAK_DUMMY", 3),
+        ],
+        materials: Vec::new(),
+        bounds_min: [0.0; 3],
+        bounds_max: [0.0; 3],
+    };
+
+    apply_actor_runtime_textures(
+        &document,
+        &SceneObject::new("fixed pakkun", "StayPakkun"),
+        &mut preview,
+    );
+
+    assert_eq!(preview.textures[0].rgba, stage_rgba);
+    assert_eq!(preview.textures[2].rgba, preview.textures[0].rgba);
+    assert_eq!(preview.textures[0].name, "H_ma_rak_dummy");
+    assert_eq!(preview.textures[2].name, "H_ma_rak_dummy");
+    assert_eq!(preview.textures[1].rgba, vec![2; 4]);
 }
 
 #[test]
@@ -2096,7 +2216,7 @@ fn case_distinct_factories_do_not_inherit_coin_or_npc_behavior() {
         "C:/game/dolpic0.szs!/montema/moma_model.bmd"
     )
     .is_empty());
-    assert!(actor_runtime_texture_replacements(&wrong_case_npc.factory_name).is_empty());
+    assert!(actor_runtime_texture_replacements(&wrong_case_npc.factory_name, None).is_empty());
 }
 
 #[test]

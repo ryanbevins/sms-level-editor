@@ -844,7 +844,8 @@ pub(super) fn apply_actor_runtime_textures(
     object: &SceneObject,
     preview: &mut J3dGeometryPreview,
 ) {
-    let replacements = actor_runtime_texture_replacements(&object.factory_name);
+    let replacements =
+        actor_runtime_texture_replacements(&object.factory_name, document.registry.as_ref());
     if replacements.is_empty() {
         return;
     }
@@ -857,7 +858,7 @@ pub(super) fn apply_actor_runtime_textures(
             .filter_map(|(index, texture)| {
                 texture
                     .name
-                    .eq_ignore_ascii_case(dummy_name)
+                    .eq_ignore_ascii_case(&dummy_name)
                     .then_some(index)
             })
             .collect::<Vec<_>>();
@@ -871,7 +872,7 @@ pub(super) fn apply_actor_runtime_textures(
                     .to_string_lossy()
                     .replace('\\', "/")
                     .to_ascii_lowercase()
-                    .ends_with(asset_suffix)
+                    .ends_with(&asset_suffix)
         }) else {
             continue;
         };
@@ -881,7 +882,7 @@ pub(super) fn apply_actor_runtime_textures(
         let Ok(mut texture) = decode_bti_texture(bytes) else {
             continue;
         };
-        texture.name = dummy_name.to_string();
+        texture.name = dummy_name;
         for texture_index in texture_indices {
             preview.textures[texture_index] = texture.clone();
         }
@@ -890,11 +891,30 @@ pub(super) fn apply_actor_runtime_textures(
 
 pub(super) fn actor_runtime_texture_replacements(
     factory: &str,
-) -> Vec<(&'static str, &'static str)> {
+    registry: Option<&ObjectRegistry>,
+) -> Vec<(String, String)> {
+    let decomp_bindings = registry
+        .into_iter()
+        .flat_map(|registry| registry.runtime_texture_replacements_for(factory))
+        .map(|replacement| {
+            let normalized = replacement.resource_path.replace('\\', "/");
+            let suffix = normalized
+                .strip_prefix("/scene")
+                .unwrap_or(&normalized)
+                .to_ascii_lowercase();
+            (replacement.dummy_texture_name.clone(), suffix)
+        })
+        .collect::<Vec<_>>();
+    if !decomp_bindings.is_empty() {
+        return decomp_bindings;
+    }
     if factory == "GateKeeper" {
         // TBiancoGateKeeper::init replaces this authored dummy texture with
         // the current stage's pollution texture.
-        return vec![("Q_kepper_dummy_128IA4", "/map/pollution/h_ma_rak.bti")];
+        return vec![(
+            "Q_kepper_dummy_128IA4".to_string(),
+            "/map/pollution/h_ma_rak.bti".to_string(),
+        )];
     }
     if !factory.starts_with("NPC") {
         return Vec::new();
@@ -906,12 +926,21 @@ pub(super) fn actor_runtime_texture_replacements(
         "NPCMonteM" | "NPCMonteMA" | "NPCMonteMC" | "NPCMonteW" | "NPCMonteWA"
     );
     if !factory.starts_with("NPCMonte") || monte_uses_pollution_texture {
-        replacements.push(("H_ma_rak_dummy", "/map/pollution/h_ma_rak.bti"));
+        replacements.push((
+            "H_ma_rak_dummy".to_string(),
+            "/map/pollution/h_ma_rak.bti".to_string(),
+        ));
     }
     if factory.starts_with("NPCMonteM") && factory != "NPCMonteME" {
-        replacements.push(("I_mom_mino_dummyI4", "/montemcommon/i_mom_mino_rgba.bti"));
+        replacements.push((
+            "I_mom_mino_dummyI4".to_string(),
+            "/montemcommon/i_mom_mino_rgba.bti".to_string(),
+        ));
     } else if factory.starts_with("NPCMonteW") {
-        replacements.push(("I_mow_mino_dummyI4", "/montewcommon/i_mow_mino_rgba.bti"));
+        replacements.push((
+            "I_mow_mino_dummyI4".to_string(),
+            "/montewcommon/i_mow_mino_rgba.bti".to_string(),
+        ));
     }
 
     replacements
