@@ -12,8 +12,7 @@ pub(super) fn level_transform_targets(
     file: &J3dFile,
 ) -> Vec<LevelTransformTarget> {
     let normalized = model_path.replace('\\', "/").to_ascii_lowercase();
-    let is_map_model =
-        normalized.ends_with("!/map/map/map.bmd") || normalized.ends_with("/map/map/map.bmd");
+    let is_map_model = model_path_is_map_terrain(&normalized);
     let pollution_layer_index = pollution_layer_model_index(&normalized);
     if !is_map_model && pollution_layer_index.is_none() {
         return Vec::new();
@@ -161,6 +160,11 @@ pub(super) fn level_transform_targets(
         .into_iter()
         .filter_map(|joint_index| targets.remove(&joint_index))
         .collect()
+}
+
+pub(super) fn model_path_is_map_terrain(model_path: &str) -> bool {
+    let normalized = model_path.replace('\\', "/").to_ascii_lowercase();
+    normalized.ends_with("!/map/map/map.bmd") || normalized.ends_with("/map/map/map.bmd")
 }
 
 pub(super) fn level_transform_overrides(

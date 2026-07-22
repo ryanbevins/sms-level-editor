@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -10,7 +10,8 @@ use sms_scene::{
     generate_floor_depth_map, generate_floor_pollution_model, whole_terrain_region,
     GoopAuthoringDocument, GoopBehavior, GoopLayerAuthoring, GoopLayerOrigin, GoopPlane,
     GoopRenderTriangle, GoopStyleSource, GoopTerrainTriangle, SourceFreeStageArchive,
-    StageArchiveEdits, GOOP_AUTHORING_FORMAT_VERSION, GOOP_CELL_SIZE, GOOP_MAX_LAYERS,
+    StageArchiveEdits, GOOP_AUTHORING_FORMAT_VERSION, GOOP_CELL_SIZE,
+    GOOP_DEPTH_WORLD_UNITS_PER_CODE, GOOP_MAX_LAYERS,
 };
 
 use crate::camera::CameraProjection;
@@ -25,7 +26,22 @@ pub(super) struct RetailGoopTemplate {
     pub(super) resource_stem: String,
     pub(super) layer_index: usize,
     pub(super) behavior: GoopBehavior,
+    pub(super) semantic_type: String,
     pub(super) compatible: bool,
+}
+
+const GOOP_TEMPLATE_ANIMATION_EXTENSIONS: [&str; 6] = ["btk", "btp", "bpk", "brk", "bck", "bas"];
+
+fn semantic_goop_type(behavior: GoopBehavior, detail_texture_name: Option<&str>) -> String {
+    let detail = detail_texture_name.unwrap_or_default().to_ascii_lowercase();
+    match behavior {
+        GoopBehavior::Fire => "Fire".to_string(),
+        GoopBehavior::Electric => "Electric".to_string(),
+        GoopBehavior::Slippery if detail.contains("choco") => "Chocolate".to_string(),
+        GoopBehavior::Slippery if detail.contains("pink") => "Pink".to_string(),
+        GoopBehavior::Slippery if detail.contains("rico") => "Oil".to_string(),
+        _ => behavior.label(),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -161,17 +177,26 @@ pub(super) fn index_retail_goop_templates(
                 ));
                 continue;
             }
-            let texture_zero_is_bound = model
-                .to_bytes()
-                .and_then(J3dFile::parse)
-                .and_then(|file| {
-                    file.geometry_preview_with_loader_flags(SMS_POLLUTION_MODEL_LOAD_FLAGS)
-                })
-                .is_ok_and(|preview| {
-                    preview.triangles.iter().any(|triangle| {
-                        triangle.texture_index == Some(0) || triangle.mask_texture_index == Some(0)
-                    })
-                });
+            let preview = match model.to_bytes().and_then(J3dFile::parse).and_then(|file| {
+                file.geometry_preview_with_loader_flags(SMS_POLLUTION_MODEL_LOAD_FLAGS)
+            }) {
+                Ok(preview) => preview,
+                Err(error) => {
+                    warnings.push(format!(
+                        "Blocked {} layer {} goop template because its model preview failed: {error}",
+                        archive.stage_id, layer_index
+                    ));
+                    continue;
+                }
+            };
+            let material_zero_triangles = preview
+                .triangles
+                .iter()
+                .filter(|triangle| triangle.material_index == Some(0))
+                .collect::<Vec<_>>();
+            let texture_zero_is_bound = material_zero_triangles.iter().any(|triangle| {
+                triangle.texture_index == Some(0) || triangle.mask_texture_index == Some(0)
+            });
             if !texture_zero_is_bound {
                 warnings.push(format!(
                     "Blocked {} layer {} goop template because its material does not bind texture zero",
@@ -179,13 +204,21 @@ pub(super) fn index_retail_goop_templates(
                 ));
                 continue;
             }
+            let detail_texture_name = material_zero_triangles
+                .iter()
+                .filter_map(|triangle| triangle.texture_index)
+                .find(|index| *index != 0)
+                .and_then(|index| preview.textures.get(index))
+                .map(|texture| texture.name.as_str());
+            let behavior = GoopBehavior::from_runtime_code(layer.layer_type);
             templates.push(RetailGoopTemplate {
                 stage_id: archive.stage_id.clone(),
                 archive_path: archive.path.clone(),
                 model_asset_path: model_asset.path.clone(),
                 resource_stem: expected_stem,
                 layer_index,
-                behavior: GoopBehavior::from_runtime_code(layer.layer_type),
+                behavior,
+                semantic_type: semantic_goop_type(behavior, detail_texture_name),
                 compatible: true,
             });
         }
@@ -217,8 +250,75 @@ fn source_pollution_stem(index: usize, stage_id: &str) -> String {
     format!("pollution{index:02}")
 }
 
+fn goop_template_choices(
+    templates: &[RetailGoopTemplate],
+    selected: usize,
+    show_retail_sources: bool,
+) -> Vec<(usize, RetailGoopTemplate)> {
+    if show_retail_sources {
+        return templates.iter().cloned().enumerate().collect();
+    }
+
+    // The retail archive/file pair is provenance, not a useful authoring
+    // concept. Present one safe choice per runtime type while retaining the
+    // currently selected source for that type so opening the combo never
+    // silently restyles an existing generated layer.
+    let mut by_type = BTreeMap::<(u16, String), (usize, RetailGoopTemplate)>::new();
+    for (index, template) in templates
+        .iter()
+        .enumerate()
+        .filter(|(_, template)| template.compatible)
+    {
+        let key = (
+            template.behavior.runtime_code(),
+            template.semantic_type.clone(),
+        );
+        let candidate = (index, template.clone());
+        match by_type.entry(key) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(candidate);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) if index == selected => {
+                entry.insert(candidate);
+            }
+            std::collections::btree_map::Entry::Occupied(_) => {}
+        }
+    }
+    by_type.into_values().collect()
+}
+
+fn goop_template_label(template: &RetailGoopTemplate, show_retail_source: bool) -> String {
+    let semantic_type = &template.semantic_type;
+    if show_retail_source {
+        let incompatible = if template.compatible {
+            ""
+        } else {
+            " [incompatible]"
+        };
+        format!(
+            "{semantic_type} - {} / {}{incompatible}",
+            template.stage_id, template.resource_stem
+        )
+    } else {
+        semantic_type.clone()
+    }
+}
+
 fn generated_goop_requires_upgrade(authoring: &GoopAuthoringDocument) -> bool {
     authoring.requires_generator_upgrade()
+}
+
+fn clear_generated_goop_readiness_if_empty(authoring: &mut GoopAuthoringDocument) {
+    if authoring
+        .layers
+        .iter()
+        .any(|layer| layer.origin == GoopLayerOrigin::Generated)
+    {
+        return;
+    }
+    authoring.stale = false;
+    authoring.terrain_fingerprint = 0;
+    authoring.format_version = GOOP_AUTHORING_FORMAT_VERSION;
 }
 
 impl SmsEditorApp {
@@ -321,52 +421,33 @@ impl SmsEditorApp {
         ui.separator();
         ui.checkbox(
             &mut self.show_incompatible_goop_templates,
-            "Show incompatible templates (expert)",
+            "Show retail source variants (expert)",
         );
         let selected_behavior = selected_generated_layer.map(|layer| layer.behavior);
-        let visible_templates = self
-            .retail_goop_templates
-            .iter()
-            .enumerate()
-            .filter(|(_, template)| {
-                (template.compatible
-                    && selected_behavior.is_none_or(|behavior| template.behavior == behavior))
-                    || self.show_incompatible_goop_templates
-            })
-            .map(|(index, template)| (index, template.clone()))
-            .collect::<Vec<_>>();
+        let visible_templates = goop_template_choices(
+            &self.retail_goop_templates,
+            self.selected_goop_template,
+            self.show_incompatible_goop_templates,
+        );
         let selected_text = self
             .retail_goop_templates
             .get(self.selected_goop_template)
-            .map_or("No compatible retail template".to_string(), |template| {
-                format!(
-                    "{} / {} ({})",
-                    template.stage_id,
-                    template.resource_stem,
-                    template.behavior.label()
-                )
+            .map_or("No compatible goop type".to_string(), |template| {
+                goop_template_label(template, self.show_incompatible_goop_templates)
             });
         let previous_template = self.selected_goop_template;
         egui::ComboBox::from_label(if selected_generated_layer.is_some() {
-            "Retail style"
+            "Goop type"
         } else {
-            "New layer style"
+            "New layer type"
         })
         .selected_text(selected_text)
         .show_ui(ui, |ui| {
             for (index, template) in visible_templates {
-                let suffix = if template.compatible {
-                    ""
-                } else {
-                    " [incompatible]"
-                };
                 ui.selectable_value(
                     &mut self.selected_goop_template,
                     index,
-                    format!(
-                        "{} / {}{}",
-                        template.stage_id, template.resource_stem, suffix
-                    ),
+                    goop_template_label(&template, self.show_incompatible_goop_templates),
                 );
             }
         });
@@ -502,7 +583,9 @@ impl SmsEditorApp {
             ));
             ui.label(format!("Plane: {:?}", layer.plane));
             if let Some(style) = &layer.style_source {
-                ui.small(format!("Style: {}", style.display_name));
+                if self.show_incompatible_goop_templates {
+                    ui.small(format!("Retail source: {}", style.display_name));
+                }
                 if style.forced_incompatible || style.behavior_code != layer.behavior.runtime_code()
                 {
                     ui.colored_label(
@@ -611,15 +694,30 @@ impl SmsEditorApp {
             .map_err(|error| error.to_string())?;
             let width = 1u16 << width_log2;
             let height = 1u16 << height_log2;
+            let runtime = YmpLayer {
+                layer_type: template.behavior.runtime_code(),
+                subtype: 0,
+                flags: GoopPlane::Floor.runtime_code(),
+                reserved: 0,
+                vertical_offset,
+                vertical_scale: GOOP_CELL_SIZE,
+                min_x: region.min_x,
+                min_z: region.min_z,
+                max_x: region.max_x,
+                max_z: region.max_z,
+                width_log2,
+                height_log2,
+                user_value: 0,
+                map_offset: 0,
+                depth_map,
+            };
             let template_model = read_stage_asset_bytes(&template.model_asset_path)
                 .and_then(J3dRebuildDocument::parse)
                 .map_err(|error| error.to_string())?;
             let generated_model = generate_floor_pollution_model(
                 &template_model,
                 &terrain.render_triangles,
-                region,
-                width,
-                height,
+                &runtime,
                 !template.compatible,
             )
             .map_err(|error| error.to_string())?;
@@ -651,23 +749,7 @@ impl SmsEditorApp {
                 behavior: template.behavior,
                 visible: true,
                 region,
-                runtime: YmpLayer {
-                    layer_type: template.behavior.runtime_code(),
-                    subtype: 0,
-                    flags: GoopPlane::Floor.runtime_code(),
-                    reserved: 0,
-                    vertical_offset,
-                    vertical_scale: GOOP_CELL_SIZE,
-                    min_x: region.min_x,
-                    min_z: region.min_z,
-                    max_x: region.max_x,
-                    max_z: region.max_z,
-                    width_log2,
-                    height_log2,
-                    user_value: 0,
-                    map_offset: 0,
-                    depth_map,
-                },
+                runtime,
                 bitmap: Some(
                     BmpFile::new_pollution_mask(
                         width,
@@ -790,7 +872,7 @@ impl SmsEditorApp {
         let preview = J3dFile::parse(&model_bytes)
             .and_then(|model| model.geometry_preview_with_loader_flags(SMS_MAP_MODEL_LOAD_FLAGS))
             .map_err(|error| format!("could not decode final map render geometry: {error}"))?;
-        let render_triangles = goop_upward_render_triangles(&preview, &collision_triangles);
+        let render_triangles = goop_upward_render_triangles(&preview);
         if render_triangles.is_empty() {
             return Err("final map model contains no upward-facing render triangles".to_string());
         }
@@ -1138,32 +1220,20 @@ impl SmsEditorApp {
                 return;
             }
         };
-        let Some((region, width, height, behavior, target_stem)) = self
+        let Some((runtime, target_stem)) = self
             .document
             .as_ref()
             .and_then(|document| document.goop_authoring.as_ref())
             .and_then(|goop| goop.layers.get(self.selected_goop_layer))
             .filter(|layer| layer.origin == GoopLayerOrigin::Generated)
-            .and_then(|layer| {
-                layer.dimensions().ok().map(|(width, height)| {
-                    (
-                        layer.region,
-                        width,
-                        height,
-                        layer.behavior,
-                        layer.resource_stem.clone(),
-                    )
-                })
-            })
+            .map(|layer| (layer.runtime.clone(), layer.resource_stem.clone()))
         else {
             return;
         };
         let generated_model = match generate_floor_pollution_model(
             &template_model,
             &terrain.render_triangles,
-            region,
-            width as u16,
-            height as u16,
+            &runtime,
             !template.compatible,
         ) {
             Ok(model) => model,
@@ -1186,15 +1256,17 @@ impl SmsEditorApp {
                 .and_then(|goop| goop.layers.get_mut(self.selected_goop_layer))
                 .ok_or_else(|| "the selected goop layer no longer exists".to_string())?;
             layer.generated_model = Some(generated_model);
+            layer.behavior = template.behavior;
+            layer.runtime.layer_type = template.behavior.runtime_code();
             layer.style_source = Some(GoopStyleSource {
                 stage_id: template.stage_id.clone(),
                 layer_index: template.layer_index,
                 display_name: format!("{} / {}", template.stage_id, template.resource_stem),
                 behavior_code: template.behavior.runtime_code(),
-                forced_incompatible: !template.compatible || template.behavior != behavior,
+                forced_incompatible: !template.compatible,
             });
             layer.metadata_dirty = true;
-            for extension in ["btk", "btp", "brk", "bck", "bas"] {
+            for extension in GOOP_TEMPLATE_ANIMATION_EXTENSIONS {
                 document.archive_edits.remove_resource(
                     format!("map/pollution/{target_stem}.{extension}").into_bytes(),
                 );
@@ -1307,6 +1379,7 @@ impl SmsEditorApp {
             .layers
             .pop()
             .expect("selected generated layer exists");
+        clear_generated_goop_readiness_if_empty(authoring);
         let mut export_authoring = authoring.clone();
         export_authoring.stale = false;
         let compiled_ymp = match document.effective_resource_clone(sms_scene::GOOP_RESOURCE_PATH) {
@@ -1340,7 +1413,7 @@ impl SmsEditorApp {
                 StageResourceDocument::PollutionMap(compiled_ymp),
             );
         }
-        for extension in ["bmp", "bmd", "btk", "btp", "brk", "bck", "bas"] {
+        for extension in ["bmp", "bmd", "btk", "btp", "bpk", "brk", "bck", "bas"] {
             document.archive_edits.remove_resource(
                 format!("map/pollution/{}.{extension}", layer.resource_stem).into_bytes(),
             );
@@ -1467,37 +1540,48 @@ impl SmsEditorApp {
             return None;
         }
         let frame = self.camera_frame();
-        let focal = perspective_focal_length(rect, self.viewport_zoom);
-        let local = position - rect.center() - self.viewport_pan;
-        let ray = vec3_normalize(vec3_add(
-            frame.forward,
-            vec3_add(
-                vec3_scale(frame.right, local.x / focal),
-                vec3_scale(frame.up, -local.y / focal),
-            ),
-        ));
+        let ray = goop_viewport_ray_direction(
+            frame,
+            rect,
+            self.viewport_pan,
+            self.viewport_zoom,
+            position,
+        );
         let preview = self.model_preview.as_ref()?;
-        preview
-            .collision_triangles
-            .iter()
-            .map(|triangle| triangle.vertices)
-            .chain(
+        let active_layer = self
+            .document
+            .as_ref()
+            .and_then(|document| document.goop_authoring.as_ref())
+            .and_then(|goop| goop.layers.get(self.selected_goop_layer));
+
+        // Only the effective map terrain may anchor the brush. Scene objects,
+        // authored props, and pollution meshes can all be nearer to the
+        // camera, but their render triangles do not define the floor goopmap.
+        let render_hit = nearest_goop_render_surface_hit(
+            active_layer,
+            frame.position,
+            ray,
+            &preview.goop_surface_model_indices,
+            &preview.triangles,
+        );
+        if !preview.goop_surface_model_indices.is_empty() {
+            return render_hit;
+        }
+
+        // Collision-only stages predate the model provenance metadata. Keep
+        // them paintable as a compatibility fallback, while rejecting walls.
+        render_hit.or_else(|| {
+            nearest_goop_surface_hit(
+                active_layer,
+                frame.position,
+                ray,
                 preview
-                    .triangles
+                    .collision_triangles
                     .iter()
-                    .filter(|triangle| triangle.render_layer == PreviewRenderLayer::Main)
+                    .filter(|triangle| triangle_has_floor_projection(triangle.vertices))
                     .map(|triangle| triangle.vertices),
             )
-            .filter_map(|vertices| {
-                ray_triangle_distance(frame.position, ray, vertices).map(|distance| {
-                    (
-                        distance,
-                        vec3_add(frame.position, vec3_scale(ray, distance)),
-                    )
-                })
-            })
-            .min_by(|left, right| left.0.total_cmp(&right.0))
-            .map(|(_, hit)| hit)
+        })
     }
 
     pub(super) fn paint_goop_overlay(&self, painter: &egui::Painter, rect: egui::Rect) {
@@ -1525,7 +1609,7 @@ impl SmsEditorApp {
                 (height.saturating_sub(1), layer.region.max_z),
             ] {
                 let points = (0..width).map(|cell_x| {
-                    goop_cell_surface_y(layer, cell_x, cell_y).map(|world_y| {
+                    goop_cell_cleanable_surface_y(layer, cell_x, cell_y).map(|world_y| {
                         [
                             layer.region.min_x + (cell_x as f32 + 0.5) * cell_size,
                             world_y + 8.0,
@@ -1540,7 +1624,7 @@ impl SmsEditorApp {
                 (width.saturating_sub(1), layer.region.max_x),
             ] {
                 let points = (0..height).map(|cell_y| {
-                    goop_cell_surface_y(layer, cell_x, cell_y).map(|world_y| {
+                    goop_cell_cleanable_surface_y(layer, cell_x, cell_y).map(|world_y| {
                         [
                             world_x,
                             world_y + 8.0,
@@ -1576,13 +1660,7 @@ impl SmsEditorApp {
             }
         }
         if let Some(hit) = self.goop_cursor_world {
-            if let (Some((center, _)), Some((edge, _))) = (
-                self.project_world_to_screen(rect, hit),
-                self.project_world_to_screen(
-                    rect,
-                    [hit[0] + self.goop_brush_radius, hit[1], hit[2]],
-                ),
-            ) {
+            if let Some((center, _)) = self.project_world_to_screen(rect, hit) {
                 let color = if layer
                     .world_to_cell(hit[0], hit[2])
                     .is_some_and(|(x, y)| layer.valid_cell(x, y))
@@ -1591,11 +1669,14 @@ impl SmsEditorApp {
                 } else {
                     egui::Color32::from_rgb(255, 90, 90)
                 };
-                painter.circle_stroke(
-                    center,
-                    center.distance(edge).max(2.0),
+                let outline = goop_brush_outline(layer, hit, self.goop_brush_radius);
+                paint_surface_polyline(
+                    painter,
+                    projection,
+                    outline.into_iter().map(Some),
                     egui::Stroke::new(2.0, color),
                 );
+                painter.circle_filled(center, 2.5, color);
             }
         }
         if authoring.stale {
@@ -1610,10 +1691,124 @@ impl SmsEditorApp {
     }
 }
 
-fn goop_cell_surface_y(layer: &GoopLayerAuthoring, x: usize, y: usize) -> Option<f32> {
+fn goop_viewport_ray_direction(
+    frame: CameraFrame,
+    rect: egui::Rect,
+    viewport_pan: egui::Vec2,
+    viewport_zoom: f32,
+    position: egui::Pos2,
+) -> [f32; 3] {
+    let focal = perspective_focal_length(rect, viewport_zoom).max(1.0);
+    let local = position - rect.center() - viewport_pan;
+    vec3_normalize(vec3_add(
+        frame.forward,
+        vec3_add(
+            vec3_scale(frame.right, local.x / focal),
+            vec3_scale(frame.up, -local.y / focal),
+        ),
+    ))
+}
+
+fn nearest_goop_surface_hit(
+    layer: Option<&GoopLayerAuthoring>,
+    origin: [f32; 3],
+    direction: [f32; 3],
+    triangles: impl IntoIterator<Item = [[f32; 3]; 3]>,
+) -> Option<[f32; 3]> {
+    triangles
+        .into_iter()
+        .filter_map(|vertices| {
+            let distance = ray_triangle_distance(origin, direction, vertices)?;
+            let hit = vec3_add(origin, vec3_scale(direction, distance));
+            layer
+                .is_none_or(|layer| goop_hit_matches_active_floor(layer, hit))
+                .then_some((distance, hit))
+        })
+        .min_by(|left, right| left.0.total_cmp(&right.0))
+        .map(|(_, hit)| hit)
+}
+
+fn nearest_goop_render_surface_hit<'a>(
+    layer: Option<&GoopLayerAuthoring>,
+    origin: [f32; 3],
+    direction: [f32; 3],
+    surface_model_indices: &BTreeSet<usize>,
+    triangles: impl IntoIterator<Item = &'a PreviewTriangle>,
+) -> Option<[f32; 3]> {
+    nearest_goop_surface_hit(
+        layer,
+        origin,
+        direction,
+        triangles.into_iter().filter_map(|triangle| {
+            (triangle.render_layer == PreviewRenderLayer::Main
+                && surface_model_indices.contains(&triangle.model_index)
+                && render_triangle_is_upward_facing(triangle.vertices, triangle.normals))
+            .then_some(triangle.vertices)
+        }),
+    )
+}
+
+fn goop_hit_matches_active_floor(layer: &GoopLayerAuthoring, hit: [f32; 3]) -> bool {
+    let Some((x, y)) = layer.world_to_cell(hit[0], hit[2]) else {
+        // Keep the footprint usable just outside the region so a brush can
+        // still overlap and paint valid edge cells.
+        return true;
+    };
+    let Ok(depth) = layer.runtime.depth_at(x, y) else {
+        return true;
+    };
+    if depth == 0xff {
+        // Invalid cells are deliberately targetable: the red footprint tells
+        // the user why the center will not paint, while valid neighboring
+        // cells inside the brush radius can still be affected.
+        return true;
+    }
+    // TPollutionPos::isSame performs this exact comparison: worldToDepth uses
+    // the hard-coded 0.025 conversion with C++ truncation toward zero, then
+    // accepts the floor layer's inclusive +/-2 encoded-depth window.
+    let encoded = ((hit[1] - layer.runtime.vertical_offset) * 0.025).trunc();
+    encoded.is_finite() && encoded >= f32::from(depth) - 2.0 && encoded <= f32::from(depth) + 2.0
+}
+
+fn triangle_has_floor_projection(vertices: [[f32; 3]; 3]) -> bool {
+    const MIN_VERTICAL_NORMAL_COMPONENT: f32 = 0.1;
+
+    let edge_a = vec3_sub(vertices[1], vertices[0]);
+    let edge_b = vec3_sub(vertices[2], vertices[0]);
+    let normal = vec3_cross(edge_a, edge_b);
+    let length = vec3_dot(normal, normal).sqrt();
+    length.is_finite()
+        && length > f32::EPSILON
+        && normal[1].abs() / length > MIN_VERTICAL_NORMAL_COMPONENT
+}
+
+fn goop_brush_outline(layer: &GoopLayerAuthoring, center: [f32; 3], radius: f32) -> Vec<[f32; 3]> {
+    const SEGMENTS: usize = 64;
+
+    (0..=SEGMENTS)
+        .map(|step| {
+            let angle = step as f32 / SEGMENTS as f32 * std::f32::consts::TAU;
+            let x = center[0] + angle.cos() * radius;
+            let z = center[2] + angle.sin() * radius;
+            let surface_y = layer
+                .world_to_cell(x, z)
+                .and_then(|(cell_x, cell_y)| goop_cell_cleanable_surface_y(layer, cell_x, cell_y))
+                .unwrap_or(center[1]);
+            [x, surface_y + 8.0, z]
+        })
+        .collect()
+}
+
+/// Reconstructs the world Y which Sunshine accepts for painting and cleaning.
+/// `TPollutionPos::worldToDepth` and `isSame` always encode at 0.025, even for
+/// imported layers whose `mVerticalScale` is not 40. `getDepthWorld` separately
+/// multiplies by `mVerticalScale` for effect placement; the authoring overlay
+/// deliberately visualizes the cleanability plane instead.
+fn goop_cell_cleanable_surface_y(layer: &GoopLayerAuthoring, x: usize, y: usize) -> Option<f32> {
     let depth = layer.runtime.depth_at(x, y).ok()?;
-    (depth != 0xff)
-        .then_some(layer.runtime.vertical_offset + f32::from(depth) * layer.runtime.vertical_scale)
+    (depth != 0xff).then_some(
+        layer.runtime.vertical_offset + f32::from(depth) * GOOP_DEPTH_WORLD_UNITS_PER_CODE,
+    )
 }
 
 fn goop_invalid_marker_surface_y(layer: &GoopLayerAuthoring, x: usize, y: usize) -> Option<f32> {
@@ -1624,7 +1819,7 @@ fn goop_invalid_marker_surface_y(layer: &GoopLayerAuthoring, x: usize, y: usize)
     let max_y = (y + 1).min(height.saturating_sub(1));
     (min_y..=max_y)
         .flat_map(|near_y| (min_x..=max_x).map(move |near_x| (near_x, near_y)))
-        .filter_map(|(near_x, near_y)| goop_cell_surface_y(layer, near_x, near_y))
+        .filter_map(|(near_x, near_y)| goop_cell_cleanable_surface_y(layer, near_x, near_y))
         .max_by(f32::total_cmp)
 }
 
@@ -1648,36 +1843,46 @@ fn goop_collision_triangles(collision: &ColFile) -> Vec<GoopTerrainTriangle> {
     collision
         .groups()
         .iter()
-        .flat_map(|group| &group.triangles)
-        .filter_map(|triangle| {
-            let [a, b, c] = triangle.vertex_indices;
-            let vertices = [a, b, c].map(|index| {
-                collision
-                    .vertices()
-                    .get(usize::from(index))
-                    .map(|vertex| vertex.position)
-            });
-            let [Some(a), Some(b), Some(c)] = vertices else {
-                return None;
-            };
-            Some(GoopTerrainTriangle {
-                vertices: [a, b, c],
+        .flat_map(|group| {
+            group.triangles.iter().filter_map(|triangle| {
+                let [a, b, c] = triangle.vertex_indices;
+                let vertices = [a, b, c].map(|index| {
+                    collision
+                        .vertices()
+                        .get(usize::from(index))
+                        .map(|vertex| vertex.position)
+                });
+                let [Some(a), Some(b), Some(c)] = vertices else {
+                    return None;
+                };
+                let vertices = [a, b, c];
+                collision_triangle_is_runtime_ground(vertices, group.surface_type)
+                    .then_some(GoopTerrainTriangle { vertices })
             })
         })
         .collect()
 }
 
-fn goop_upward_render_triangles(
-    preview: &J3dGeometryPreview,
-    collision_triangles: &[GoopTerrainTriangle],
-) -> Vec<GoopRenderTriangle> {
+fn collision_triangle_is_runtime_ground(vertices: [[f32; 3]; 3], surface_type: u16) -> bool {
+    // TBGCheckData::getPlaneType forces 0x0801 into the ground list. Every
+    // other collision triangle is ground only when its normalized Y normal is
+    // greater than 0.2. TPollutionObj::getDepthFromMap calls checkGround, so
+    // roofs and walls must not participate in generated YMP sampling.
+    if surface_type == 0x0801 {
+        return true;
+    }
+    let first = vec3_sub(vertices[1], vertices[0]);
+    let second = vec3_sub(vertices[2], vertices[1]);
+    let normal = vec3_cross(first, second);
+    let length = vec3_dot(normal, normal).sqrt();
+    length.is_finite() && length > f32::EPSILON && normal[1] / length > 0.2
+}
+
+fn goop_upward_render_triangles(preview: &J3dGeometryPreview) -> Vec<GoopRenderTriangle> {
     preview
         .triangles
         .iter()
-        .filter(|triangle| {
-            render_triangle_is_upward_facing(triangle.vertices, triangle.normals)
-                && render_triangle_matches_topmost_collision(triangle.vertices, collision_triangles)
-        })
+        .filter(|triangle| render_triangle_is_upward_facing(triangle.vertices, triangle.normals))
         .map(|triangle| GoopRenderTriangle {
             vertices: triangle.vertices,
             normals: triangle.normals,
@@ -1711,34 +1916,6 @@ fn render_triangle_is_upward_facing(
     let geometric = vec3_cross(edge_a, edge_b);
     let length = vec3_dot(geometric, geometric).sqrt();
     length.is_finite() && length > f32::EPSILON && -geometric[1] / length > MIN_UPWARD_COMPONENT
-}
-
-fn render_triangle_matches_topmost_collision(
-    vertices: [[f32; 3]; 3],
-    collision_triangles: &[GoopTerrainTriangle],
-) -> bool {
-    const MAX_RENDER_COLLISION_SEPARATION: f32 = 30.0;
-
-    let center: [f32; 3] =
-        std::array::from_fn(|axis| vertices.iter().map(|vertex| vertex[axis]).sum::<f32>() / 3.0);
-    collision_triangles
-        .iter()
-        .filter_map(|triangle| collision_height_at_xz(triangle.vertices, center[0], center[2]))
-        .max_by(f32::total_cmp)
-        .is_some_and(|height| (height - center[1]).abs() <= MAX_RENDER_COLLISION_SEPARATION)
-}
-
-fn collision_height_at_xz(vertices: [[f32; 3]; 3], x: f32, z: f32) -> Option<f32> {
-    let [a, b, c] = vertices;
-    let denominator = (b[2] - c[2]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[2] - c[2]);
-    if denominator.abs() <= f32::EPSILON {
-        return None;
-    }
-    let weight_a = ((b[2] - c[2]) * (x - c[0]) + (c[0] - b[0]) * (z - c[2])) / denominator;
-    let weight_b = ((c[2] - a[2]) * (x - c[0]) + (a[0] - c[0]) * (z - c[2])) / denominator;
-    let weight_c = 1.0 - weight_a - weight_b;
-    (weight_a >= -0.0001 && weight_b >= -0.0001 && weight_c >= -0.0001)
-        .then_some(weight_a * a[1] + weight_b * b[1] + weight_c * c[1])
 }
 
 fn rebuild_goop_document(
@@ -1799,9 +1976,7 @@ fn rebuild_goop_document(
             generate_floor_pollution_model(
                 &model,
                 render_triangles,
-                layer.region,
-                width as u16,
-                height as u16,
+                &layer.runtime,
                 source.forced_incompatible,
             )
             .map_err(|error| error.to_string())?,
@@ -1834,7 +2009,7 @@ fn copy_template_animations(
             .file_stem()
             .and_then(|value| value.to_str())
             .is_some_and(|value| value.eq_ignore_ascii_case(&template.resource_stem));
-        if stem_matches && matches!(extension.as_str(), "btk" | "btp" | "brk" | "bck" | "bas") {
+        if stem_matches && GOOP_TEMPLATE_ANIMATION_EXTENSIONS.contains(&extension.as_str()) {
             document.upsert_authored_resource(
                 format!("map/pollution/{target_stem}.{extension}").into_bytes(),
                 resource.document.clone(),
@@ -2044,6 +2219,62 @@ mod tests {
         }
     }
 
+    fn retail_template(
+        stage_id: &str,
+        layer_index: usize,
+        behavior: GoopBehavior,
+        semantic_type: &str,
+    ) -> RetailGoopTemplate {
+        RetailGoopTemplate {
+            stage_id: stage_id.to_string(),
+            archive_path: PathBuf::from(format!("{stage_id}.szs")),
+            model_asset_path: PathBuf::from(format!("pollution{layer_index:02}.bmd")),
+            resource_stem: format!("pollution{layer_index:02}"),
+            layer_index,
+            behavior,
+            semantic_type: semantic_type.to_string(),
+            compatible: true,
+        }
+    }
+
+    #[test]
+    fn normal_goop_type_choices_hide_retail_provenance_and_keep_selected_variant() {
+        assert_eq!(
+            semantic_goop_type(GoopBehavior::Slippery, Some("TestChoco2")),
+            "Chocolate"
+        );
+        assert_eq!(
+            semantic_goop_type(GoopBehavior::Slippery, Some("B_RAKenogu_pink")),
+            "Pink"
+        );
+        assert_eq!(
+            semantic_goop_type(GoopBehavior::Slippery, Some("B_ricoDrDr")),
+            "Oil"
+        );
+        assert!(GOOP_TEMPLATE_ANIMATION_EXTENSIONS.contains(&"bpk"));
+
+        let templates = vec![
+            retail_template("airport0", 0, GoopBehavior::Slippery, "Pink"),
+            retail_template("bianco0", 0, GoopBehavior::Slippery, "Chocolate"),
+            retail_template("monte0", 0, GoopBehavior::Fire, "Fire"),
+            retail_template("sirena0", 0, GoopBehavior::Electric, "Electric"),
+        ];
+
+        let choices = goop_template_choices(&templates, 1, false);
+        assert_eq!(choices.len(), 4);
+        assert_eq!(choices[0].1.behavior, GoopBehavior::Fire);
+        assert_eq!(choices[1].0, 1);
+        assert_eq!(choices[1].1.behavior, GoopBehavior::Slippery);
+        assert_eq!(choices[2].1.semantic_type, "Pink");
+        assert_eq!(choices[3].1.behavior, GoopBehavior::Electric);
+        assert_eq!(goop_template_label(&choices[1].1, false), "Chocolate");
+        assert!(!goop_template_label(&choices[1].1, false).contains("bianco"));
+
+        let expert = goop_template_choices(&templates, 1, true);
+        assert_eq!(expert.len(), templates.len());
+        assert!(goop_template_label(&expert[1].1, true).contains("bianco0 / pollution00"));
+    }
+
     #[test]
     fn legacy_generated_layers_request_exactly_one_automatic_rebuild() {
         let mut authoring = GoopAuthoringDocument {
@@ -2068,6 +2299,24 @@ mod tests {
     }
 
     #[test]
+    fn deleting_the_last_generated_layer_clears_stale_release_state() {
+        let mut authoring = GoopAuthoringDocument {
+            format_version: GOOP_AUTHORING_FORMAT_VERSION - 1,
+            layers: vec![editable_layer()],
+            terrain_fingerprint: 123,
+            stale: true,
+        };
+        clear_generated_goop_readiness_if_empty(&mut authoring);
+        assert!(authoring.stale);
+
+        authoring.layers.clear();
+        clear_generated_goop_readiness_if_empty(&mut authoring);
+        assert!(!authoring.stale);
+        assert_eq!(authoring.terrain_fingerprint, 0);
+        assert_eq!(authoring.format_version, GOOP_AUTHORING_FORMAT_VERSION);
+    }
+
+    #[test]
     fn pixel_changes_are_coalesced_into_contiguous_spans() {
         let changes = BTreeMap::from([(2, (0, 1)), (3, (2, 3)), (7, (4, 5))]);
         let spans = coalesce_pixel_changes(changes);
@@ -2085,6 +2334,219 @@ mod tests {
             [[0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]],
         );
         assert_eq!(distance, Some(1.0));
+    }
+
+    #[test]
+    fn generated_depth_uses_only_the_runtime_collision_ground_list() {
+        let vertices = vec![
+            sms_formats::ColVertex::new(0.0, 0.0, 0.0),
+            sms_formats::ColVertex::new(0.0, 0.0, 100.0),
+            sms_formats::ColVertex::new(100.0, 0.0, 0.0),
+            sms_formats::ColVertex::new(0.0, 100.0, 0.0),
+        ];
+        let triangle = |vertex_indices| sms_formats::ColTriangle {
+            vertex_indices,
+            attribute_0: 0,
+            attribute_1: 0,
+            data: None,
+        };
+        let collision = sms_formats::ColFile::new(
+            vertices,
+            vec![
+                sms_formats::ColGroup {
+                    surface_type: 0,
+                    has_per_triangle_data: false,
+                    triangles: vec![
+                        triangle([0, 1, 2]),
+                        triangle([0, 2, 1]),
+                        triangle([0, 3, 1]),
+                    ],
+                },
+                sms_formats::ColGroup {
+                    surface_type: 0x0801,
+                    has_per_triangle_data: false,
+                    triangles: vec![triangle([0, 3, 1])],
+                },
+            ],
+        );
+
+        assert!(collision_triangle_is_runtime_ground(
+            [[0.0, 0.0, 0.0], [0.0, 0.0, 100.0], [100.0, 0.0, 0.0]],
+            0
+        ));
+        assert!(!collision_triangle_is_runtime_ground(
+            [[0.0, 0.0, 0.0], [100.0, 0.0, 0.0], [0.0, 0.0, 100.0]],
+            0
+        ));
+        assert!(!collision_triangle_is_runtime_ground(
+            [[0.0, 0.0, 0.0], [0.0, 100.0, 0.0], [0.0, 0.0, 100.0]],
+            0
+        ));
+        assert!(collision_triangle_is_runtime_ground(
+            [[0.0, 0.0, 0.0], [0.0, 100.0, 0.0], [0.0, 0.0, 100.0]],
+            0x0801
+        ));
+        assert_eq!(goop_collision_triangles(&collision).len(), 2);
+    }
+
+    #[test]
+    fn viewport_ray_is_the_inverse_of_zoomed_and_panned_projection() {
+        let mut app = SmsEditorApp::default();
+        {
+            let camera = app.renderer.camera_mut();
+            camera.focus = [120.0, 80.0, 300.0];
+            camera.yaw_degrees = 37.0;
+            camera.pitch_degrees = -28.0;
+            camera.distance = 4_800.0;
+        }
+        app.viewport_pan = egui::vec2(83.0, -47.0);
+        app.viewport_zoom = 0.35;
+        let rect = egui::Rect::from_min_size(egui::pos2(25.0, 40.0), egui::vec2(1_300.0, 620.0));
+        let frame = app.camera_frame();
+        let target = vec3_add(
+            frame.position,
+            vec3_add(
+                vec3_scale(frame.forward, 6_000.0),
+                vec3_add(
+                    vec3_scale(frame.right, 1_150.0),
+                    vec3_scale(frame.up, -620.0),
+                ),
+            ),
+        );
+        let screen = app
+            .project_world_to_screen(rect, target)
+            .expect("target remains in front of camera")
+            .0;
+        let ray =
+            goop_viewport_ray_direction(frame, rect, app.viewport_pan, app.viewport_zoom, screen);
+        let expected = vec3_normalize(vec3_sub(target, frame.position));
+        for axis in 0..3 {
+            assert!((ray[axis] - expected[axis]).abs() < 0.000_01);
+        }
+    }
+
+    #[test]
+    fn collision_wall_cannot_steal_the_brush_from_the_active_floor() {
+        let layer = editable_layer();
+        let wall = [[0.0, 0.0, 0.0], [320.0, 0.0, 0.0], [0.0, 100.0, 0.0]];
+        let floor = [[0.0, 0.0, 0.0], [0.0, 0.0, 160.0], [320.0, 0.0, 0.0]];
+        let origin = [60.0, 100.0, -100.0];
+        let direction = vec3_normalize([0.0, -1.0, 2.0]);
+
+        assert!(!triangle_has_floor_projection(wall));
+        assert!(triangle_has_floor_projection(floor));
+        assert!(ray_triangle_distance(origin, direction, wall).is_some());
+        let hit = nearest_goop_surface_hit(
+            Some(&layer),
+            origin,
+            direction,
+            [wall, floor]
+                .into_iter()
+                .filter(|vertices| triangle_has_floor_projection(*vertices)),
+        )
+        .expect("floor remains targetable behind collision wall");
+        assert!((hit[0] - 60.0).abs() < 0.001);
+        assert!(hit[1].abs() < 0.001);
+        assert!((hit[2] - 100.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn nearer_upward_prop_cannot_steal_brush_from_authoritative_map_floor() {
+        let triangle = |model_index, height| PreviewTriangle {
+            vertices: [
+                [0.0, height, 0.0],
+                [100.0, height, 0.0],
+                [0.0, height, 100.0],
+            ],
+            normals: Some([[0.0, 1.0, 0.0]; 3]),
+            color_channels: [None; 2],
+            tex_coord_sets: [None; 8],
+            material_index: None,
+            packet_index: 0,
+            model_index,
+            render_layer: PreviewRenderLayer::Main,
+            color: None,
+            vertex_colors: None,
+            combine_mode: J3dPreviewCombineMode::VertexOnly,
+            tex_coords: None,
+            texture_index: None,
+            mask_tex_coords: None,
+            mask_texture_index: None,
+            cull_mode: None,
+            alpha_compare: None,
+            blend_mode: None,
+            z_mode: None,
+            billboard: None,
+            particle_type: None,
+            particle_pivot: None,
+            particle_direction: None,
+            particle_color_mode: None,
+            particle_environment_color: None,
+        };
+        let prop = triangle(2, 50.0);
+        let floor = triangle(1, 0.0);
+        let origin = [40.0, 100.0, 40.0];
+        let direction = [0.0, -1.0, 0.0];
+        let layer = editable_layer();
+
+        let unfiltered = nearest_goop_surface_hit(
+            Some(&layer),
+            origin,
+            direction,
+            [prop.vertices, floor.vertices],
+        )
+        .expect("nearer prop is a geometric hit");
+        assert!((unfiltered[1] - 50.0).abs() < 0.001);
+
+        let hit = nearest_goop_render_surface_hit(
+            Some(&layer),
+            origin,
+            direction,
+            &BTreeSet::from([1]),
+            [&prop, &floor],
+        )
+        .expect("authoritative map floor remains targetable behind the prop");
+        assert!(hit[1].abs() < 0.001);
+    }
+
+    #[test]
+    fn invalid_and_edge_cells_keep_a_targetable_red_brush_footprint() {
+        let mut layer = editable_layer();
+        layer.runtime.set_depth(2, 1, 0xff).unwrap();
+        assert!(goop_hit_matches_active_floor(&layer, [100.0, 20.0, 60.0]));
+        assert!(goop_hit_matches_active_floor(&layer, [-5.0, 0.0, 60.0]));
+
+        assert!(!goop_hit_matches_active_floor(&layer, [60.0, 200.0, 60.0]));
+    }
+
+    #[test]
+    fn active_floor_hit_uses_runtime_depth_truncation_and_inclusive_window() {
+        let mut layer = editable_layer();
+        layer.origin = GoopLayerOrigin::Imported;
+        layer.runtime.vertical_offset = 40.0;
+        layer.runtime.vertical_scale = 32.0;
+
+        // Cell (1, 1) stores depth zero. isSame accepts encoded -2..=2.
+        // Values just inside the next 40-unit interval still truncate toward
+        // zero, while crossing it produces +/-3 and must reject the surface.
+        assert!(goop_hit_matches_active_floor(&layer, [60.0, -79.0, 60.0]));
+        assert!(!goop_hit_matches_active_floor(&layer, [60.0, -81.0, 60.0]));
+        assert!(goop_hit_matches_active_floor(&layer, [60.0, 159.0, 60.0]));
+        assert!(!goop_hit_matches_active_floor(&layer, [60.0, 161.0, 60.0]));
+    }
+
+    #[test]
+    fn brush_outline_is_a_world_xz_circle_that_follows_layer_height() {
+        let mut layer = editable_layer();
+        layer.runtime.vertical_offset = 40.0;
+        layer.runtime.set_depth(5, 2, 2).unwrap();
+        let center = [160.0, 40.0, 80.0];
+        let outline = goop_brush_outline(&layer, center, 60.0);
+        assert_eq!(outline.len(), 65);
+        for point in &outline {
+            assert!(((point[0] - center[0]).hypot(point[2] - center[2]) - 60.0).abs() < 0.001);
+        }
+        assert!(outline.iter().any(|point| (point[1] - 128.0).abs() < 0.001));
     }
 
     #[test]
@@ -2109,36 +2571,6 @@ mod tests {
         ));
         let reversed_floor = [floor[0], floor[2], floor[1]];
         assert!(!render_triangle_is_upward_facing(reversed_floor, None));
-    }
-
-    #[test]
-    fn render_surface_filter_requires_the_topmost_collision_floor() {
-        let floor = [[0.0, 25.0, 0.0], [100.0, 25.0, 0.0], [0.0, 25.0, 100.0]];
-        let mut collision = vec![GoopTerrainTriangle { vertices: floor }];
-        assert!(render_triangle_matches_topmost_collision(floor, &collision));
-
-        let floating = floor.map(|mut vertex| {
-            vertex[1] += 31.0;
-            vertex
-        });
-        assert!(!render_triangle_matches_topmost_collision(
-            floating, &collision
-        ));
-
-        let upper_floor = floor.map(|mut vertex| {
-            vertex[1] += 100.0;
-            vertex
-        });
-        collision.push(GoopTerrainTriangle {
-            vertices: upper_floor,
-        });
-        assert!(!render_triangle_matches_topmost_collision(
-            floor, &collision
-        ));
-        assert!(render_triangle_matches_topmost_collision(
-            upper_floor,
-            &collision
-        ));
     }
 
     #[test]
@@ -2208,15 +2640,22 @@ mod tests {
     }
 
     #[test]
-    fn overlay_heights_decode_runtime_depth_and_anchor_invalid_boundaries() {
+    fn imported_overlay_uses_cleanability_depth_and_retail_horizontal_scale() {
         let mut layer = editable_layer();
+        layer.origin = GoopLayerOrigin::Imported;
+        layer.region.max_x = 256.0;
+        layer.region.max_z = 128.0;
+        layer.runtime.max_x = 256.0;
+        layer.runtime.max_z = 128.0;
         layer.runtime.vertical_offset = -80.0;
         layer.runtime.vertical_scale = 32.0;
+        assert_eq!(layer.world_to_cell(80.0, 48.0), Some((2, 1)));
+
         layer.runtime.set_depth(2, 1, 3).unwrap();
-        assert_eq!(goop_cell_surface_y(&layer, 2, 1), Some(16.0));
+        assert_eq!(goop_cell_cleanable_surface_y(&layer, 2, 1), Some(40.0));
 
         layer.runtime.set_depth(3, 1, 0xff).unwrap();
-        assert_eq!(goop_invalid_marker_surface_y(&layer, 3, 1), Some(16.0));
+        assert_eq!(goop_invalid_marker_surface_y(&layer, 3, 1), Some(40.0));
 
         for y in 0..4 {
             for x in 0..8 {
@@ -2248,6 +2687,21 @@ mod tests {
             let model = read_stage_asset_bytes(&template.model_asset_path)
                 .and_then(J3dRebuildDocument::parse)
                 .expect("reparse compatible retail goop template");
+            let template_preview =
+                sms_formats::J3dFile::parse(model.to_bytes().expect("encode retail goop template"))
+                    .expect("parse retail goop template")
+                    .geometry_preview()
+                    .expect("preview retail goop template");
+            let expects_detail = template_preview
+                .materials
+                .iter()
+                .find(|material| material.material_index == 0)
+                .is_some_and(|material| {
+                    material.tev_stages.iter().any(|stage| {
+                        stage.order.tex_map.is_some_and(|texture| texture > 0)
+                            && stage.order.tex_coord.is_some_and(|coord| coord > 0)
+                    })
+                });
             assert!(model
                 .sections
                 .iter()
@@ -2275,8 +2729,29 @@ mod tests {
                 vertices: [[0.0, 0.0, 0.0], [320.0, 0.0, 0.0], [0.0, 0.0, 160.0]],
                 normals: Some([[0.0, 1.0, 0.0]; 3]),
             }];
-            let generated = generate_floor_pollution_model(&model, &terrain, region, 8, 4, false)
+            let runtime = YmpLayer {
+                layer_type: 0,
+                subtype: 0,
+                flags: GoopPlane::Floor.runtime_code(),
+                reserved: 0,
+                vertical_offset: 0.0,
+                vertical_scale: GOOP_CELL_SIZE,
+                min_x: region.min_x,
+                min_z: region.min_z,
+                max_x: region.max_x,
+                max_z: region.max_z,
+                width_log2: 3,
+                height_log2: 2,
+                user_value: 0,
+                map_offset: 0,
+                depth_map: vec![0; 32],
+            };
+            let generated = generate_floor_pollution_model(&model, &terrain, &runtime, false)
                 .expect("generate with compatible retail material template");
+            assert!(generated
+                .sections
+                .iter()
+                .all(|section| section.declared_size.is_multiple_of(0x20)));
             let preview = sms_formats::J3dFile::parse(
                 generated
                     .to_bytes()
@@ -2299,6 +2774,51 @@ mod tests {
                 template.stage_id,
                 template.resource_stem
             );
+            if expects_detail {
+                let material = preview
+                    .materials
+                    .iter()
+                    .find(|material| material.material_index == 0)
+                    .expect("generated pollution BMD material zero");
+                let usable_detail = material.tev_stages.iter().any(|stage| {
+                    let (Some(texture_slot), Some(tex_gen_slot)) =
+                        (stage.order.tex_map, stage.order.tex_coord)
+                    else {
+                        return false;
+                    };
+                    if texture_slot == 0
+                        || tex_gen_slot == 0
+                        || material.texture_indices[usize::from(texture_slot)].is_none()
+                    {
+                        return false;
+                    }
+                    let source = material.tex_gens[usize::from(tex_gen_slot)].source;
+                    let Some(vertex_slot) = source
+                        .checked_sub(4)
+                        .map(usize::from)
+                        .filter(|slot| *slot < 8)
+                    else {
+                        return false;
+                    };
+                    let coords = preview
+                        .triangles
+                        .iter()
+                        .filter_map(|triangle| triangle.tex_coord_sets[vertex_slot])
+                        .flatten()
+                        .collect::<Vec<_>>();
+                    coords.first().is_some_and(|first| {
+                        coords.iter().skip(1).any(|coord| {
+                            (coord[0] - first[0]).abs() > 0.000001
+                                || (coord[1] - first[1]).abs() > 0.000001
+                        })
+                    })
+                });
+                assert!(
+                    usable_detail,
+                    "compatible template {} / {} lost its nonzero detail texture coordinates",
+                    template.stage_id, template.resource_stem
+                );
+            }
         }
     }
 }

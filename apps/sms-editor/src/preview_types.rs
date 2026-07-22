@@ -27,6 +27,9 @@ pub(super) struct ModelPreview {
     pub(super) source_vertices: usize,
     pub(super) source_triangles: usize,
     pub(super) source_textures: usize,
+    /// Render-model indices that belong to the effective map terrain and may
+    /// anchor the goop brush. Main-layer props are intentionally excluded.
+    pub(super) goop_surface_model_indices: BTreeSet<usize>,
     pub(super) object_model_indices: BTreeMap<String, usize>,
     pub(super) mirror_actor_positions: BTreeMap<usize, [f32; 3]>,
     pub(super) mirror_cubes: Vec<PreviewMirrorCube>,

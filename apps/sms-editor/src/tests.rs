@@ -190,6 +190,25 @@ fn camera_app() -> SmsEditorApp {
 }
 
 #[test]
+fn transform_shortcuts_do_not_exit_goop_mode() {
+    for key in [egui::Key::Q, egui::Key::W, egui::Key::E, egui::Key::R] {
+        assert_eq!(
+            EditorTool::Goop.after_keyboard_shortcut(key),
+            EditorTool::Goop
+        );
+    }
+
+    assert_eq!(
+        EditorTool::Select.after_keyboard_shortcut(egui::Key::W),
+        EditorTool::Move
+    );
+    assert_eq!(
+        EditorTool::Move.after_keyboard_shortcut(egui::Key::G),
+        EditorTool::Goop
+    );
+}
+
+#[test]
 fn automatic_scene_refresh_is_queued_once_per_base_root() {
     let mut app = SmsEditorApp {
         base_root: ".".to_string(),
@@ -1583,6 +1602,7 @@ fn preview_for_texture_alpha(has_alpha: bool, has_translucent_alpha: bool) -> Mo
         source_vertices: 0,
         source_triangles: 0,
         source_textures: 1,
+        goop_surface_model_indices: BTreeSet::new(),
         object_model_indices: BTreeMap::new(),
         mirror_actor_positions: BTreeMap::new(),
         mirror_cubes: Vec::new(),
@@ -2737,6 +2757,7 @@ fn updating_object_transform_moves_cached_preview_mesh() {
             source_vertices: 3,
             source_triangles: 1,
             source_textures: 0,
+            goop_surface_model_indices: BTreeSet::new(),
             object_model_indices,
             mirror_actor_positions: BTreeMap::from([(7, old_transform.translation)]),
             mirror_cubes: Vec::new(),

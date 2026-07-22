@@ -809,6 +809,7 @@ fn geometry_update_preview() -> ModelPreview {
         source_vertices: 6,
         source_triangles: 2,
         source_textures: 0,
+        goop_surface_model_indices: BTreeSet::new(),
         object_model_indices: BTreeMap::new(),
         mirror_actor_positions: BTreeMap::new(),
         mirror_cubes: Vec::new(),

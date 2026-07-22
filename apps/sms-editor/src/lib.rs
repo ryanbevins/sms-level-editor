@@ -170,6 +170,21 @@ impl EditorTool {
             Self::Place => "Place",
         }
     }
+
+    fn after_keyboard_shortcut(self, key: egui::Key) -> Self {
+        if self == Self::Goop && key != egui::Key::G {
+            return self;
+        }
+
+        match key {
+            egui::Key::Q => Self::Select,
+            egui::Key::W => Self::Move,
+            egui::Key::E => Self::Rotate,
+            egui::Key::R => Self::Scale,
+            egui::Key::G => Self::Goop,
+            _ => self,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1223,19 +1238,19 @@ impl eframe::App for SmsEditorApp {
             return;
         }
         if ctx.input(|i| i.key_pressed(egui::Key::W)) {
-            self.tool = EditorTool::Move;
+            self.tool = self.tool.after_keyboard_shortcut(egui::Key::W);
         }
         if ctx.input(|i| i.key_pressed(egui::Key::E)) {
-            self.tool = EditorTool::Rotate;
+            self.tool = self.tool.after_keyboard_shortcut(egui::Key::E);
         }
         if ctx.input(|i| i.key_pressed(egui::Key::R)) {
-            self.tool = EditorTool::Scale;
+            self.tool = self.tool.after_keyboard_shortcut(egui::Key::R);
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Q)) {
-            self.tool = EditorTool::Select;
+            self.tool = self.tool.after_keyboard_shortcut(egui::Key::Q);
         }
         if ctx.input(|i| i.key_pressed(egui::Key::G)) {
-            self.tool = EditorTool::Goop;
+            self.tool = self.tool.after_keyboard_shortcut(egui::Key::G);
         }
     }
 
@@ -2243,6 +2258,7 @@ impl SmsEditorApp {
         let mut source_vertices = 0;
         let mut source_triangles = 0;
         let mut source_textures = 0;
+        let mut goop_surface_model_indices = BTreeSet::new();
         let mut object_model_indices = BTreeMap::new();
         let mut mirror_actor_positions = BTreeMap::new();
         let mut mirror_model_slots = BTreeMap::new();
@@ -2251,6 +2267,7 @@ impl SmsEditorApp {
         for asset in models {
             let asset_path = asset.path.to_string_lossy().replace('\\', "/");
             let include_in_camera_bounds = is_camera_bounds_model_path(&asset_path);
+            let is_goop_surface_model = model_path_is_map_terrain(&asset_path);
             let model_render_layer = preview_render_layer_for_model_path(&asset_path);
             if !visibility.effects && preview_render_layer_is_effect(model_render_layer) {
                 continue;
@@ -2417,6 +2434,9 @@ impl SmsEditorApp {
                                 particle_environment_color: None,
                             });
                         }
+                    }
+                    if is_goop_surface_model && triangles.len() > triangle_start {
+                        goop_surface_model_indices.insert(model_index);
                     }
                     if !level_targets.is_empty() {
                         level_transform_models.push(LevelTransformModelPreview {
@@ -3189,6 +3209,7 @@ impl SmsEditorApp {
             source_vertices,
             source_triangles,
             source_textures,
+            goop_surface_model_indices,
             object_model_indices,
             mirror_actor_positions,
             mirror_cubes,

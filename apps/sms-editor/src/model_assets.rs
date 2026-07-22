@@ -448,7 +448,7 @@ pub(super) struct AuthoredModelPreviewKey {
     pub(super) loader_flags: u32,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(super) struct AuthoredModelPreviewBase {
     had_stage_preview: bool,
     triangle_count: usize,
@@ -459,6 +459,7 @@ pub(super) struct AuthoredModelPreviewBase {
     bounds_max: [f32; 3],
     camera_bounds_min: [f32; 3],
     camera_bounds_max: [f32; 3],
+    goop_surface_model_indices: BTreeSet<usize>,
 }
 
 pub(super) struct PreparedModelImport {
@@ -1572,6 +1573,7 @@ impl SmsEditorApp {
             bounds_max: preview.bounds_max,
             camera_bounds_min: preview.camera_bounds_min,
             camera_bounds_max: preview.camera_bounds_max,
+            goop_surface_model_indices: preview.goop_surface_model_indices.clone(),
         });
         let appended = append_authored_model_instances(
             preview,
@@ -1608,6 +1610,7 @@ impl SmsEditorApp {
         preview.bounds_max = base.bounds_max;
         preview.camera_bounds_min = base.camera_bounds_min;
         preview.camera_bounds_max = base.camera_bounds_max;
+        preview.goop_surface_model_indices = base.goop_surface_model_indices;
         if !base.had_stage_preview {
             self.model_preview = None;
         }
@@ -3975,6 +3978,7 @@ pub(super) fn append_authored_model_instances(
             .max()
             .map_or(1, |index| index + 1);
 
+        let instance_triangle_start = preview.triangles.len();
         for triangle in &geometry.preview.triangles {
             let vertices = triangle
                 .vertices
@@ -4024,6 +4028,11 @@ pub(super) fn append_authored_model_instances(
                 particle_environment_color: None,
             });
         }
+        if instance.placement.export_mode == ModelInstanceExportMode::MapTerrain
+            && preview.triangles.len() > instance_triangle_start
+        {
+            preview.goop_surface_model_indices.insert(next_model_index);
+        }
         next_model_index += 1;
     }
     preview.triangles.len() - triangle_start
@@ -4054,6 +4063,7 @@ fn empty_authored_model_preview() -> ModelPreview {
         source_vertices: 0,
         source_triangles: 0,
         source_textures: 0,
+        goop_surface_model_indices: BTreeSet::new(),
         object_model_indices: BTreeMap::new(),
         mirror_actor_positions: BTreeMap::new(),
         mirror_cubes: Vec::new(),
@@ -4326,6 +4336,14 @@ mod tests {
                 asset_id: entry.id,
                 loader_flags: SMS_MAP_MODEL_LOAD_FLAGS,
             }));
+        let preview = app
+            .model_preview
+            .as_ref()
+            .expect("authored terrain preview");
+        assert_eq!(preview.goop_surface_model_indices.len(), 1);
+        assert!(preview.triangles.iter().all(|triangle| preview
+            .goop_surface_model_indices
+            .contains(&triangle.model_index)));
         assert!(content.join(MODEL_INSTANCE_MANIFEST_NAME).is_file());
     }
 

@@ -41,8 +41,8 @@ pub use goop_authoring::{
     generate_floor_depth_map, generate_floor_pollution_model, terrain_fingerprint,
     whole_terrain_region, GoopAuthoringDocument, GoopBehavior, GoopLayerAuthoring, GoopLayerOrigin,
     GoopPlane, GoopRegion, GoopRenderTriangle, GoopStyleSource, GoopTerrainTriangle,
-    GOOP_AUTHORING_FORMAT_VERSION, GOOP_CELL_SIZE, GOOP_MAX_DIMENSION, GOOP_MAX_LAYERS,
-    GOOP_RESOURCE_PATH,
+    GOOP_AUTHORING_FORMAT_VERSION, GOOP_CELL_SIZE, GOOP_DEPTH_WORLD_UNITS_PER_CODE,
+    GOOP_MAX_DIMENSION, GOOP_MAX_LAYERS, GOOP_RESOURCE_PATH,
 };
 pub use object_authoring::{
     ObjectAuthoringCatalog, ObjectAuthoringCatalogBuild, ObjectAuthoringCatalogWarning,
