@@ -3308,10 +3308,10 @@ fn configured_dolphin_user_directory_is_forwarded_to_dolphin() {
 }
 
 #[test]
-fn play_in_editor_keeps_input_active_when_dolphin_loses_top_level_focus() {
+fn play_in_editor_keeps_input_active_and_accelerates_original_disc_loads() {
     let mut command = Command::new("Dolphin");
 
-    SmsEditorApp::configure_play_in_editor_input(&mut command);
+    SmsEditorApp::configure_play_in_editor_runtime(&mut command);
 
     assert_eq!(
         command.get_args().collect::<Vec<_>>(),
@@ -3320,6 +3320,8 @@ fn play_in_editor_keeps_input_active_when_dolphin_loses_top_level_focus() {
             std::ffi::OsStr::new("Dolphin.Interface.PauseOnFocusLost=False"),
             std::ffi::OsStr::new("-C"),
             std::ffi::OsStr::new("Dolphin.Input.BackgroundInput=True"),
+            std::ffi::OsStr::new("-C"),
+            std::ffi::OsStr::new("Dolphin.Core.FastDiscSpeed=True"),
         ]
     );
 }

@@ -1922,7 +1922,13 @@ fn find_sound_stage_hook(source: &[u8], image: &DolImage) -> Result<SoundStageHo
             let Some(sound_register) = decode_lwz_from_r13(sequence[0]) else {
                 continue;
             };
-            let Some(ms_stg_register) = decode_lwz_from_r13(sequence[2]) else {
+            let dispatch_anchor = WordAnchor {
+                section,
+                word_index: word_index + 2,
+            };
+            let Some(ms_stg_offset) =
+                decode_sound_stage_offset(source, image, dispatch_anchor, sequence[2])?
+            else {
                 continue;
             };
             let tail = if is_cmpwi(sequence[3], 4, -1) && is_beq(sequence[4]) {
@@ -1947,7 +1953,6 @@ fn find_sound_stage_hook(source: &[u8], image: &DolImage) -> Result<SoundStageHo
             };
             if sound_register != 3
                 || !is_relative_bl(sequence[1])
-                || ms_stg_register != 4
                 || decode_lwz_from_r13(sequence[tail]) != Some(3)
                 || immediate_i16(sequence[tail]) != immediate_i16(sequence[0])
                 || area_argument != 5
@@ -1967,10 +1972,7 @@ fn find_sound_stage_hook(source: &[u8], image: &DolImage) -> Result<SoundStageHo
                 continue;
             }
             candidates.push(SoundStageHook {
-                dispatch_anchor: WordAnchor {
-                    section,
-                    word_index: word_index + 2,
-                },
+                dispatch_anchor,
                 enter_stage_anchor: WordAnchor {
                     section,
                     word_index: word_index + tail + 3,
@@ -1986,11 +1988,59 @@ fn find_sound_stage_hook(source: &[u8], image: &DolImage) -> Result<SoundStageHo
                 )?,
                 area_register,
                 scenario_register,
-                ms_stg_offset: immediate_i16(sequence[2]),
+                ms_stg_offset,
             });
         }
     }
     require_unique_value(candidates, "MSound stage initialization call")
+}
+
+fn decode_sound_stage_offset(
+    source: &[u8],
+    image: &DolImage,
+    dispatch_anchor: WordAnchor,
+    instruction: u32,
+) -> Result<Option<i16>, String> {
+    if decode_lwz_from_r13(instruction) == Some(4) {
+        return Ok(Some(immediate_i16(instruction)));
+    }
+    if !is_unconditional_branch(instruction) {
+        return Ok(None);
+    }
+    let dispatch_address = dispatch_anchor.address()?;
+    let dispatcher_target = decode_branch_target(instruction, dispatch_address)?;
+    let Some(dispatcher_anchor) = address_to_word_anchor(image, dispatcher_target)? else {
+        return Ok(None);
+    };
+    if !dispatcher_anchor.section.text {
+        return Ok(None);
+    }
+    let resume_address = dispatch_address
+        .checked_add(4)
+        .ok_or_else(|| "MSound dispatcher resume address overflows u32".to_string())?;
+    let words = section_words(source, dispatcher_anchor.section)?;
+    let mut offsets = Vec::new();
+    for word_index in dispatcher_anchor.word_index..words.len().saturating_sub(1) {
+        if decode_lwz_from_r13(words[word_index]) != Some(4)
+            || !is_unconditional_branch(words[word_index + 1])
+        {
+            continue;
+        }
+        let branch_anchor = WordAnchor {
+            section: dispatcher_anchor.section,
+            word_index: word_index + 1,
+        };
+        if decode_branch_target(words[word_index + 1], branch_anchor.address()?)? == resume_address
+        {
+            offsets.push(immediate_i16(words[word_index]));
+        }
+    }
+    offsets.sort_unstable();
+    offsets.dedup();
+    Ok(match offsets.as_slice() {
+        [offset] => Some(*offset),
+        _ => None,
+    })
 }
 
 fn find_wave_bank_load_wave(source: &[u8], image: &DolImage) -> Result<u32, String> {
@@ -3789,6 +3839,78 @@ mod tests {
             layout.text_address + u32::try_from((layout.hook_word + 4) * 4).unwrap()
         );
         assert_eq!(patched.bytes.len(), synthetic_dol(layout).len());
+    }
+
+    #[test]
+    fn sound_stage_hook_follows_an_existing_stage_music_dispatcher() {
+        let layout = SyntheticLayout {
+            text_address: 0x8000_1000,
+            hook_word: 0x80,
+            movie_word: 0x120,
+            setter_word: 0x160,
+        };
+        let mut source = synthetic_dol(layout);
+        let sound_hook_word = layout.hook_word + 7;
+        let dispatch_word = layout.hook_word + 9;
+        let dispatcher_word = 0x1b0;
+        let init_sound_word = 0x1e0;
+        let enter_stage_word = 0x1e1;
+        let address = |word: usize| layout.text_address + u32::try_from(word * 4).unwrap();
+        for (word, value) in [
+            (sound_hook_word, encode_d_form(32, 3, 13, -0x6000)),
+            (
+                sound_hook_word + 1,
+                encode_branch(address(sound_hook_word + 1), address(init_sound_word), true)
+                    .unwrap(),
+            ),
+            (sound_hook_word + 2, encode_d_form(32, 4, 13, -0x5ff8)),
+            (sound_hook_word + 3, encode_cmpwi(4, -1)),
+            (sound_hook_word + 4, 0x4182_0014),
+            (sound_hook_word + 5, encode_d_form(32, 3, 13, -0x6000)),
+            (sound_hook_word + 6, encode_d_form(14, 5, 28, 0)),
+            (sound_hook_word + 7, encode_d_form(14, 6, 29, 0)),
+            (
+                sound_hook_word + 8,
+                encode_branch(
+                    address(sound_hook_word + 8),
+                    address(enter_stage_word),
+                    true,
+                )
+                .unwrap(),
+            ),
+            (sound_hook_word + 9, PPC_BLR),
+            (init_sound_word, PPC_BLR),
+            (enter_stage_word, PPC_BLR),
+        ] {
+            write_be_u32(&mut source, SYNTHETIC_TEXT_OFFSET + word * 4, value).unwrap();
+        }
+        write_be_u32(
+            &mut source,
+            SYNTHETIC_TEXT_OFFSET + dispatch_word * 4,
+            encode_branch(address(dispatch_word), address(dispatcher_word), false).unwrap(),
+        )
+        .unwrap();
+        write_be_u32(
+            &mut source,
+            SYNTHETIC_TEXT_OFFSET + dispatcher_word * 4,
+            encode_d_form(32, 4, 13, -0x5ff8),
+        )
+        .unwrap();
+        write_be_u32(
+            &mut source,
+            SYNTHETIC_TEXT_OFFSET + (dispatcher_word + 1) * 4,
+            encode_branch(
+                address(dispatcher_word + 1),
+                address(dispatch_word + 1),
+                false,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let image = parse_dol(&source).unwrap();
+        let hook = find_sound_stage_hook(&source, &image).unwrap();
+        assert_eq!(hook.ms_stg_offset, -0x5ff8);
     }
 
     #[test]

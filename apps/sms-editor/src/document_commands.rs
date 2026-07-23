@@ -2017,7 +2017,7 @@ impl SmsEditorApp {
         };
         Self::configure_sms_graphics(&mut command, native_goop_mod_ready);
         if mode == DolphinLaunchMode::Editor {
-            Self::configure_play_in_editor_input(&mut command);
+            Self::configure_play_in_editor_runtime(&mut command);
         }
         command
             .current_dir(&outcome.run.run_root)
@@ -2159,12 +2159,18 @@ impl SmsEditorApp {
         Some(path)
     }
 
-    pub(super) fn configure_play_in_editor_input(command: &mut Command) {
+    pub(super) fn configure_play_in_editor_runtime(command: &mut Command) {
         command
             .arg("-C")
             .arg("Dolphin.Interface.PauseOnFocusLost=False")
             .arg("-C")
-            .arg("Dolphin.Input.BackgroundInput=True");
+            .arg("Dolphin.Input.BackgroundInput=True")
+            // PIE skips Sunshine's menu, which normally hides serialized DVD
+            // loads for the default voice and stage music banks. Dolphin's
+            // fast-disc override shortens those original loads without
+            // reordering or duplicating the game's audio initialization.
+            .arg("-C")
+            .arg("Dolphin.Core.FastDiscSpeed=True");
     }
 
     pub(super) fn configure_sms_graphics(command: &mut Command, native_goop_mod_ready: bool) {
