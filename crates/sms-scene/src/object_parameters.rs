@@ -210,16 +210,29 @@ impl StageDocument {
 /// the inspector. Ordinary typed values remain editable, while linked values
 /// must still equal the typed prototype unless the binding proves that the
 /// corresponding dependency was updated with them.
+#[cfg(test)]
 pub(crate) fn validate_object_parameter_links(
     record: &JDramaRecord,
     object: &SceneObject,
     placement: &PlacementBinding,
+) -> Result<()> {
+    validate_object_parameter_links_with_owned_name(record, object, placement, false)
+}
+
+pub(crate) fn validate_object_parameter_links_with_owned_name(
+    record: &JDramaRecord,
+    object: &SceneObject,
+    placement: &PlacementBinding,
+    allow_editor_owned_name: bool,
 ) -> Result<()> {
     for descriptor in editable_object_parameters(record)? {
         let Some(parameter) = object.raw_params.get(&descriptor.key) else {
             continue;
         };
         if parameter.raw() == descriptor.raw_value {
+            continue;
+        }
+        if allow_editor_owned_name && descriptor.key == OBJECT_PARAMETER_NAME {
             continue;
         }
         if let Some(reason) =

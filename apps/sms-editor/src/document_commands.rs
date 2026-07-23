@@ -1715,6 +1715,10 @@ impl SmsEditorApp {
                 .as_ref()
                 .is_some_and(|authoring| !authoring.objects.is_empty())
                 || !document.dialogue_library.is_empty()
+                || self
+                    .dialogue_route_index
+                    .as_ref()
+                    .is_some_and(|index| document.has_uninitialized_generated_dialogue(index))
         });
         let compiled_dialogue = if has_dialogue_authoring {
             if let Some(document) = self.document.as_ref() {
@@ -1784,6 +1788,7 @@ impl SmsEditorApp {
                 candidate.dialogue_library.clone(),
             );
             if let Some(document) = self.document.as_mut() {
+                document.objects = candidate.objects;
                 document.dialogue_authoring = candidate.dialogue_authoring;
                 document.dialogue_library = candidate.dialogue_library;
                 self.document_dirty = stage_document_differs_from_saved(

@@ -1531,6 +1531,29 @@ impl StageDocument {
         false
     }
 
+    pub(crate) fn owns_generated_dialogue_runtime_name(&self, object_id: &str) -> bool {
+        let Some(object) = self.objects.iter().find(|object| object.id == object_id) else {
+            return false;
+        };
+        let expected = format!(
+            "{GENERATED_DIALOGUE_RUNTIME_NAME_PREFIX}{:016x}",
+            stable_text_fingerprint(object_id)
+        );
+        if object.raw_param("name") != Some(expected.as_str()) {
+            return false;
+        }
+        let Some(authoring) = self
+            .dialogue_authoring
+            .as_ref()
+            .and_then(|authoring| authoring.objects.get(object_id))
+        else {
+            return false;
+        };
+        let owns_previous_identity =
+            authoring.prior_runtime_name.is_some() || authoring.inherited_from_object_id.is_some();
+        owns_previous_identity && self.object_inherits_generated_dialogue(object_id)
+    }
+
     fn available_generated_dialogue_runtime_name(&self, object_id: &str) -> Result<String> {
         let generated_runtime_name = format!(
             "{GENERATED_DIALOGUE_RUNTIME_NAME_PREFIX}{:016x}",
@@ -1547,6 +1570,45 @@ impl StageDocument {
         Ok(generated_runtime_name)
     }
 
+    fn uninitialized_generated_dialogue_objects(&self, index: &DialogueRouteIndex) -> Vec<String> {
+        let Some(registry) = self.registry.as_ref() else {
+            return Vec::new();
+        };
+        self.objects
+            .iter()
+            .filter(|object| {
+                matches!(
+                    object.placement.as_ref(),
+                    Some(
+                        crate::PlacementBinding::Authored(_) | crate::PlacementBinding::CloneOf(_)
+                    )
+                ) && registry.is_dialogue_instance_eligible(&object.factory_name)
+                    && !self.object_inherits_generated_dialogue(&object.id)
+                    && index.variants_for_object(&object.id).iter().any(|variant| {
+                        variant.provenance == DialogueProvenance::Generated
+                            && variant.message.is_none()
+                    })
+            })
+            .map(|object| object.id.clone())
+            .collect()
+    }
+
+    /// Returns true when an editor-placed talk actor still needs its own empty
+    /// generated route. Retail placements remain untouched so a dialogue no-op
+    /// still rebuilds byte-identically.
+    pub fn has_uninitialized_generated_dialogue(&self, index: &DialogueRouteIndex) -> bool {
+        !self
+            .uninitialized_generated_dialogue_objects(index)
+            .is_empty()
+    }
+
+    fn initialize_missing_generated_dialogue(&mut self, index: &DialogueRouteIndex) -> Result<()> {
+        for object_id in self.uninitialized_generated_dialogue_objects(index) {
+            self.initialize_dialogue_for_new_object(&object_id)?;
+        }
+        Ok(())
+    }
+
     /// Compiles authored deltas without mutating the imported stage or the
     /// extracted base. Newly allocated message indexes are persisted back to
     /// the authoring document only after every resource edit succeeds.
@@ -1554,6 +1616,11 @@ impl StageDocument {
         &mut self,
         index: &DialogueRouteIndex,
     ) -> Result<CompiledDialogueEdits> {
+        // A newly placed actor with no retail normal route must still select a
+        // message on every conversation. Otherwise TTalk2D2 retains whichever
+        // message the previously spoken-to NPC selected, leaking dialogue
+        // between unrelated instances.
+        self.initialize_missing_generated_dialogue(index)?;
         let has_stage_authoring = self.dialogue_authoring.as_ref().is_some_and(|authoring| {
             authoring
                 .objects
@@ -1890,17 +1957,18 @@ impl StageDocument {
                             .any(|override_| override_.key == variant.key)
                 })
             {
-                let replacement_message_id = inherited_generated_message_id(
+                let Some(replacement_message_id) = inherited_generated_message_id(
                     &authoring,
                     object_id,
                     &variant.key,
                     &compiled_generated_messages,
-                )
-                .ok_or_else(|| {
-                    SceneError::StageExport(format!(
-                        "generated dialogue duplicate {object_id:?} could not resolve its inherited message allocation"
-                    ))
-                })?;
+                ) else {
+                    // A derived empty fallback is inspector-visible but emits
+                    // no script or BMG entry until someone authors it. An
+                    // untouched duplicate of that fallback therefore has no
+                    // allocation to inherit yet.
+                    continue;
+                };
                 generated_routes.push((object_id.clone(), replacement_message_id));
             }
         }
@@ -2764,7 +2832,11 @@ fn compile_generated_dialogue_script(
         program.push_instruction(SpcInstruction::Equal);
         let next_route_jump = program.push_instruction(SpcInstruction::JumpIfZero(0));
         program.push_instruction(SpcInstruction::Int(message_id as i32));
-        program.push_instruction(SpcInstruction::IntZero);
+        // A generated normal route is a complete standalone conversation.
+        // TTalk2D2 treats bit 0 as the terminal-message flag: without it the
+        // window closes into mode 1 ("waiting for the next message") and the
+        // director intentionally keeps Mario and the talk camera locked.
+        program.push_instruction(SpcInstruction::Int(1));
         program.push_instruction(SpcInstruction::Builtin {
             symbol_index: set_message,
             argument_count: 2,
@@ -5536,25 +5608,35 @@ fn classify_unresolved_talk_capable_objects(
             });
             continue;
         }
-        let pending_authored_or_inherited_route = document
+        let pending_generated_or_inherited_route = document
             .dialogue_authoring
             .as_ref()
             .and_then(|authoring| authoring.objects.get(&object.id))
             .is_some_and(|authoring| {
-                authoring.inherited_from_object_id.is_some() || !authoring.overrides.is_empty()
+                authoring.inherited_from_object_id.is_some()
+                    || authoring
+                        .overrides
+                        .iter()
+                        .any(|authored| authored.key.original_message.is_none())
             });
-        if pending_authored_or_inherited_route {
+        if pending_generated_or_inherited_route {
             continue;
         }
         let existing_routes = index.variants_for_object(&object.id);
-        let has_player_initiated_route = existing_routes
+        let has_conversation_entry_route = existing_routes
             .iter()
-            .any(|variant| variant.route_kind != DialogueRouteKind::Forced);
-        if !has_player_initiated_route {
-            let forced_only = !existing_routes.is_empty();
+            .any(|variant| dialogue_route_starts_conversation(variant.route_kind));
+        if !has_conversation_entry_route {
+            let forced_only = !existing_routes.is_empty()
+                && existing_routes
+                    .iter()
+                    .all(|variant| variant.route_kind == DialogueRouteKind::Forced);
+            let secondary_only = !existing_routes.is_empty() && !forced_only;
             index.issues.push(DialogueResolutionIssue {
                 severity: DialogueResolutionSeverity::Warning,
-                code: if forced_only {
+                code: if secondary_only {
+                    "dialogue-talk-capable-secondary-only"
+                } else if forced_only {
                     "dialogue-talk-capable-forced-only"
                 } else {
                     "dialogue-talk-capable-retail-unrouted"
@@ -5564,7 +5646,13 @@ fn classify_unresolved_talk_capable_objects(
                     object.id,
                     object.factory_name,
                     object.raw_param("name").unwrap_or(&object.id),
-                    if forced_only { " while its forced/cutscene route remains original-only" } else { "" }
+                    if forced_only {
+                        " while its forced/cutscene route remains original-only"
+                    } else if secondary_only {
+                        " while its conditional follow-up/override routes remain independently editable"
+                    } else {
+                        ""
+                    }
                 ),
                 script_path: None,
             });
@@ -5604,6 +5692,16 @@ fn classify_unresolved_talk_capable_objects(
                 });
         }
     }
+}
+
+fn dialogue_route_starts_conversation(route_kind: DialogueRouteKind) -> bool {
+    matches!(
+        route_kind,
+        DialogueRouteKind::Normal
+            | DialogueRouteKind::BoardOrSign
+            | DialogueRouteKind::Shop
+            | DialogueRouteKind::Generated
+    )
 }
 
 #[cfg(test)]
@@ -5727,6 +5825,25 @@ mod tests {
             actor_previews: BTreeMap::new(),
             loaded_project: None,
         }
+    }
+
+    fn authored_dialogue_object(id: &str, runtime_name: &str) -> SceneObject {
+        let mut object = SceneObject::new(id, "NPCFixture");
+        object.insert_source_raw_param("name", runtime_name);
+        object.placement = Some(crate::PlacementBinding::Authored(
+            crate::AuthoredPlacement {
+                raw_resource_path: b"map/scene.bin".to_vec(),
+                target_group_index: 0,
+                prototype: sms_formats::JDramaRecord::new(
+                    "NPCFixture",
+                    runtime_name,
+                    sms_formats::JDramaRecordPayload::Empty,
+                )
+                .unwrap(),
+                dependencies: Vec::new(),
+            },
+        ));
+        object
     }
 
     fn retail_stage_dialogue_index(
@@ -8062,6 +8179,10 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(setter_calls.len(), 1);
+        assert!(matches!(
+            program.instructions.get(setter_calls[0].saturating_sub(1)),
+            Some(SpcInstruction::Int(1))
+        ));
         let matched_jump = setter_calls[0] + 2;
         assert!(matches!(
             program.instructions.get(matched_jump),
@@ -8091,6 +8212,104 @@ mod tests {
                     SpcInstruction::JumpIfZero(_)
                 )
         }));
+    }
+
+    #[test]
+    fn unassigned_editor_placed_actor_gets_its_own_empty_generated_route() {
+        let mut document = empty_document("authored");
+        document.registry = Some(npc_registry(&[("NPCFixture", NPC_ACTOR_TYPE_BOARD)]));
+        document.objects = vec![
+            authored_dialogue_object("edited", "Shared preset name"),
+            authored_dialogue_object("unassigned", "Shared preset name"),
+        ];
+        let edited_key = document
+            .initialize_dialogue_for_new_object("edited")
+            .unwrap();
+        document
+            .dialogue_authoring
+            .as_mut()
+            .unwrap()
+            .objects
+            .get_mut("edited")
+            .unwrap()
+            .overrides
+            .iter_mut()
+            .find(|override_| override_.key == edited_key)
+            .unwrap()
+            .content
+            .message = text("Only the edited actor");
+
+        let index = document.build_dialogue_route_index().unwrap();
+        assert!(document.has_uninitialized_generated_dialogue(&index));
+        let compiled = document.compile_dialogue_authoring(&index).unwrap();
+        assert!(!document.has_uninitialized_generated_dialogue(&index));
+
+        let authoring = document.dialogue_authoring.as_ref().unwrap();
+        let edited = &authoring.objects["edited"];
+        let unassigned = &authoring.objects["unassigned"];
+        assert_eq!(edited.stable_allocations.len(), 1);
+        assert_eq!(unassigned.stable_allocations.len(), 1);
+        assert_ne!(
+            edited.stable_allocations[0].message_index,
+            unassigned.stable_allocations[0].message_index
+        );
+        assert!(unassigned.overrides[0].content.message.tokens.is_empty());
+        assert_ne!(
+            document.objects[0].raw_param("name"),
+            document.objects[1].raw_param("name")
+        );
+
+        let bmg = compiled
+            .stage_edits
+            .resources
+            .iter()
+            .find_map(|edit| match &edit.document {
+                StageResourceDocument::Message(bmg)
+                    if edit.raw_resource_path == STAGE_DIALOGUE_MESSAGE_PATH =>
+                {
+                    Some(bmg)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(bmg.entries.len(), 2);
+
+        let script = compiled
+            .stage_edits
+            .resources
+            .iter()
+            .find_map(|edit| match &edit.document {
+                StageResourceDocument::Script(script)
+                    if edit.raw_resource_path == GENERATED_DIALOGUE_SCRIPT_PATH =>
+                {
+                    Some(script)
+                }
+                _ => None,
+            })
+            .unwrap()
+            .to_relocatable()
+            .unwrap();
+        let setter = script
+            .symbols
+            .iter()
+            .position(|symbol| symbol.name == "setTalkMsgID")
+            .unwrap() as u32;
+        let selected_messages = script
+            .instructions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, instruction)| match instruction {
+                SpcInstruction::Builtin {
+                    symbol_index,
+                    argument_count: 2,
+                } if *symbol_index == setter => match script.instructions.get(index - 2) {
+                    Some(SpcInstruction::Int(message_id)) => Some(*message_id as u32),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(selected_messages.len(), 2);
     }
 
     #[test]
@@ -8231,6 +8450,48 @@ mod tests {
         let inherited = index.variants_for_object("duplicate");
         assert_eq!(inherited.len(), 1);
         assert_eq!(inherited[0].provenance, DialogueProvenance::Generated);
+    }
+
+    #[test]
+    fn happy_override_does_not_suppress_the_instance_normal_talk_fallback() {
+        let mut document = empty_document("happy-only");
+        document
+            .objects
+            .push(SceneObject::new("pianta", "NPCMonteM"));
+        document.registry = Some(npc_registry(&[("NPCMonteM", 0x0400_0001)]));
+        let mut happy = consumer_variant("happy-only", "pianta", 35, 24);
+        happy.route_kind = DialogueRouteKind::HappyOverride;
+        document.dialogue_authoring = Some(DialogueAuthoringDocument {
+            format_version: DIALOGUE_AUTHORING_FORMAT_VERSION,
+            objects: BTreeMap::from([(
+                "pianta".to_string(),
+                DialogueObjectAuthoring {
+                    overrides: vec![DialogueVariantOverride {
+                        key: happy.key.clone(),
+                        scope: DialogueEditScope::Instance,
+                        route_kind: DialogueRouteKind::HappyOverride,
+                        condition_path: "Happy/reward flag set".to_string(),
+                        content: happy.content.clone(),
+                    }],
+                    ..DialogueObjectAuthoring::default()
+                },
+            )]),
+        });
+        let mut index = DialogueRouteIndex::default();
+        index
+            .variants_by_object
+            .insert("pianta".to_string(), vec![happy]);
+
+        classify_unresolved_talk_capable_objects(&document, &mut index);
+
+        let routes = index.variants_for_object("pianta");
+        assert_eq!(routes.len(), 2);
+        assert!(routes
+            .iter()
+            .any(|variant| variant.route_kind == DialogueRouteKind::HappyOverride));
+        assert!(routes.iter().any(|variant| {
+            variant.provenance == DialogueProvenance::Generated && variant.message.is_none()
+        }));
     }
 
     #[test]

@@ -394,11 +394,18 @@ impl StageDocument {
         )?;
         reconcile_scene_lighting(&mut archive, &self.lighting)?;
         let inserted_placement_roots = apply_placement_inserts(&mut archive, edits)?;
-        reconcile_scene_objects(
+        let dialogue_owned_runtime_names = self
+            .objects
+            .iter()
+            .filter(|object| self.owns_generated_dialogue_runtime_name(&object.id))
+            .map(|object| object.id.clone())
+            .collect::<BTreeSet<_>>();
+        reconcile_scene_objects_with_owned_dialogue_names(
             &mut archive,
             &self.objects,
             &inserted_placement_roots,
             self.registry.as_ref(),
+            &dialogue_owned_runtime_names,
         )?;
         let rebuilt = archive.encode()?;
         let reopened = SourceFreeStageArchive::parse(&rebuilt)?;
@@ -1476,11 +1483,28 @@ fn resolve_runtime_actor_names(objects: &[SceneObject]) -> Result<BTreeMap<Strin
     Ok(by_target)
 }
 
+#[cfg(test)]
 fn reconcile_scene_objects(
     archive: &mut SourceFreeStageArchive,
     objects: &[SceneObject],
     inserted_placement_roots: &[PlacementAddress],
     registry: Option<&ObjectRegistry>,
+) -> Result<()> {
+    reconcile_scene_objects_with_owned_dialogue_names(
+        archive,
+        objects,
+        inserted_placement_roots,
+        registry,
+        &BTreeSet::new(),
+    )
+}
+
+fn reconcile_scene_objects_with_owned_dialogue_names(
+    archive: &mut SourceFreeStageArchive,
+    objects: &[SceneObject],
+    inserted_placement_roots: &[PlacementAddress],
+    registry: Option<&ObjectRegistry>,
+    dialogue_owned_runtime_names: &BTreeSet<String>,
 ) -> Result<()> {
     let runtime_actor_names = resolve_runtime_actor_names(objects)?;
     let baseline = archive
@@ -1525,6 +1549,13 @@ fn reconcile_scene_objects(
                 object.id
             )));
         };
+        let dialogue_owns_name = dialogue_owned_runtime_names.contains(&object.id);
+        if dialogue_owns_name && runtime_actor_names.contains_key(&object.id) {
+            return Err(stage_export_error(format!(
+                "object '{}' cannot use both an editor-generated dialogue identity and another runtime TNameRef binding",
+                object.id
+            )));
+        }
         match binding {
             PlacementBinding::Existing(address) | PlacementBinding::CloneOf(address) => {
                 let Some(placement) = baseline.get(address) else {
@@ -1537,7 +1568,12 @@ fn reconcile_scene_objects(
                 };
                 validate_object_identity(object, placement)?;
                 let mut record = placement_record(archive, address)?.clone();
-                crate::validate_object_parameter_links(&record, object, binding)?;
+                crate::validate_object_parameter_links_with_owned_name(
+                    &record,
+                    object,
+                    binding,
+                    dialogue_owns_name,
+                )?;
                 crate::apply_object_parameter_edits(
                     &mut record,
                     object,
@@ -1565,7 +1601,12 @@ fn reconcile_scene_objects(
             PlacementBinding::Authored(placement) => {
                 validate_authored_object_identity(object, placement)?;
                 let mut record = placement.prototype.clone();
-                crate::validate_object_parameter_links(&record, object, binding)?;
+                crate::validate_object_parameter_links_with_owned_name(
+                    &record,
+                    object,
+                    binding,
+                    dialogue_owns_name,
+                )?;
                 crate::apply_object_parameter_edits(
                     &mut record,
                     object,
@@ -4097,6 +4138,40 @@ mod tests {
         let error = document.build_stage_archive().unwrap_err().to_string();
         assert!(error.contains("stage-only export"), "{error}");
         assert!(error.contains("DOL outputs remain atomic"), "{error}");
+    }
+
+    #[test]
+    fn managed_export_accepts_only_an_owned_generated_dialogue_runtime_name() {
+        let fixture = StageFixture::new("generated-dialogue-runtime-name");
+        let mut document = fixture.document();
+        let object_id = document.objects[0].id.clone();
+        document
+            .initialize_dialogue_for_new_object(&object_id)
+            .unwrap();
+        let generated_name = document.objects[0].raw_param("name").unwrap().to_string();
+        assert!(document.owns_generated_dialogue_runtime_name(&object_id));
+
+        let rebuilt = document
+            .build_stage_archive_with_compiled_dialogue_edits(&document.archive_edits)
+            .expect("dialogue-owned deterministic name may cross the managed export boundary");
+        let reopened = SourceFreeStageArchive::parse(&rebuilt).unwrap();
+        assert!(reopened.object_placements().iter().any(|placement| {
+            placement.raw_resource_path == b"scene.bin"
+                && placement.record_path == [0]
+                && placement.name == generated_name
+        }));
+
+        let mut spoofed = fixture.document();
+        spoofed.objects[0].set_raw_param("name", "GraffitoDlg_0000000000000000");
+        assert!(!spoofed.owns_generated_dialogue_runtime_name(&spoofed.objects[0].id));
+        let error = spoofed
+            .build_stage_archive_with_compiled_dialogue_edits(&spoofed.archive_edits)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("cannot change linked parameter 'name'"),
+            "{error}"
+        );
     }
 
     struct StageFixture {

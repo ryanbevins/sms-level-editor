@@ -64,7 +64,7 @@ pub use object_authoring::{
     ObjectAuthoringDependency, ObjectAuthoringResource, ObjectAuthoringRuntimeActorReference,
     ObjectAuthoringTableDependency, ObjectAuthoringTemplate, SHINE_QUICK_CAMERA_NAME,
 };
-pub(crate) use object_parameters::validate_object_parameter_links;
+pub(crate) use object_parameters::validate_object_parameter_links_with_owned_name;
 pub use object_parameters::{
     apply_all_object_parameters, apply_dirty_object_parameter_edits, apply_object_parameter_edits,
     editable_object_parameters, editable_parameters_for_object, seed_scene_object_parameters,

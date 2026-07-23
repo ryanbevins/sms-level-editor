@@ -1216,7 +1216,7 @@ fn dialogue_route_kind_label(kind: DialogueRouteKind) -> &'static str {
         DialogueRouteKind::Balloon => "Balloon",
         DialogueRouteKind::BoardOrSign => "Board/sign",
         DialogueRouteKind::Shop => "Shop",
-        DialogueRouteKind::Generated => "Generated",
+        DialogueRouteKind::Generated => "Generated normal",
     }
 }
 
