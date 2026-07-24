@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 use walkdir::WalkDir;
 
@@ -28,6 +29,67 @@ pub(crate) struct SourceFile {
 }
 
 impl SourceInventory {
+    pub(crate) fn metadata_fingerprint(repo_root: &Path) -> Result<u64> {
+        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+
+        let canonical_root =
+            fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+        let mut hash = fnv1a_bytes(FNV_OFFSET, canonical_root.to_string_lossy().as_bytes());
+        let mut source_count = 0_u64;
+
+        for directory in ["src", "include"] {
+            let scan_root = repo_root.join(directory);
+            if !scan_root.is_dir() {
+                return Err(SchemaError::MissingSource(scan_root));
+            }
+
+            for entry in WalkDir::new(&scan_root).sort_by_file_name() {
+                let entry = entry.map_err(|source| SchemaError::SourceTraversal {
+                    root: scan_root.clone(),
+                    source,
+                })?;
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+
+                let path = entry.path();
+                let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
+                    continue;
+                };
+                if !SOURCE_EXTENSIONS.contains(&extension) {
+                    continue;
+                }
+
+                let relative_path = normalize_source_path(repo_root, path);
+                let metadata = entry
+                    .metadata()
+                    .map_err(|source| SchemaError::SourceTraversal {
+                        root: scan_root.clone(),
+                        source,
+                    })?;
+                hash = fnv1a_bytes(hash, relative_path.as_bytes());
+                hash = fnv1a_bytes(hash, &[0]);
+                hash = fnv1a_bytes(hash, &metadata.len().to_le_bytes());
+                if let Some(modified) = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                {
+                    hash = fnv1a_bytes(hash, &modified.as_secs().to_le_bytes());
+                    hash = fnv1a_bytes(hash, &modified.subsec_nanos().to_le_bytes());
+                } else {
+                    hash = fnv1a_bytes(hash, &[0xff]);
+                }
+                source_count += 1;
+            }
+        }
+
+        if source_count == 0 {
+            return Err(SchemaError::EmptySourceInventory(repo_root.to_path_buf()));
+        }
+        Ok(fnv1a_bytes(hash, &source_count.to_le_bytes()))
+    }
+
     pub(crate) fn build(repo_root: &Path) -> Result<Self> {
         let mut files = BTreeMap::new();
 
@@ -102,6 +164,14 @@ impl SourceInventory {
     }
 }
 
+fn fnv1a_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    for byte in bytes {
+        hash = (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
 impl SourceFile {
     pub(crate) fn relative_path(&self) -> &str {
         &self.relative_path
@@ -157,6 +227,29 @@ mod tests {
 
         let error = SourceInventory::build(&root).unwrap_err();
         assert!(matches!(error, SchemaError::MissingSource(path) if path.ends_with("include")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn metadata_fingerprint_changes_with_source_contents_but_ignores_other_files() {
+        let root = fixture_root("fingerprint");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("include")).unwrap();
+        let source = root.join("src/example.cpp");
+        fs::write(&source, "first").unwrap();
+
+        let initial = SourceInventory::metadata_fingerprint(&root).unwrap();
+        fs::write(root.join("src/notes.txt"), "not schema input").unwrap();
+        assert_eq!(
+            SourceInventory::metadata_fingerprint(&root).unwrap(),
+            initial
+        );
+
+        fs::write(&source, "second version").unwrap();
+        assert_ne!(
+            SourceInventory::metadata_fingerprint(&root).unwrap(),
+            initial
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

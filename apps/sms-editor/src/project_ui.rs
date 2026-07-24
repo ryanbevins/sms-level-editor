@@ -642,6 +642,15 @@ impl SmsEditorApp {
         self.document = None;
         self.render_scene = None;
         self.scene_archives.clear();
+        self.scene_labels.clear();
+        self.retail_skyboxes.clear();
+        self.retail_goop_templates.clear();
+        self.goop_templates_indexed = false;
+        self.retail_music.clear();
+        self.retail_sounds.clear();
+        self.retail_dialogue_voices.clear();
+        self.retail_stage_audio.clear();
+        self.install_object_authoring_catalog_cache(None);
         self.model_preview = None;
         self.authored_model_preview_base = None;
         self.gpu_viewport = None;

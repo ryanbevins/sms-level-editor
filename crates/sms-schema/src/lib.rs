@@ -959,6 +959,16 @@ pub struct SchemaGenerator {
     repo_root: PathBuf,
 }
 
+const SCHEMA_CACHE_FORMAT_VERSION: u32 = 1;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CachedObjectRegistry {
+    format_version: u32,
+    source_fingerprint: u64,
+    generator_fingerprint: u64,
+    registry: ObjectRegistry,
+}
+
 impl SchemaGenerator {
     pub fn new(repo_root: impl AsRef<Path>) -> Self {
         Self {
@@ -968,25 +978,77 @@ impl SchemaGenerator {
 
     pub fn generate(&self) -> Result<ObjectRegistry> {
         let sources = SourceInventory::build(&self.repo_root)?;
+        self.generate_from_inventory(&sources)
+    }
+
+    /// Loads a previously generated registry when both the decomp source tree
+    /// and this extractor implementation are unchanged.
+    ///
+    /// Cache reads and writes are opportunistic: an inaccessible or malformed
+    /// cache never prevents schema generation.
+    pub fn generate_cached(&self, cache_path: impl AsRef<Path>) -> Result<ObjectRegistry> {
+        let cache_path = cache_path.as_ref();
+        let source_fingerprint = SourceInventory::metadata_fingerprint(&self.repo_root)?;
+        let generator_fingerprint = schema_generator_fingerprint();
+        if let Ok(bytes) = fs::read(cache_path) {
+            if let Ok(cached) = serde_json::from_slice::<CachedObjectRegistry>(&bytes) {
+                if cached.format_version == SCHEMA_CACHE_FORMAT_VERSION
+                    && cached.source_fingerprint == source_fingerprint
+                    && cached.generator_fingerprint == generator_fingerprint
+                {
+                    return Ok(cached.registry);
+                }
+            }
+        }
+
+        let sources = SourceInventory::build(&self.repo_root)?;
+        let registry = self.generate_from_inventory(&sources)?;
+        if SourceInventory::metadata_fingerprint(&self.repo_root)? == source_fingerprint {
+            let cached = CachedObjectRegistry {
+                format_version: SCHEMA_CACHE_FORMAT_VERSION,
+                source_fingerprint,
+                generator_fingerprint,
+                registry: registry.clone(),
+            };
+            if let Ok(bytes) = serde_json::to_vec(&cached) {
+                if let Some(parent) = cache_path.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                let temporary_path =
+                    cache_path.with_extension(format!("json.{}.tmp", std::process::id()));
+                if fs::write(&temporary_path, bytes).is_ok()
+                    && fs::rename(&temporary_path, cache_path).is_err()
+                {
+                    let _ = fs::remove_file(cache_path);
+                    if fs::rename(&temporary_path, cache_path).is_err() {
+                        let _ = fs::remove_file(&temporary_path);
+                    }
+                }
+            }
+        }
+        Ok(registry)
+    }
+
+    fn generate_from_inventory(&self, sources: &SourceInventory) -> Result<ObjectRegistry> {
         let mut registry = ObjectRegistry::default();
-        self.scan_mar_name_ref_gen(&sources, &mut registry)?;
-        self.scan_named_object_models(&sources, &mut registry)?;
-        self.scan_enemy_model_data(&sources, &mut registry)?;
-        self.scan_map_obj_manager(&sources, &mut registry)?;
-        self.scan_map_obj_resources(&sources, &mut registry)?;
-        self.scan_map_obj_ball_transforms(&sources, &mut registry)?;
-        self.scan_map_obj_model_overrides(&sources, &mut registry)?;
-        self.scan_map_obj_string_tev_programs(&sources, &mut registry)?;
-        self.scan_map_obj_stream_tev_colors(&sources, &mut registry)?;
-        self.scan_params_and_assets(&sources, &mut registry)?;
-        self.scan_map_static_models(&sources, &mut registry)?;
-        self.scan_audio_metadata(&sources, &mut registry)?;
-        self.scan_map_obj_flags(&sources, &mut registry)?;
-        self.scan_collision_surfaces(&sources, &mut registry)?;
-        self.scan_particle_bindings(&sources, &mut registry)?;
-        self.scan_npc_resource_bindings(&sources, &mut registry)?;
-        self.scan_npc_init_data(&sources, &mut registry)?;
-        self.scan_map_obj_factory_types(&sources, &mut registry)?;
+        self.scan_mar_name_ref_gen(sources, &mut registry)?;
+        self.scan_named_object_models(sources, &mut registry)?;
+        self.scan_enemy_model_data(sources, &mut registry)?;
+        self.scan_map_obj_manager(sources, &mut registry)?;
+        self.scan_map_obj_resources(sources, &mut registry)?;
+        self.scan_map_obj_ball_transforms(sources, &mut registry)?;
+        self.scan_map_obj_model_overrides(sources, &mut registry)?;
+        self.scan_map_obj_string_tev_programs(sources, &mut registry)?;
+        self.scan_map_obj_stream_tev_colors(sources, &mut registry)?;
+        self.scan_params_and_assets(sources, &mut registry)?;
+        self.scan_map_static_models(sources, &mut registry)?;
+        self.scan_audio_metadata(sources, &mut registry)?;
+        self.scan_map_obj_flags(sources, &mut registry)?;
+        self.scan_collision_surfaces(sources, &mut registry)?;
+        self.scan_particle_bindings(sources, &mut registry)?;
+        self.scan_npc_resource_bindings(sources, &mut registry)?;
+        self.scan_npc_init_data(sources, &mut registry)?;
+        self.scan_map_obj_factory_types(sources, &mut registry)?;
         dedup_registry(&mut registry)?;
         validate_registry(&registry)?;
         Ok(registry)
@@ -1959,6 +2021,29 @@ impl SchemaGenerator {
         )?;
         Ok(())
     }
+}
+
+fn schema_generator_fingerprint() -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    [
+        include_bytes!("lib.rs").as_slice(),
+        include_bytes!("source_inventory.rs").as_slice(),
+        include_bytes!("factory_extractor.rs").as_slice(),
+        include_bytes!("map_obj_ball_extractor.rs").as_slice(),
+        include_bytes!("map_obj_resource_extractor.rs").as_slice(),
+        include_bytes!("map_obj_shared_model_extractor.rs").as_slice(),
+        include_bytes!("map_obj_stream_tev_extractor.rs").as_slice(),
+        include_bytes!("map_obj_string_tev_extractor.rs").as_slice(),
+        include_bytes!("stage_name_extractor.rs").as_slice(),
+    ]
+    .into_iter()
+    .fold(FNV_OFFSET, |mut hash, bytes| {
+        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+        for byte in bytes {
+            hash = (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME);
+        }
+        hash
+    })
 }
 
 #[derive(Clone)]
@@ -6521,6 +6606,19 @@ mod tests {
     }
 
     #[test]
+    fn generated_schema_cache_round_trips_the_complete_registry() {
+        let fixture = complete_generator_fixture();
+        let cache_path = fixture.root.join("cache/object-registry.json");
+        let generator = SchemaGenerator::new(&fixture.root);
+
+        let generated = generator.generate_cached(&cache_path).unwrap();
+        assert!(cache_path.is_file());
+        let cached = generator.generate_cached(&cache_path).unwrap();
+
+        assert_eq!(cached, generated);
+    }
+
+    #[test]
     #[ignore = "requires the neighboring Super Mario Sunshine decompilation checkout"]
     fn generated_neighboring_decomp_schema_satisfies_registry_invariants() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
@@ -6721,6 +6819,7 @@ mod tests {
                 "{resource_name} color"
             );
         }
+
         assert_eq!(registry.map_obj_string_tev_programs.len(), 1);
         let nozzle = &registry.map_obj_string_tev_programs[0];
         assert_eq!(nozzle.resource_name, "NozzleBox");

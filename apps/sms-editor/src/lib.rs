@@ -225,6 +225,7 @@ struct LoadedStage {
     base_root: String,
     requested_project_root: String,
     project_root: String,
+    has_scene_index: bool,
     archives: Vec<SceneArchiveInfo>,
     registry: Option<ObjectRegistry>,
     schema_warning: Option<String>,
@@ -241,6 +242,7 @@ struct LoadedStage {
     skybox_warnings: Vec<String>,
     retail_music: Vec<RetailMusicEntry>,
     retail_sounds: Vec<RetailSoundEntry>,
+    retail_dialogue_voices: Vec<RetailDialogueVoiceEntry>,
     retail_stage_audio: Vec<RetailStageAudioProfile>,
     music_warning: Option<String>,
 }
@@ -269,6 +271,7 @@ struct ProjectLoadSelection {
     warning: Option<String>,
 }
 
+#[derive(Clone, Default)]
 struct SceneScanResult {
     archives: Vec<SceneArchiveInfo>,
     labels: BTreeMap<String, SceneArchiveLabel>,
@@ -277,8 +280,10 @@ struct SceneScanResult {
     skybox_warnings: Vec<String>,
     retail_music: Vec<RetailMusicEntry>,
     retail_sounds: Vec<RetailSoundEntry>,
+    retail_dialogue_voices: Vec<RetailDialogueVoiceEntry>,
     retail_stage_audio: Vec<RetailStageAudioProfile>,
     music_warning: Option<String>,
+    object_authoring_catalog_cache: Option<ObjectAuthoringCatalogCache>,
 }
 
 fn build_object_authoring_catalog(
@@ -383,6 +388,31 @@ fn normalized_base_root_identity(base_root: &Path) -> String {
         normalized.to_ascii_lowercase()
     } else {
         normalized
+    }
+}
+
+fn editor_schema_cache_path(repo_root: &Path) -> Option<PathBuf> {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+
+    let cache_root = std::env::var_os("LOCALAPPDATA")
+        .or_else(|| std::env::var_os("APPDATA"))
+        .map(PathBuf::from)?;
+    let identity = normalized_base_root_identity(repo_root);
+    let key = fnv1a_bytes(FNV_OFFSET, identity.as_bytes());
+    Some(
+        cache_root
+            .join("Graffito-Editor")
+            .join("cache")
+            .join("schema")
+            .join(format!("{key:016x}.json")),
+    )
+}
+
+fn generate_editor_schema(repo_root: &Path) -> sms_schema::Result<ObjectRegistry> {
+    let generator = SchemaGenerator::new(repo_root);
+    match editor_schema_cache_path(repo_root) {
+        Some(cache_path) => generator.generate_cached(cache_path),
+        None => generator.generate(),
     }
 }
 
@@ -1388,6 +1418,26 @@ impl SmsEditorApp {
         })
     }
 
+    fn reusable_scene_scan(&self, base_root: &Path) -> Option<SceneScanResult> {
+        (!self.last_scanned_base_root.trim().is_empty()
+            && normalized_base_root_identity(Path::new(self.last_scanned_base_root.trim()))
+                == normalized_base_root_identity(base_root))
+        .then(|| SceneScanResult {
+            archives: self.scene_archives.clone(),
+            labels: self.scene_labels.clone(),
+            label_warning: None,
+            retail_skyboxes: self.retail_skyboxes.clone(),
+            skybox_warnings: Vec::new(),
+            retail_music: self.retail_music.clone(),
+            retail_sounds: self.retail_sounds.clone(),
+            retail_dialogue_voices: self.retail_dialogue_voices.clone(),
+            retail_stage_audio: self.retail_stage_audio.clone(),
+            music_warning: None,
+            object_authoring_catalog_cache: self
+                .reusable_object_authoring_catalog_cache(base_root, self.registry.as_ref()),
+        })
+    }
+
     fn install_object_authoring_catalog_cache(
         &mut self,
         cache: Option<ObjectAuthoringCatalogCache>,
@@ -1408,7 +1458,7 @@ impl SmsEditorApp {
         }
     }
 
-    fn generate_schema(&mut self) {
+    fn generate_schema(&mut self, force: bool) {
         if self.background_receiver.is_some() {
             self.log
                 .push("Another background operation is already running.".to_string());
@@ -1426,20 +1476,23 @@ impl SmsEditorApp {
         };
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
-            let result = SchemaGenerator::new(repo_root)
-                .generate()
-                .map(|registry| {
-                    let object_authoring_catalog_cache = (!base_root.is_empty()
-                        && archives.iter().any(|archive| archive.size_bytes > 0))
-                    .then(|| {
-                        build_object_authoring_catalog(Path::new(&base_root), &archives, &registry)
-                    });
-                    LoadedSchema {
-                        registry,
-                        object_authoring_catalog_cache,
-                    }
-                })
-                .map_err(|err| err.to_string());
+            let result = if force {
+                SchemaGenerator::new(&repo_root).generate()
+            } else {
+                generate_editor_schema(Path::new(&repo_root))
+            }
+            .map(|registry| {
+                let object_authoring_catalog_cache = (!base_root.is_empty()
+                    && archives.iter().any(|archive| archive.size_bytes > 0))
+                .then(|| {
+                    build_object_authoring_catalog(Path::new(&base_root), &archives, &registry)
+                });
+                LoadedSchema {
+                    registry,
+                    object_authoring_catalog_cache,
+                }
+            })
+            .map_err(|err| err.to_string());
             let _ = sender.send(BackgroundResult::Schema(Box::new(result)));
         });
         self.background_receiver = Some(receiver);
@@ -1502,6 +1555,9 @@ impl SmsEditorApp {
         let task_base_root = base_root.clone();
         let repo_root = self.repo_root.trim().to_string();
         let project_root = self.project_root.trim().to_string();
+        let registry = self.registry.clone();
+        let existing_object_authoring_catalog_cache =
+            self.reusable_object_authoring_catalog_cache(Path::new(&base_root), registry.as_ref());
         thread::spawn(move || {
             let result = (|| -> Result<SceneScanResult, String> {
                 let mut archives = discover_scene_archives(PathBuf::from(&task_base_root))
@@ -1536,11 +1592,20 @@ impl SmsEditorApp {
                 };
                 let retail_sounds =
                     index_retail_sounds(Path::new(&task_base_root)).unwrap_or_default();
+                let retail_dialogue_voices =
+                    index_retail_dialogue_voices(Path::new(&repo_root), &retail_sounds)
+                        .unwrap_or_default();
                 let retail_stage_audio = index_retail_stage_audio_profiles(
                     Path::new(&repo_root),
                     Path::new(&task_base_root),
                 )
                 .unwrap_or_default();
+                let object_authoring_catalog_cache = resolve_object_authoring_catalog(
+                    Path::new(&task_base_root),
+                    &archives,
+                    registry.as_ref(),
+                    existing_object_authoring_catalog_cache,
+                );
                 Ok(SceneScanResult {
                     archives,
                     labels,
@@ -1549,8 +1614,10 @@ impl SmsEditorApp {
                     skybox_warnings,
                     retail_music,
                     retail_sounds,
+                    retail_dialogue_voices,
                     retail_stage_audio,
                     music_warning,
+                    object_authoring_catalog_cache,
                 })
             })();
             let _ = sender.send(BackgroundResult::Scan {
@@ -1574,6 +1641,10 @@ impl SmsEditorApp {
         self.flush_camera_state();
         if self.is_dirty() {
             self.pending_stage_open = Some(stage_id);
+        } else if self.background_receiver.is_some() {
+            self.log
+                .push(format!("Queued stage '{stage_id}' to open next."));
+            self.pending_stage_open = Some(stage_id);
         } else {
             self.stage_id = stage_id;
             self.open_stage();
@@ -1587,7 +1658,6 @@ impl SmsEditorApp {
             return;
         }
         let base_root = self.base_root.trim().to_string();
-        let repo_root = self.repo_root.trim().to_string();
         let project_root = self.project_root.trim().to_string();
         let stage_id = self.stage_id.trim().to_string();
         if base_root.is_empty() || stage_id.is_empty() {
@@ -1597,42 +1667,16 @@ impl SmsEditorApp {
         }
 
         let visibility = self.preview_visibility();
-        let existing_object_authoring_catalog_cache = self
-            .reusable_object_authoring_catalog_cache(Path::new(&base_root), self.registry.as_ref());
+        let existing_scene_scan = self.reusable_scene_scan(Path::new(&base_root));
         let existing_registry = self.registry.clone();
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
             let result = (|| -> Result<Box<LoadedStage>, String> {
-                let mut archives = discover_scene_archives(PathBuf::from(&base_root))
-                    .map_err(|err| err.to_string())?;
                 let authored_stage_ids = if project_root.is_empty() {
                     Vec::new()
                 } else {
                     sms_scene::discover_authored_project_stage_ids(&project_root)
                         .map_err(|error| error.to_string())?
-                };
-                for authored_stage_id in &authored_stage_ids {
-                    insert_authored_scene_archive(
-                        &mut archives,
-                        Path::new(&base_root),
-                        authored_stage_id,
-                    );
-                }
-                let (scene_labels, scene_label_warning) = match load_scene_archive_labels(
-                    PathBuf::from(&base_root).as_path(),
-                    PathBuf::from(&repo_root).as_path(),
-                    &archives,
-                ) {
-                    Ok(labels) => (labels, None),
-                    Err(error) => (BTreeMap::new(), Some(error)),
-                };
-                let (registry, schema_warning) = if let Some(registry) = existing_registry {
-                    (Some(registry), None)
-                } else {
-                    match SchemaGenerator::new(&repo_root).generate() {
-                        Ok(registry) => (Some(registry), None),
-                        Err(err) => (None, Some(err.to_string())),
-                    }
                 };
                 let requested_project_root = project_root;
                 let (mut document, project_selection) = if authored_stage_ids
@@ -1659,39 +1703,37 @@ impl SmsEditorApp {
                         .map_err(|error| error.to_string())?;
                     (document, selection)
                 };
+                let registry = existing_registry;
+                let schema_warning = None;
                 if let Some(registry) = registry.clone() {
                     document = document.with_registry(registry);
                 }
-                let object_authoring_catalog_cache = resolve_object_authoring_catalog(
-                    Path::new(&base_root),
-                    &archives,
-                    registry.as_ref(),
-                    existing_object_authoring_catalog_cache,
-                );
+                let has_scene_index = existing_scene_scan.is_some();
+                let SceneScanResult {
+                    archives,
+                    labels: scene_labels,
+                    label_warning: scene_label_warning,
+                    retail_skyboxes,
+                    skybox_warnings,
+                    retail_music,
+                    retail_sounds,
+                    retail_dialogue_voices,
+                    retail_stage_audio,
+                    music_warning,
+                    object_authoring_catalog_cache,
+                } = existing_scene_scan.unwrap_or_default();
                 let (
                     object_authoring_catalog_key,
                     object_authoring_catalog,
                     object_authoring_catalog_warnings,
                 ) = split_object_authoring_catalog_cache(object_authoring_catalog_cache);
-                let (retail_skyboxes, skybox_warnings) = index_retail_skyboxes(&archives);
-                let (retail_music, music_warning) = match index_retail_music(
-                    Path::new(&repo_root),
-                    Path::new(&base_root),
-                    &scene_labels,
-                ) {
-                    Ok(entries) => (entries, None),
-                    Err(error) => (Vec::new(), Some(error)),
-                };
-                let retail_sounds = index_retail_sounds(Path::new(&base_root)).unwrap_or_default();
-                let retail_stage_audio =
-                    index_retail_stage_audio_profiles(Path::new(&repo_root), Path::new(&base_root))
-                        .unwrap_or_default();
                 let scene = RenderScene::from_document(&document);
                 let preview = SmsEditorApp::build_model_preview(&document, visibility);
                 Ok(Box::new(LoadedStage {
                     base_root,
                     requested_project_root,
                     project_root: project_selection.project_root,
+                    has_scene_index,
                     archives,
                     registry,
                     schema_warning,
@@ -1708,6 +1750,7 @@ impl SmsEditorApp {
                     skybox_warnings,
                     retail_music,
                     retail_sounds,
+                    retail_dialogue_voices,
                     retail_stage_audio,
                     music_warning,
                 }))
@@ -1770,8 +1813,24 @@ impl SmsEditorApp {
                             if self.document.is_some() {
                                 self.rebuild_model_preview_from_document();
                             }
+                            if self.pending_stage_open.is_none()
+                                && self
+                                    .reusable_scene_scan(Path::new(self.base_root.trim()))
+                                    .is_none()
+                            {
+                                self.scan_scenes();
+                            }
                         }
-                        Err(err) => self.log.push(format!("Schema generation failed: {err}")),
+                        Err(err) => {
+                            self.log.push(format!("Schema generation failed: {err}"));
+                            if self.pending_stage_open.is_none()
+                                && self
+                                    .reusable_scene_scan(Path::new(self.base_root.trim()))
+                                    .is_none()
+                            {
+                                self.scan_scenes();
+                            }
+                        }
                     },
                     BackgroundResult::Scan { base_root, result } => match result {
                         Ok(scan) => {
@@ -1793,7 +1852,11 @@ impl SmsEditorApp {
                             self.retail_skyboxes = scan.retail_skyboxes;
                             self.retail_music = scan.retail_music;
                             self.retail_sounds = scan.retail_sounds;
+                            self.retail_dialogue_voices = scan.retail_dialogue_voices;
                             self.retail_stage_audio = scan.retail_stage_audio;
+                            self.install_object_authoring_catalog_cache(
+                                scan.object_authoring_catalog_cache,
+                            );
                             self.last_scanned_base_root = base_root;
                             if self.stage_id.trim().is_empty() {
                                 if let Some(first) = self.scene_archives.first() {
@@ -1815,6 +1878,12 @@ impl SmsEditorApp {
                             ));
                             self.log
                                 .push(format!("Indexed {sound_count} exact retail sound name(s)."));
+                            if self.registry.is_some() {
+                                self.log.push(format!(
+                                    "Indexed {} typed object class(es) for content-browser placement.",
+                                    self.object_authoring_catalog.len()
+                                ));
+                            }
                             for warning in scan.skybox_warnings {
                                 self.log.push(warning);
                             }
@@ -1972,6 +2041,12 @@ impl SmsEditorApp {
                             .push(format!("{} failed: {err}", mode.progress_label())),
                     },
                 }
+                if self.background_receiver.is_none() && !self.is_dirty() {
+                    if let Some(stage_id) = self.pending_stage_open.take() {
+                        self.stage_id = stage_id;
+                        self.open_stage();
+                    }
+                }
             }
             Some(Err(TryRecvError::Empty)) => {
                 ctx.request_repaint_after(std::time::Duration::from_millis(33));
@@ -1993,6 +2068,7 @@ impl SmsEditorApp {
             base_root,
             requested_project_root,
             project_root,
+            has_scene_index,
             archives,
             registry,
             schema_warning,
@@ -2009,6 +2085,7 @@ impl SmsEditorApp {
             skybox_warnings,
             retail_music,
             retail_sounds,
+            retail_dialogue_voices,
             retail_stage_audio,
             music_warning,
         } = loaded;
@@ -2051,14 +2128,19 @@ impl SmsEditorApp {
         self.project_root = project_root;
         self.adopt_resolved_project_data_root();
         self.registry = registry;
-        if self.registry.is_some() {
+        if self.registry.is_some() && has_scene_index {
             self.log.push(format!(
                 "Object authoring catalog indexed {} typed class(es); content-browser placement can add them with automatic manager and resource dependencies.",
                 object_authoring_catalog.len()
             ));
-        } else {
+        } else if self.registry.is_none() {
             self.log.push(
                 "Object authoring catalog is unavailable until object schema generation succeeds."
+                    .to_string(),
+            );
+        } else {
+            self.log.push(
+                "Opened the level first; base-game content and typed object choices are continuing to index in the background."
                     .to_string(),
             );
         }
@@ -2074,14 +2156,18 @@ impl SmsEditorApp {
                 object_authoring_catalog_warnings.len() - 12
             ));
         }
-        let object_authoring_catalog_cache =
-            object_authoring_catalog_key.map(|key| ObjectAuthoringCatalogCache {
-                key,
-                catalog: object_authoring_catalog,
-                warnings: object_authoring_catalog_warnings,
-            });
-        self.install_object_authoring_catalog_cache(object_authoring_catalog_cache);
-        self.scene_archives = archives;
+        if has_scene_index {
+            let object_authoring_catalog_cache =
+                object_authoring_catalog_key.map(|key| ObjectAuthoringCatalogCache {
+                    key,
+                    catalog: object_authoring_catalog,
+                    warnings: object_authoring_catalog_warnings,
+                });
+            self.install_object_authoring_catalog_cache(object_authoring_catalog_cache);
+            self.scene_archives = archives;
+        } else {
+            self.install_object_authoring_catalog_cache(None);
+        }
         self.retail_goop_templates.clear();
         self.goop_templates_indexed = false;
         self.selected_goop_layer = 0;
@@ -2089,21 +2175,15 @@ impl SmsEditorApp {
         self.goop_stroke = None;
         self.goop_undo_stack.clear();
         self.goop_redo_stack.clear();
-        self.scene_labels = scene_labels;
-        self.retail_skyboxes = retail_skyboxes;
-        self.retail_music = retail_music;
-        self.retail_dialogue_voices =
-            match index_retail_dialogue_voices(Path::new(&self.repo_root), &retail_sounds) {
-                Ok(voices) => voices,
-                Err(error) => {
-                    self.log
-                        .push(format!("Dialogue voice choices are unavailable: {error}"));
-                    Vec::new()
-                }
-            };
-        self.retail_sounds = retail_sounds;
-        self.retail_stage_audio = retail_stage_audio;
-        self.last_scanned_base_root = self.base_root.trim().to_string();
+        if has_scene_index {
+            self.scene_labels = scene_labels;
+            self.retail_skyboxes = retail_skyboxes;
+            self.retail_music = retail_music;
+            self.retail_sounds = retail_sounds;
+            self.retail_dialogue_voices = retail_dialogue_voices;
+            self.retail_stage_audio = retail_stage_audio;
+            self.last_scanned_base_root = self.base_root.trim().to_string();
+        }
         self.log.push(format!(
             "Opened stage '{}' with {} asset(s), {} model(s), {} collision file(s). You can add typed object classes with automatic dependencies from the content browser.",
             document.stage_id,
@@ -2205,6 +2285,13 @@ impl SmsEditorApp {
         self.reset_camera();
         self.restore_project_camera_state();
         self.apply_startup_camera_focus();
+        if !has_scene_index && self.pending_stage_open.is_none() {
+            if self.registry.is_some() {
+                self.scan_scenes();
+            } else {
+                self.generate_schema(false);
+            }
+        }
     }
 
     fn build_model_preview(

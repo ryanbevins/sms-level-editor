@@ -3412,6 +3412,7 @@ fn completed_stage_load_is_discarded_when_the_project_path_changed() {
         base_root: "base-root".to_string(),
         requested_project_root: "project-a".to_string(),
         project_root: "project-a".to_string(),
+        has_scene_index: true,
         archives: Vec::new(),
         registry: None,
         schema_warning: None,
@@ -3428,6 +3429,7 @@ fn completed_stage_load_is_discarded_when_the_project_path_changed() {
         skybox_warnings: Vec::new(),
         retail_music: Vec::new(),
         retail_sounds: Vec::new(),
+        retail_dialogue_voices: Vec::new(),
         retail_stage_audio: Vec::new(),
         music_warning: None,
     };
@@ -3455,6 +3457,7 @@ fn completed_stage_load_adopts_the_resolved_project_folder() {
         base_root: "base-root".to_string(),
         requested_project_root: "sms-editor-project".to_string(),
         project_root: "sms-editor-project-SunshineUSExtract".to_string(),
+        has_scene_index: true,
         archives: Vec::new(),
         registry: None,
         schema_warning: None,
@@ -3471,6 +3474,7 @@ fn completed_stage_load_adopts_the_resolved_project_folder() {
         skybox_warnings: Vec::new(),
         retail_music: Vec::new(),
         retail_sounds: Vec::new(),
+        retail_dialogue_voices: Vec::new(),
         retail_stage_audio: Vec::new(),
         music_warning: None,
     };
@@ -3498,6 +3502,7 @@ fn completed_stage_load_is_discarded_when_the_selected_stage_changed() {
         base_root: "base-root".to_string(),
         requested_project_root: "project".to_string(),
         project_root: "project".to_string(),
+        has_scene_index: true,
         archives: Vec::new(),
         registry: None,
         schema_warning: None,
@@ -3514,6 +3519,7 @@ fn completed_stage_load_is_discarded_when_the_selected_stage_changed() {
         skybox_warnings: Vec::new(),
         retail_music: Vec::new(),
         retail_sounds: Vec::new(),
+        retail_dialogue_voices: Vec::new(),
         retail_stage_audio: Vec::new(),
         music_warning: None,
     };
@@ -3574,6 +3580,30 @@ fn object_authoring_catalog_cache_identity_tracks_retail_inventory_and_registry(
     let changed_registry_key =
         object_authoring_catalog_cache_key(root.path(), &[retail_archive], &changed_registry);
     assert_ne!(original_key, changed_registry_key);
+}
+
+#[test]
+fn completed_base_game_index_is_reused_for_later_level_loads_only_on_the_same_base() {
+    let base = tempfile::tempdir().unwrap();
+    let other_base = tempfile::tempdir().unwrap();
+    let archive = SceneArchiveInfo {
+        stage_id: "dolpic0".to_string(),
+        group: "Delfino Plaza".to_string(),
+        relative_path: PathBuf::from("files/data/scene/dolpic0.szs"),
+        path: base.path().join("files/data/scene/dolpic0.szs"),
+        size_bytes: 42,
+    };
+    let app = SmsEditorApp {
+        last_scanned_base_root: base.path().to_string_lossy().into_owned(),
+        scene_archives: vec![archive.clone()],
+        ..SmsEditorApp::default()
+    };
+
+    let reused = app
+        .reusable_scene_scan(base.path())
+        .expect("same-base level switches should reuse the completed index");
+    assert_eq!(reused.archives, [archive]);
+    assert!(app.reusable_scene_scan(other_base.path()).is_none());
 }
 
 #[test]

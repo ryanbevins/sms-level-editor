@@ -155,6 +155,7 @@ impl SmsEditorApp {
         let retail_skyboxes = self.retail_skyboxes.clone();
         let retail_music = self.retail_music.clone();
         let retail_sounds = self.retail_sounds.clone();
+        let retail_dialogue_voices = self.retail_dialogue_voices.clone();
         let retail_stage_audio = self.retail_stage_audio.clone();
         let existing_object_authoring_catalog_cache = self
             .reusable_object_authoring_catalog_cache(Path::new(&base_root), self.registry.as_ref());
@@ -222,7 +223,7 @@ impl SmsEditorApp {
                 let (registry, schema_warning) = if let Some(registry) = existing_registry {
                     (Some(registry), None)
                 } else {
-                    match SchemaGenerator::new(&repo_root).generate() {
+                    match generate_editor_schema(Path::new(&repo_root)) {
                         Ok(registry) => (Some(registry), None),
                         Err(error) => (None, Some(error.to_string())),
                     }
@@ -252,6 +253,7 @@ impl SmsEditorApp {
                     base_root,
                     requested_project_root,
                     project_root: project_selection.project_root,
+                    has_scene_index: true,
                     archives,
                     registry,
                     schema_warning,
@@ -268,6 +270,7 @@ impl SmsEditorApp {
                     skybox_warnings: Vec::new(),
                     retail_music,
                     retail_sounds,
+                    retail_dialogue_voices,
                     retail_stage_audio,
                     music_warning: None,
                 }))

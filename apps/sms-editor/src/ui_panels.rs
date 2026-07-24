@@ -39,7 +39,7 @@ impl SmsEditorApp {
                     .clicked()
                 {
                     ui.close();
-                    self.generate_schema();
+                    self.generate_schema(true);
                 }
                 if ui
                     .add_enabled(self.document.is_some(), egui::Button::new("Validate"))
